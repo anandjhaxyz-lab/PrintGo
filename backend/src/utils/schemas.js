@@ -35,6 +35,8 @@ const createJobSchema = z.object({
       copies: z.number().int().min(1).max(100).default(1),
       pageRangeType: z.enum(['all', 'custom']).default('all'),
       customRange: z.string().nullable().optional(),
+      paperSize: z.string().optional().default('A4'),
+      paperType: z.string().optional().default('plain'),
       pagesToPrint: z.number().int().min(1).default(1),
     }).refine(data => {
       if (data.pageRangeType === 'custom') {

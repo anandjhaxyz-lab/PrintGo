@@ -1,7 +1,12 @@
+require('dotenv').config();
 const prisma = require('./src/utils/prisma');
 
 async function seed() {
-  const key = "new_rotated_machine_key_1a2b3c4d5e6f";
+  const key = process.env.MACHINE_KEY;
+  if (!key) {
+    throw new Error('MACHINE_KEY environment variable is not defined.');
+  }
+
   try {
     const existing = await prisma.machine.findUnique({ where: { machineKey: key }});
     if (!existing) {
@@ -9,12 +14,11 @@ async function seed() {
         data: {
           name: 'Main Shop Printer',
           location: 'Front Desk',
-          type: 'KIOSK',
           machineKey: key,
           status: 'ACTIVE',
         }
       });
-      console.log('✅ Seeded machine successfully!');
+      console.log('Seeded machine successfully with configured MACHINE_KEY.');
     } else {
       console.log('Machine already exists.');
     }

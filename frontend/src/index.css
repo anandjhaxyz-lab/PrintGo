@@ -750,6 +750,8 @@ footer a:hover {
 
 @media (min-width: 1400px) {
   .container { max-width: 1320px; }
+}
+
 /* --- Animations --- */
 @keyframes slideUp {
     0% { opacity: 0; transform: translateY(12px) scale(0.98); }
@@ -938,3 +940,925 @@ footer a:hover {
 .transition-all { transition-property: all; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); transition-duration: 150ms; }
 .duration-300 { transition-duration: 300ms; }
 .duration-500 { transition-duration: 500ms; }
+
+/* ============================================================
+   Phase 5: Enterprise SaaS Admin Dashboard Styles
+   ============================================================ */
+
+.admin-full-layout {
+  width: 100vw;
+  min-height: 100vh;
+  margin: 0;
+  padding: 0;
+  background-color: #f8fafc;
+  display: flex;
+}
+
+.admin-wrapper {
+  display: flex;
+  width: 100%;
+  min-height: 100vh;
+  background-color: #f8fafc;
+}
+
+/* Sidebar */
+.admin-sidebar {
+  width: 260px;
+  min-width: 260px;
+  background-color: #0f172a;
+  color: #f1f5f9;
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  border-right: 1px solid #1e293b;
+  z-index: 40;
+  transition: transform 0.25s ease-in-out;
+}
+
+.admin-sidebar-header {
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #1e293b;
+}
+
+.admin-nav {
+  padding: 0.75rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  flex: 1;
+}
+
+.admin-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.625rem 0.875rem;
+  border-radius: 8px;
+  color: #94a3b8;
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+  transition: all 0.15s ease;
+}
+
+.admin-nav-item:hover {
+  color: #ffffff;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.admin-nav-item.active {
+  color: #ffffff;
+  background-color: #4f46e5;
+  box-shadow: 0 2px 4px rgba(79, 70, 229, 0.3);
+}
+
+.admin-sidebar-footer {
+  padding: 1rem 1.25rem;
+  border-top: 1px solid #1e293b;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: #0b1120;
+}
+
+/* Main Area */
+.admin-content-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.admin-topbar {
+  background-color: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 0.875rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  position: sticky;
+  top: 0;
+  z-index: 30;
+}
+
+.admin-main-body {
+  padding: 1.5rem;
+  flex: 1;
+}
+
+/* KPI Cards */
+.admin-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.admin-kpi-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 1.25rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.admin-kpi-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #64748b;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.admin-kpi-value {
+  font-size: 1.625rem;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.admin-kpi-sub {
+  font-size: 0.75rem;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+/* Tables */
+.admin-table-container {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  text-align: left;
+}
+
+.admin-table th {
+  background-color: #f8fafc;
+  padding: 0.75rem 1rem;
+  font-weight: 600;
+  color: #475569;
+  border-bottom: 1px solid #e2e8f0;
+  white-space: nowrap;
+}
+
+.admin-table td {
+  padding: 0.875rem 1rem;
+  border-bottom: 1px solid #f1f5f9;
+  color: #1e293b;
+  vertical-align: middle;
+}
+
+.admin-table tr:hover td {
+  background-color: #f8fafc;
+}
+
+/* Filter Bar */
+.admin-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+  background: #ffffff;
+  padding: 0.875rem 1rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+}
+
+.admin-input {
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 0.45rem 0.75rem;
+  font-size: 0.875rem;
+  outline: none;
+  background: #ffffff;
+  color: #0f172a;
+}
+
+.admin-input:focus {
+  border-color: #4f46e5;
+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.15);
+}
+
+/* Modals */
+.admin-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(15, 23, 42, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 1rem;
+}
+
+.admin-modal-card {
+  background: #ffffff;
+  border-radius: 16px;
+  max-width: 600px;
+  width: 100%;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+  padding: 1.5rem;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+  .admin-sidebar {
+    position: fixed;
+    transform: translateX(-100%);
+  }
+  .admin-sidebar.open {
+    transform: translateX(0);
+  }
+}
+
+/* ============================================================
+   Print Stylesheet — Counter Display Flyer & Print Safety
+   Supports A4 and A5 desktop and kiosk label printing
+   ============================================================ */
+@media print {
+  /* Page Setup for A4 and A5 */
+  @page {
+    size: auto;
+    margin: 10mm;
+  }
+
+  /* 1. Global Reset: Clean white background, no margins/padding */
+  html, body {
+    background: #ffffff !important;
+    color: #000000 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: auto !important;
+    overflow: visible !important;
+    box-shadow: none !important;
+  }
+
+  /* 2. Hide all non-printable UI, dashboard navigation, topbar, sidebars, alerts */
+  .no-print,
+  .admin-sidebar,
+  .admin-topbar,
+  .admin-filter-bar,
+  .admin-tab-nav,
+  .admin-kpi-grid,
+  .admin-table-container,
+  header,
+  nav,
+  aside,
+  footer,
+  button {
+    display: none !important;
+  }
+
+  /* Hide root siblings when flyer modal is open */
+  body > #root > .admin-container > *:not(.admin-main) {
+    display: none !important;
+  }
+
+  /* 3. Neutralize Modal Backdrop and Dialog Shadows */
+  .printable-flyer-modal-backdrop {
+    position: static !important;
+    inset: auto !important;
+    background: transparent !important;
+    background-color: transparent !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    z-index: auto !important;
+  }
+
+  .printable-flyer-dialog-card {
+    max-width: 100% !important;
+    max-height: none !important;
+    overflow: visible !important;
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 auto !important;
+    background: transparent !important;
+    border-radius: 0 !important;
+  }
+
+  /* 4. Format Printable Counter Display Flyer */
+  #printable-counter-card,
+  .printable-counter-card {
+    display: block !important;
+    position: relative !important;
+    margin: 0 auto !important;
+    max-width: 148mm !important;
+    padding: 16mm 12mm !important;
+    border: 2.5px solid #0f172a !important;
+    border-radius: 12px !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    box-shadow: none !important;
+    text-align: center !important;
+  }
+
+  /* QR Code Quiet Zone */
+  #printable-counter-card .qr-code-quiet-zone {
+    padding: 12px !important;
+    background: #ffffff !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 10px !important;
+    display: inline-block !important;
+    margin: 8mm 0 !important;
+  }
+
+  /* Instruction Box */
+  #printable-counter-card .instruction-box {
+    background: #f8fafc !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 8px !important;
+    padding: 4mm 6mm !important;
+    text-align: left !important;
+    font-size: 9pt !important;
+    line-height: 1.5 !important;
+    color: #1e293b !important;
+    margin-bottom: 6mm !important;
+  }
+
+  /* Text & Instructions Clarity */
+  #printable-counter-card h3,
+  #printable-counter-card .flyer-title {
+    font-size: 14pt !important;
+    font-weight: 900 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.06em !important;
+    margin-bottom: 2mm !important;
+    color: #0f172a !important;
+  }
+
+  #printable-counter-card .flyer-subtitle {
+    font-size: 9pt !important;
+    font-weight: 600 !important;
+    color: #475569 !important;
+  }
+
+  #printable-counter-card .fallback-url {
+    font-size: 8pt !important;
+    font-family: monospace !important;
+    color: #0f172a !important;
+    word-break: break-all !important;
+  }
+
+  #printable-counter-card .flyer-footer {
+    border-top: 1px solid #e2e8f0 !important;
+    padding-top: 3mm !important;
+    margin-top: 4mm !important;
+    font-size: 7.5pt !important;
+    color: #64748b !important;
+  }
+}
+
+/* ============================================================
+   S3K – Print Yourself Customer Portal Theme
+   Palette: Premium Navy Blue, Royal Blue, White & Gold
+   Mobile-First / No-Scroll Architecture
+   ============================================================ */
+
+.s3k-portal-root {
+  min-height: 100vh;
+  min-height: 100dvh;
+  height: 100dvh;
+  max-height: 100dvh;
+  width: 100%;
+  background: radial-gradient(circle at 50% 0%, rgba(30, 64, 175, 0.28) 0%, transparent 55%),
+              radial-gradient(circle at 100% 100%, rgba(212, 175, 55, 0.1) 0%, transparent 45%),
+              #070E1E;
+  color: #F8FAFC;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  box-sizing: border-box;
+}
+
+.s3k-portal-wrapper {
+  max-width: 440px;
+  width: 100%;
+  margin: 0 auto;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 0.65rem 0.85rem;
+  box-sizing: border-box;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media (max-height: 660px) {
+  .s3k-portal-wrapper {
+    padding: 0.35rem 0.5rem;
+  }
+  .s3k-header {
+    padding: 0.35rem 0.5rem;
+  }
+}
+
+@media (max-width: 340px) {
+  .s3k-portal-wrapper {
+    padding: 0.35rem 0.4rem;
+  }
+  .s3k-brand-title {
+    font-size: 0.92rem;
+  }
+  .s3k-preview-btn {
+    padding: 0.2rem 0.45rem;
+    font-size: 0.68rem;
+  }
+}
+
+/* S3K Header */
+.s3k-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+  background: rgba(16, 32, 66, 0.85);
+  border: 1px solid rgba(212, 175, 55, 0.35);
+  border-radius: 14px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  flex-shrink: 0;
+}
+
+.s3k-brand-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.s3k-logo-box {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #1D4ED8 0%, #0F172A 100%);
+  border: 1.5px solid #D4AF37;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #D4AF37;
+  font-weight: 900;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  box-shadow: 0 0 10px rgba(212, 175, 55, 0.4);
+  flex-shrink: 0;
+}
+
+.s3k-brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.15;
+}
+
+.s3k-presents {
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #D4AF37;
+}
+
+.s3k-brand-title {
+  font-size: 1.05rem;
+  font-weight: 900;
+  color: #FFFFFF;
+  letter-spacing: -0.01em;
+}
+
+.s3k-brand-gold {
+  color: #F59E0B;
+}
+
+.s3k-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: 9999px;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #34D399;
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* S3K Cards */
+.s3k-card {
+  background: rgba(16, 32, 66, 0.85);
+  border: 1px solid rgba(37, 99, 235, 0.28);
+  border-radius: 14px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 6px 20px -2px rgba(0, 0, 0, 0.45);
+  box-sizing: border-box;
+}
+
+.s3k-card-gold {
+  border-color: rgba(212, 175, 55, 0.4);
+}
+
+/* S3K Upload Dropzone Card */
+.s3k-upload-dropzone {
+  background: linear-gradient(180deg, rgba(16, 32, 66, 0.85) 0%, rgba(10, 20, 42, 0.95) 100%);
+  border: 2px dashed rgba(212, 175, 55, 0.45);
+  border-radius: 16px;
+  padding: 1.5rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.5);
+  box-sizing: border-box;
+  transition: all 0.2s ease;
+}
+
+.s3k-upload-dropzone:hover {
+  border-color: rgba(212, 175, 55, 0.7);
+  background: linear-gradient(180deg, rgba(20, 40, 80, 0.9) 0%, rgba(12, 24, 50, 0.98) 100%);
+}
+
+.s3k-kiosk-heading {
+  font-size: 0.95rem;
+  font-weight: 800;
+  color: #FFFFFF;
+  line-height: 1.2;
+  white-space: nowrap;
+  letter-spacing: -0.01em;
+}
+
+@media (max-width: 350px) {
+  .s3k-kiosk-heading {
+    white-space: normal;
+  }
+}
+
+/* S3K Format Grid & Chips */
+.s3k-format-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.35rem;
+  width: 100%;
+  max-width: 290px;
+  margin: 0.85rem auto 0;
+}
+
+.s3k-format-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 0.32rem 0.4rem;
+  border-radius: 8px;
+  background: rgba(11, 23, 46, 0.85);
+  color: #CBD5E1;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* S3K Selection Cards (Color, Sides, Pages) */
+.s3k-option-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem;
+}
+
+.s3k-option-btn {
+  background: rgba(11, 23, 46, 0.7);
+  border: 1.5px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  padding: 0.5rem 0.6rem;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  transition: all 0.18s ease;
+  user-select: none;
+  text-align: left;
+}
+
+.s3k-option-btn:active {
+  transform: scale(0.98);
+}
+
+.s3k-option-btn.selected {
+  background: rgba(30, 64, 175, 0.35);
+  border-color: #D4AF37;
+  box-shadow: 0 0 10px rgba(212, 175, 55, 0.25);
+}
+
+/* S3K Stepper */
+.s3k-stepper-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(30, 64, 175, 0.4);
+  border: 1.5px solid rgba(212, 175, 55, 0.4);
+  color: #FFFFFF;
+  font-size: 1.15rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.s3k-stepper-btn:active {
+  transform: scale(0.92);
+  background: rgba(212, 175, 55, 0.4);
+}
+
+/* S3K Primary CTA */
+.s3k-primary-btn {
+  background: linear-gradient(135deg, #1D4ED8 0%, #2563EB 50%, #3B82F6 100%);
+  color: #FFFFFF;
+  font-weight: 800;
+  border: 1px solid rgba(212, 175, 55, 0.4);
+  border-radius: 12px;
+  box-shadow: 0 4px 16px rgba(37, 99, 235, 0.45);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.8rem 1rem;
+  font-size: 0.95rem;
+  transition: all 0.2s ease;
+  text-decoration: none;
+}
+
+.s3k-primary-btn:active {
+  transform: scale(0.98);
+}
+
+.s3k-gold-btn {
+  background: linear-gradient(135deg, #F59E0B 0%, #D4AF37 50%, #FBBF24 100%);
+  color: #070E1E;
+  font-weight: 900;
+  border: none;
+  box-shadow: 0 4px 18px rgba(212, 175, 55, 0.4);
+}
+
+.s3k-success-btn {
+  background: linear-gradient(135deg, #059669 0%, #10B981 100%);
+  color: #FFFFFF;
+  font-weight: 900;
+  border: 1px solid rgba(52, 211, 153, 0.4);
+  box-shadow: 0 4px 18px rgba(16, 185, 129, 0.35);
+}
+
+/* S3K Document Preview Button & Modal */
+.s3k-preview-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 99999;
+  background: #070E1E;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+.s3k-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.85rem;
+  background: #0E1B38;
+  border-bottom: 1.5px solid rgba(212, 175, 55, 0.4);
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.s3k-preview-body {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  background: #0B132B;
+  position: relative;
+  box-sizing: border-box;
+}
+
+.s3k-preview-footer {
+  padding: 0.5rem 0.85rem;
+  background: #0E1B38;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  box-sizing: border-box;
+}
+
+.s3k-preview-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: 8px;
+  background: rgba(30, 64, 175, 0.45);
+  border: 1px solid rgba(212, 175, 55, 0.45);
+  color: #FBBF24;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.s3k-preview-btn:hover {
+  background: rgba(30, 64, 175, 0.75);
+  border-color: #F59E0B;
+  color: #FFFFFF;
+}
+
+.s3k-preview-btn:active {
+  transform: scale(0.95);
+}
+
+.s3k-preview-ctrl-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: rgba(30, 64, 175, 0.35);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: #FFFFFF;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.s3k-preview-ctrl-btn:active {
+  transform: scale(0.92);
+}
+
+.s3k-preview-close-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  color: #FCA5A5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.s3k-preview-close-btn:hover {
+  background: rgba(239, 68, 68, 0.4);
+  color: #FFFFFF;
+}
+
+.s3k-preview-close-btn:active {
+  transform: scale(0.92);
+}
+
+/* S3K Page Selection Buttons */
+.s3k-page-btn {
+  padding: 0.45rem 0.5rem;
+  border-radius: 8px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  background: rgba(15, 23, 42, 0.7);
+  color: #94A3B8;
+  border: 1.5px solid rgba(148, 163, 184, 0.2);
+  user-select: none;
+}
+
+.s3k-page-btn.active {
+  background: linear-gradient(135deg, #1D4ED8 0%, #2563EB 100%);
+  color: #FFFFFF;
+  border-color: #D4AF37;
+  box-shadow: 0 0 10px rgba(212, 175, 55, 0.35);
+}
+
+/* Micro Footer */
+.s3k-footer {
+  text-align: center;
+  padding: 0.25rem 0.5rem;
+  flex-shrink: 0;
+  font-size: 0.62rem;
+  color: #94A3B8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  opacity: 0.85;
+}
+
+.s3k-footer-gold {
+  color: #D4AF37;
+  font-weight: 700;
+}
+
+/* 16:9 Standard Advertisement Board */
+.s3k-ad-card {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 12px;
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #040814;
+  border: 1.5px solid rgba(212, 175, 55, 0.35);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(212, 175, 55, 0.08);
+  flex-shrink: 0;
+}
+
+.s3k-ad-media {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  display: block;
+}
+
+/* Small secondary Back Button on Step 2 */
+.s3k-back-btn {
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  color: #94A3B8;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.35rem 0.85rem;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.s3k-back-btn:hover {
+  background: rgba(30, 41, 59, 0.9);
+  border-color: rgba(212, 175, 55, 0.4);
+  color: #F8FAFC;
+}
+
+.s3k-back-btn:active {
+  transform: scale(0.96);
+}

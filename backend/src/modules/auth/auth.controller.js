@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const prisma = require('../../utils/prisma');
 const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
+const { getPricingProfile, serializePublicPricingProfile } = require('../../services/pricing.service');
+const { resolveCashfreeEnv } = require('../../config/cashfree.config');
 
 const login = async (req, res, next) => {
   try {
@@ -80,7 +82,7 @@ const createSession = async (req, res, next) => {
 
     // Generate a cryptographically secure session code (12 hex chars = 6 bytes = 281 trillion combinations)
     const sessionCode = crypto.randomBytes(6).toString('hex');
-    
+
     // Session expires in 1 hour
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
 
@@ -160,12 +162,83 @@ const joinSession = async (req, res, next) => {
       { expiresIn: '1h' }
     );
 
+    const rawProfile = await getPricingProfile(session.machineId || null);
+    const pricingProfile = serializePublicPricingProfile(rawProfile);
+    const { env: cashfreeEnv } = resolveCashfreeEnv();
+
     logger.info(`Mobile joined session: ${session.code}`);
 
     res.status(200).json({
       success: true,
       sessionToken,
       machineId: session.machineId,
+      expiresAt: session.expiresAt,
+      cashfreeEnv: cashfreeEnv || 'sandbox',
+      pricingProfile,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/auth/session/from-printer-qr
+ * Called when mobile customer scans a permanent physical printer QR code (/p/:publicCode).
+ * Creates a fresh, isolated 60-minute customer session bound to the target printer.
+ */
+const createSessionFromPrinterQr = async (req, res, next) => {
+  try {
+    const { publicCode } = req.body;
+    const printerQrService = require('../../services/printerQr.service');
+    const result = await printerQrService.resolvePrinterQr(publicCode);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/auth/printer-qr/:publicCode
+ * Public pre-scan lookup returning printer metadata.
+ */
+const getPublicPrinterQrInfo = async (req, res, next) => {
+  try {
+    const { publicCode } = req.params;
+    const printerQrService = require('../../services/printerQr.service');
+    const result = await printerQrService.getPublicPrinterQrInfo(publicCode);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /api/auth/pricing
+ * Public sanitized pricing profile + Cashfree environment lookup (by publicCode or machineId).
+ */
+const getPublicPricing = async (req, res, next) => {
+  try {
+    const { publicCode, machineId } = req.query;
+    let resolvedMachineId = machineId || null;
+
+    if (!resolvedMachineId && publicCode && typeof publicCode === 'string') {
+      const qr = await prisma.printerQr.findUnique({
+        where: { publicCode: publicCode.trim() },
+        select: { machineId: true }
+      });
+      if (qr?.machineId) {
+        resolvedMachineId = qr.machineId;
+      }
+    }
+
+    const rawProfile = await getPricingProfile(resolvedMachineId);
+    const pricingProfile = serializePublicPricingProfile(rawProfile);
+    const { env: cashfreeEnv } = resolveCashfreeEnv();
+
+    res.status(200).json({
+      success: true,
+      cashfreeEnv: cashfreeEnv || 'sandbox',
+      pricingProfile
     });
   } catch (error) {
     next(error);
@@ -177,5 +250,8 @@ module.exports = {
   logout,
   getMe,
   createSession,
-  joinSession
+  joinSession,
+  createSessionFromPrinterQr,
+  getPublicPrinterQrInfo,
+  getPublicPricing
 };

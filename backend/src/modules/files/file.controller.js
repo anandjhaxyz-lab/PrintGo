@@ -57,7 +57,7 @@ const serveDocument = async (req, res, next) => {
       return next(new AppError('Access denied: You do not have permission to view this file', 403));
     }
 
-    const uploadsDir = path.join(__dirname, '../../../uploads');
+    const uploadsDir = process.env.UPLOADS_DIR || path.join(__dirname, '../../../uploads');
     const filePath = path.join(uploadsDir, filename);
 
     if (!fs.existsSync(filePath)) {

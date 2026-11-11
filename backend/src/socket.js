@@ -56,8 +56,7 @@ const setupSockets = (io) => {
       socket.emit('printer_registered_success', { machineId: socket.machineId, name: socket.machineName });
 
       // P4: Recovery System for dropped socket messages.
-      // If the printer dropped internet exactly when a payment succeeded, the socket message was lost.
-      // Send any jobs that are stuck in PRINTING state back to the printer immediately upon reconnection.
+      // Reconcile active PRINTING jobs safely via agent journal rather than blindly re-emitting physical_print_job!
       (async () => {
         try {
           const stuckJobs = await prisma.printJob.findMany({
@@ -65,28 +64,13 @@ const setupSockets = (io) => {
               machineId: socket.machineId,
               status: 'PRINTING'
             },
-            include: { document: true }
+            select: { shortId: true }
           });
           
-          for (const job of stuckJobs) {
-            const printData = {
-              jobId: job.shortId,
-              fileUrl: job.document ? job.document.filename : '', 
-              originalName: job.document ? job.document.originalName : '',
-              pagesToPrint: job.pagesToPrint,
-              settings: {
-                color: job.color,
-                duplex: job.duplex,
-                copies: job.copies,
-                pageRangeType: job.pageRangeType,
-                customRange: job.customRange
-              },
-              price: job.cost,
-              encryptedKey: job.encryptedKey,
-              iv: job.iv
-            };
-            logger.info(`Resending stuck PRINTING job ${job.shortId} to reconnected machine ${socket.machineId}`);
-            socket.emit('physical_print_job', printData);
+          if (stuckJobs.length > 0) {
+            const jobIds = stuckJobs.map(j => j.shortId);
+            logger.info(`Requesting reconciliation for ${jobIds.length} active PRINTING job(s) from machine ${socket.machineId}: ${jobIds.join(', ')}`);
+            socket.emit('reconcile_active_jobs', { jobIds });
           }
         } catch (e) {
           logger.error('Error recovering stuck jobs for printer:', e);
@@ -222,26 +206,77 @@ const setupSockets = (io) => {
       // P3-001: We do NOT mark it COMPLETED here anymore. It stays PRINTING until physical success.
     });
 
-    socket.on('print_physical_success', async ({ jobId }) => {
+    socket.on('print_physical_success', async (payload) => {
       if (socket.userType !== 'printer') return;
-      logger.info(`Physical print success for job ${jobId}`);
+      const jobId = typeof payload === 'object' ? payload.jobId : payload;
+      logger.info(`Physical print success reported for job ${jobId}`);
       try {
-        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId }, include: { document: true } });
-        if (!currentJob || !isValidJobTransition(currentJob.status, 'COMPLETED')) return;
-        
+        const currentJob = await prisma.printJob.findUnique({ 
+          where: { shortId: jobId }, 
+          include: { document: true } 
+        });
+        if (!currentJob) return;
+
         // P0: Enforce Machine Ownership
         if (currentJob.machineId !== socket.machineId) {
           logger.warn(`Machine ${socket.machineId} attempted to mark job ${jobId} as COMPLETED, but job belongs to ${currentJob.machineId}`);
           return;
         }
-        
+
+        // Idempotency: If already COMPLETED, acknowledge to agent and do nothing further
+        if (currentJob.status === 'COMPLETED') {
+          socket.emit('ack_job_completed', { jobId });
+          return;
+        }
+
+        if (!isValidJobTransition(currentJob.status, 'COMPLETED')) {
+          logger.warn(`Ignoring invalid transition from ${currentJob.status} to COMPLETED for job ${jobId}`);
+          return;
+        }
+
         const completedJob = await prisma.printJob.update({
           where: { shortId: jobId },
           data: { status: 'COMPLETED' },
           include: { document: true }
         });
+
+        // Record verification in PrintHistory
+        await prisma.printHistory.create({
+          data: {
+            printJobId: currentJob.id,
+            success: true,
+            errorDetails: payload?.reconciled 
+              ? 'Reconciled via agent journal evidence' 
+              : (payload?.wasSeenInQueue ? 'Verified via Windows spooler polling' : 'Verified via driver dispatch confirmation'),
+            completedAt: new Date()
+          }
+        });
+
+        // Acknowledge receipt to the agent
+        socket.emit('ack_job_completed', { jobId });
+        logger.info(`Job ${jobId} marked COMPLETED and acknowledged to machine ${socket.machineId}`);
       } catch (err) {
         logger.error(`Failed to update job ${jobId} to COMPLETED:`, err);
+      }
+    });
+
+    socket.on('print_physical_ambiguous', async ({ jobId, reason, wasSeenInQueue }) => {
+      if (socket.userType !== 'printer') return;
+      logger.warn(`Job ${jobId} physical outcome ambiguous: ${reason}. Keeping status as PRINTING for operator reconciliation.`);
+      try {
+        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
+        if (currentJob) {
+          await prisma.printHistory.create({
+            data: {
+              printJobId: currentJob.id,
+              success: false,
+              errorDetails: `Ambiguous outcome: ${reason} (wasSeenInQueue: ${wasSeenInQueue})`,
+              completedAt: new Date()
+            }
+          });
+        }
+      } catch (e) {
+        logger.error('Error logging ambiguous print outcome:', e);
       }
     });
 

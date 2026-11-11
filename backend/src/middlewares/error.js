@@ -2,6 +2,11 @@ const logger = require('../utils/logger');
 const AppError = require('../utils/AppError');
 
 const errorHandler = (err, req, res, next) => {
+  if (err.message && err.message.includes('CORS')) {
+    err.statusCode = 403;
+    err.isOperational = true;
+  }
+
   err.statusCode = err.statusCode || 500;
   err.status = err.status || 'error';
 

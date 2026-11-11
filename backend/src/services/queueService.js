@@ -50,7 +50,7 @@ const processJob = async (shortId) => {
         
         const printData = {
           jobId: updatedJob.shortId,
-          fileUrl: updatedJob.document ? updatedJob.document.filename : '', 
+          fileUrl: (updatedJob.document && updatedJob.document.filename) ? updatedJob.document.filename.replace(/^https:\/\/localhost:5000/, 'http://localhost:5000') : '', 
           originalName: updatedJob.document ? updatedJob.document.originalName : '',
           pagesToPrint: updatedJob.pagesToPrint,
           settings: {
@@ -91,10 +91,10 @@ const initWorker = (io) => {
     const worker = new Worker('printQueue', async (job) => {
       const { shortId } = job.data;
       await processJob(shortId);
-    }, { connection });
+    }, { connection, concurrency: 1 });
 
     worker.on('failed', (job, err) => {
-      console.error(`Job ${job.id} failed with error ${err.message}`);
+      console.error(`Physical Print Job ${job.id} failed without automatic retry: ${err.message}`);
     });
     return worker;
   } catch(e) {
@@ -112,8 +112,9 @@ const startPrintingProcess = async (shortId, io) => {
       // Race with a 2.5s timeout so a dead/limited Redis never blocks printing
       await Promise.race([
         printQueue.add('printJob', { shortId }, {
-          attempts: 3,
-          backoff: { type: 'exponential', delay: 1000 }
+          attempts: 1, // Single execution guarantee for physical printing (NO AUTOMATIC RETRIES)
+          removeOnComplete: true,
+          removeOnFail: false // Retain failed physical job records for operator inspection
         }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Redis operation timed out')), 2500))
       ]);
@@ -158,37 +159,191 @@ const calculateEstimatedWaitTime = async (shortId) => {
   }
 };
 
+const ABANDONED_JOB_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Prisma filter matching only genuinely abandoned, unlinked PENDING_PAYMENT jobs.
+ * Applied identically during candidate selection and atomic in-transaction deletion.
+ */
+const buildAbandonedJobWhere = (oneHourAgo) => ({
+  status: 'PENDING_PAYMENT',
+  createdAt: { lt: oneHourAgo },
+  paymentId: null,
+  payment: { is: null },
+  invoice: { is: null },
+  printHistory: { none: {} },
+  isTest: false
+});
+
+/**
+ * Checks both relational FKs and non-FK scalar references (printJobId / gatewayOrderId)
+ * before permitting physical deletion of a PrintJob record.
+ */
+const hasProtectedJobReferences = async (db, job) => {
+  const orderPrefixes = [
+    { gatewayOrderId: { startsWith: `order_${job.shortId}_` } },
+    { gatewayOrderId: { startsWith: `demo_order_${job.shortId}_` } }
+  ];
+
+  const [
+    invoiceCount,
+    historyCount,
+    refundCount,
+    creditNoteCount,
+    reconciliationCount,
+    paymentCount,
+    paymentEventCount
+  ] = await Promise.all([
+    db.invoice.count({ where: { printJobId: job.id } }),
+    db.printHistory.count({ where: { printJobId: job.id } }),
+    db.refund.count({ where: { printJobId: job.id } }),
+    db.creditNote.count({ where: { printJobId: job.id } }),
+    db.reconciliationRecord.count({ where: { printJobId: job.id } }),
+    db.payment.count({ where: { OR: orderPrefixes } }),
+    db.paymentEvent.count({ where: { OR: orderPrefixes } })
+  ]);
+
+  return (
+    invoiceCount > 0 ||
+    historyCount > 0 ||
+    refundCount > 0 ||
+    creditNoteCount > 0 ||
+    reconciliationCount > 0 ||
+    paymentCount > 0 ||
+    paymentEventCount > 0
+  );
+};
+
+/**
+ * Safely deletes abandoned PENDING_PAYMENT jobs one isolated transaction at a time.
+ * Document files are removed strictly AFTER database transaction commit.
+ */
+const cleanupAbandonedJobs = async (options = {}) => {
+  const db = options.prismaClient || prisma;
+  const nowMs = options.now instanceof Date ? options.now.getTime() : Date.now();
+  const ttlMs = typeof options.ttlMs === 'number' ? options.ttlMs : ABANDONED_JOB_TTL_MS;
+  const oneHourAgo = new Date(nowMs - ttlMs);
+  const deleteFileFn = options.deleteFileFn || require('../utils/storage').deleteFile;
+
+  const baseWhere = buildAbandonedJobWhere(oneHourAgo);
+  const candidateWhere = Array.isArray(options.jobIds)
+    ? { AND: [baseWhere, { id: { in: options.jobIds } }] }
+    : baseWhere;
+
+  const candidates = await db.printJob.findMany({
+    where: candidateWhere,
+    include: { document: true },
+    orderBy: { createdAt: 'asc' }
+  });
+
+  const summary = {
+    scannedCount: candidates.length,
+    deletedCount: 0,
+    deletedJobIds: [],
+    skippedCount: 0,
+    filesDeleted: 0,
+    orphanedFiles: [],
+    errors: []
+  };
+
+  for (const candidate of candidates) {
+    let txOutcome = { deleted: false, filenameToDelete: null };
+
+    try {
+      txOutcome = await db.$transaction(async (tx) => {
+        const freshJob = await tx.printJob.findUnique({
+          where: { id: candidate.id },
+          include: { document: true, invoice: true, payment: true }
+        });
+
+        if (
+          !freshJob ||
+          freshJob.status !== 'PENDING_PAYMENT' ||
+          !(freshJob.createdAt < oneHourAgo) ||
+          freshJob.paymentId !== null ||
+          freshJob.payment !== null ||
+          freshJob.invoice !== null ||
+          freshJob.isTest !== false
+        ) {
+          return { deleted: false, filenameToDelete: null };
+        }
+
+        if (await hasProtectedJobReferences(tx, freshJob)) {
+          return { deleted: false, filenameToDelete: null };
+        }
+
+        const deleteRes = await tx.printJob.deleteMany({
+          where: {
+            id: freshJob.id,
+            ...baseWhere
+          }
+        });
+
+        if (deleteRes.count !== 1) {
+          return { deleted: false, filenameToDelete: null };
+        }
+
+        const remainingDocumentRefs = freshJob.documentId
+          ? await tx.printJob.count({ where: { documentId: freshJob.documentId } })
+          : 0;
+
+        return {
+          deleted: true,
+          filenameToDelete: remainingDocumentRefs === 0 ? (freshJob.document?.filename || null) : null
+        };
+      });
+    } catch (jobErr) {
+      summary.errors.push({ jobId: candidate.id, shortId: candidate.shortId, error: jobErr.message });
+      console.error(`Cleanup skipped for job ${candidate.shortId} (${candidate.id}) due to DB error: ${jobErr.message}`);
+      continue;
+    }
+
+    if (!txOutcome.deleted) {
+      summary.skippedCount++;
+      continue;
+    }
+
+    summary.deletedCount++;
+    summary.deletedJobIds.push(candidate.id);
+
+    if (txOutcome.filenameToDelete) {
+      try {
+        const fileDeleted = await deleteFileFn(txOutcome.filenameToDelete);
+        if (fileDeleted === false) {
+          throw new Error('Storage deleteFile returned false');
+        }
+        summary.filesDeleted++;
+      } catch (fileErr) {
+        summary.orphanedFiles.push({
+          jobId: candidate.id,
+          shortId: candidate.shortId,
+          filename: txOutcome.filenameToDelete,
+          error: fileErr.message
+        });
+        console.error(
+          `[ORPHANED_FILE_CLEANUP] Deleted PrintJob ${candidate.shortId} (${candidate.id}), ` +
+          `but failed to delete file '${txOutcome.filenameToDelete}': ${fileErr.message}`
+        );
+      }
+    }
+  }
+
+  if (summary.deletedCount > 0) {
+    console.log(`[CLEANUP] Removed ${summary.deletedCount} abandoned PENDING_PAYMENT job(s) from database.`);
+  }
+
+  return summary;
+};
+
 // Cleanup abandoned jobs and stuck PRINTING jobs every 15 minutes
-setInterval(async () => {
+const cleanupTimer = setInterval(async () => {
   try {
-    const oneHourAgo = new Date(Date.now() - 3600000);
+    const oneHourAgo = new Date(Date.now() - ABANDONED_JOB_TTL_MS);
     const fifteenMinsAgo = new Date(Date.now() - 15 * 60000);
     const { deleteFile } = require('../utils/storage');
 
-    // 1. Delete abandoned PENDING_PAYMENT jobs
-    const abandonedJobs = await prisma.printJob.findMany({
-      where: {
-        status: 'PENDING_PAYMENT',
-        createdAt: { lt: oneHourAgo }
-      },
-      include: { document: true }
-    });
-
-    for (const job of abandonedJobs) {
-      if (job.document && job.document.filename) {
-        await deleteFile(job.document.filename);
-      }
-    }
-
-    const result = await prisma.printJob.deleteMany({
-      where: {
-        status: 'PENDING_PAYMENT',
-        createdAt: { lt: oneHourAgo }
-      }
-    });
-    if (result.count > 0) {
-      console.log(`🧹 Cleaned up ${result.count} abandoned jobs from database.`);
-    }
+    // 1. Delete genuinely abandoned unlinked PENDING_PAYMENT jobs safely
+    await cleanupAbandonedJobs({ deleteFileFn: deleteFile });
 
     // 2. P3-004: Fail and refund stuck PRINTING jobs (Agent crash recovery)
     const stuckJobs = await prisma.printJob.findMany({
@@ -204,11 +359,20 @@ setInterval(async () => {
         where: { id: job.id },
         data: { status: 'FAILED' }
       });
-      
+
       if (job.paymentId) {
-        console.log(`Initiating automated refund for stuck job ${job.shortId}...`);
-        const paymentsService = require('../modules/payments/payments.service');
-        await paymentsService.refundPayment(job.shortId);
+        try {
+          console.log(`Initiating automated recovery refund via refund.service for stuck job ${job.shortId}...`);
+          const refundService = require('./refund.service');
+          await refundService.createRefund({
+            paymentId: job.paymentId,
+            reason: 'Automated crash recovery refund: print job stuck in PRINTING for >15 minutes',
+            idempotencyKey: `auto_recovery_${job.id}_${job.paymentId}`,
+            initiatedBy: 'SYSTEM'
+          });
+        } catch (refundErr) {
+          console.error(`Automated refund failed/skipped for stuck job ${job.shortId}:`, refundErr.message);
+        }
       }
     }
 
@@ -237,8 +401,15 @@ setInterval(async () => {
   }
 }, 15 * 60 * 1000);
 
+if (typeof cleanupTimer.unref === 'function') {
+  cleanupTimer.unref();
+}
+
 module.exports = {
   startPrintingProcess,
   calculateEstimatedWaitTime,
-  initWorker
+  initWorker,
+  cleanupAbandonedJobs,
+  buildAbandonedJobWhere,
+  hasProtectedJobReferences
 };

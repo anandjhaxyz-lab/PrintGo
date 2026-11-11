@@ -41,13 +41,14 @@ describe('Jobs Endpoints', () => {
       ]);
 
       const res = await request(app).get('/api/jobs');
-      
+
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
       expect(res.body.jobs.length).toBe(1);
-      // Ensure the service was called with the user object (for tenant isolation)
+      // Ensure the service was called with the user object and query params (for tenant isolation + pagination)
       expect(jobsService.getAllJobs).toHaveBeenCalledWith(
-        expect.objectContaining({ id: '1', companyId: 'comp-1' })
+        expect.objectContaining({ id: '1', companyId: 'comp-1' }),
+        expect.any(Object)
       );
     });
   });
@@ -56,7 +57,7 @@ describe('Jobs Endpoints', () => {
     it('should validate zod schema for create job', async () => {
       // Missing file and settings
       const res = await request(app).post('/api/jobs').send({});
-      
+
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBeDefined();
     });

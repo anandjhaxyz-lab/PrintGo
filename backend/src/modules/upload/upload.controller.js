@@ -1,6 +1,7 @@
 const { Queue } = require('bullmq');
 const { connection } = require('../../services/redisClient');
 const uploadService = require('./upload.service');
+const { deleteFile } = require('../../utils/storage');
 
 let uploadQueue = null;
 if (connection) {
@@ -25,7 +26,7 @@ const handleUpload = async (req, res, next) => {
       pages = await job.waitUntilFinished(new (require('bullmq').QueueEvents)('uploadQueue', { connection }));
     } else {
       // Fallback or Encrypted bypass
-      pages = await uploadService.getPageCount(fileUrl, req.file.mimetype, isEncrypted, claimedPages);
+      pages = await uploadService.getPageCount(fileUrl, req.file.mimetype, isEncrypted, claimedPages, req.file.path);
     }
 
     res.json({
@@ -39,6 +40,9 @@ const handleUpload = async (req, res, next) => {
       }
     });
   } catch (error) {
+    if (req.file) {
+      deleteFile(req.file.location || req.file.path || req.file.filename).catch(() => {});
+    }
     next(error);
   }
 };

@@ -5,28 +5,78 @@ const logger = require('../../utils/logger');
 
 const generateShortId = () => crypto.randomBytes(4).toString('hex');
 
-const getAllJobs = async (user) => {
+const getAllJobs = async (user, query = {}) => {
+  const { page = 1, limit = 100, status, paymentStatus, machineId, color, duplex, search, startDate, endDate, isTest } = query;
+  const skip = (Math.max(1, Number(page)) - 1) * Number(limit);
+
   const where = {};
   if (user && user.role !== 'SUPERADMIN') {
     where.machine = { companyId: user.companyId };
   }
+  if (status) where.status = status;
+  if (machineId) where.machineId = machineId;
+  if (color) where.color = color;
+  if (duplex) where.duplex = duplex;
+  if (isTest !== undefined && isTest !== '') {
+    where.isTest = isTest === 'true' || isTest === true;
+  }
 
-  return await prisma.printJob.findMany({
-    where,
-    include: {
-      document: true,
-      machine: true,
-      customer: true
-    },
-    orderBy: { createdAt: 'desc' },
-    take: 100
-  });
+  if (paymentStatus) {
+    where.payment = { status: paymentStatus };
+  }
+
+  if (startDate || endDate) {
+    where.createdAt = {};
+    if (startDate) where.createdAt.gte = new Date(startDate);
+    if (endDate) where.createdAt.lte = new Date(endDate);
+  }
+
+  if (search) {
+    where.OR = [
+      { shortId: { contains: search, mode: 'insensitive' } },
+      { document: { originalName: { contains: search, mode: 'insensitive' } } }
+    ];
+  }
+
+  const [jobs, total] = await Promise.all([
+    prisma.printJob.findMany({
+      where,
+      skip,
+      take: Number(limit),
+      include: {
+        document: true,
+        machine: true,
+        customer: true,
+        payment: true,
+        invoice: true,
+        printHistory: { orderBy: { completedAt: 'desc' } }
+      },
+      orderBy: { createdAt: 'desc' }
+    }),
+    prisma.printJob.count({ where })
+  ]);
+
+  return {
+    jobs,
+    pagination: {
+      page: Number(page),
+      limit: Number(limit),
+      total,
+      pages: Math.ceil(total / Number(limit))
+    }
+  };
 };
 
 const getJobByShortId = async (shortId, user = null) => {
   const job = await prisma.printJob.findUnique({
     where: { shortId },
-    include: { document: true, machine: true, payment: true }
+    include: {
+      document: true,
+      machine: true,
+      payment: true,
+      invoice: true,
+      printHistory: { orderBy: { completedAt: 'desc' } }
+    }
   });
   if (!job) {
     throw new AppError('Job not found', 404);
@@ -56,9 +106,13 @@ const createJob = async (jobData) => {
     }
   });
 
-  // Server-side price calculation — client-sent cost is IGNORED
+  // Server-side price calculation with dynamic pricing and immutable snapshot
   const { calculatePrice } = require('../../services/pricing.service');
-  const { cost, pagesToPrint } = calculatePrice(settings, { pages: file.pages });
+  const priceResult = await calculatePrice(settings, { pages: file.pages }, machineId);
+  const { cost, pagesToPrint, pricingSnapshot } = priceResult;
+  if (jobData.sessionId) {
+    pricingSnapshot.sessionId = jobData.sessionId;
+  }
 
   // Create job
   const newJob = await prisma.printJob.create({
@@ -73,6 +127,9 @@ const createJob = async (jobData) => {
       pagesToPrint,
       pageRangeType: settings.pageRangeType,
       customRange: settings.customRange || null,
+      paperSize: settings.paperSize || 'A4',
+      paperType: settings.paperType || 'plain',
+      pricingSnapshot: JSON.stringify(pricingSnapshot),
       encryptedKey: encryptedKey || null,
       iv: iv || null
     },
@@ -86,6 +143,11 @@ const createJob = async (jobData) => {
 const updateJobStatus = async (shortId, status, user = null) => {
   // P2-002: Check permission first
   await getJobByShortId(shortId, user);
+
+  // Historical guard: Job ab36197e must NEVER be modified
+  if (shortId === 'ab36197e') {
+    throw new AppError('Historical baseline job ab36197e is protected and cannot be altered', 400);
+  }
 
   const job = await prisma.printJob.update({
     where: { shortId },

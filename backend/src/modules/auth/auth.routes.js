@@ -16,4 +16,10 @@ router.post('/session/join', validate(sessionSchema), authController.joinSession
 // Backward compatibility: old /session endpoint redirects to /session/join
 // This allows the mobile frontend to work while being migrated
 router.post('/session', validate(sessionSchema), authController.joinSession);
+
+// Permanent Printer QR session endpoints (Phase 2)
+router.post('/session/from-printer-qr', authController.createSessionFromPrinterQr);
+router.get('/printer-qr/:publicCode', authController.getPublicPrinterQrInfo);
+router.get('/pricing', authController.getPublicPricing);
+
 module.exports = router;

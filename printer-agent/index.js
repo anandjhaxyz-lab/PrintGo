@@ -18,6 +18,8 @@ try {
   pdfParse = null;
 }
 const SpoolerMonitor = require('./src/spooler');
+const JobJournal = require('./src/journal');
+const journal = new JobJournal();
 
 process.on('uncaughtException', (err) => {
   console.error('🔥 CRITICAL ERROR: Uncaught Exception:', err);
@@ -106,7 +108,7 @@ if (fs.existsSync(pubKeyPath) && fs.existsSync(privKeyPath)) {
   console.log('✅ New persistent keys generated and saved to disk.');
 }
 
-const spoolerMonitor = new SpoolerMonitor({ execFile, printerName: PRINTER_NAME });
+const spoolerMonitor = new SpoolerMonitor({ execFile, printerName: PRINTER_NAME, journal });
 
 let statusInterval = null;
 socket.on('connect', () => {
@@ -147,6 +149,30 @@ socket.on('connect_error', (err) => {
   console.error(`🔌 Connection Error: ${err.message}`);
 });
 
+socket.on('ack_job_completed', ({ jobId }) => {
+  console.log(`✅ Backend acknowledged completion for Job ${jobId}`);
+  journal.recordAcknowledged(jobId);
+});
+
+socket.on('reconcile_active_jobs', ({ jobIds = [] }) => {
+  console.log(`🔍 Received reconciliation request from backend for jobs:`, jobIds);
+  for (const jobId of jobIds) {
+    const entry = journal.getJob(jobId);
+    if (entry && journal.isDispatched(jobId)) {
+      console.log(`📡 Reporting existing dispatch evidence for Job ${jobId} (state: ${entry.state})`);
+      socket.emit('print_physical_success', {
+        jobId,
+        reconciled: true,
+        dispatchedAt: entry.dispatchedAt,
+        completedAt: entry.completedAt
+      });
+    } else {
+      console.log(`📡 Job ${jobId} was never dispatched locally.`);
+      socket.emit('job_reconciliation_report', { jobId, status: 'NOT_DISPATCHED' });
+    }
+  }
+});
+
 // checkPrinterStatus logic has been moved to src/spooler.js
 
 socket.on('physical_print_job', async (jobData) => {
@@ -156,14 +182,26 @@ socket.on('physical_print_job', async (jobData) => {
     return;
   }
 
+  // Idempotency Guard (P0) - Never re-print a previously dispatched job!
+  if (journal.isDispatched(jobData.jobId)) {
+    console.warn(`⚠️ IDEMPOTENCY GUARD: Job ${jobData.jobId} was already dispatched/printed locally. Refusing duplicate physical print!`);
+    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true });
+    return;
+  }
+
+  journal.recordReceived(jobData.jobId, { originalName: jobData.originalName });
+
   console.log(`\n======================================================`);
   console.log(`📥 NEW PRINT JOB RECEIVED! [Job ID: ${jobData.jobId}]`);
   console.log(`📄 Document: ${jobData.originalName}`);
   console.log(`======================================================`);
 
-  const fileUrl = jobData.fileUrl.startsWith('http') 
-    ? jobData.fileUrl 
-    : `${BACKEND_URL}${jobData.fileUrl}`;
+  let fileUrl = jobData.fileUrl;
+  if (fileUrl && fileUrl.startsWith('https://localhost:5000')) {
+    fileUrl = fileUrl.replace('https://localhost:5000', BACKEND_URL);
+  } else if (fileUrl && !fileUrl.startsWith('http')) {
+    fileUrl = `${BACKEND_URL}${fileUrl.startsWith('/') ? '' : '/'}${fileUrl}`;
+  }
   
   // Extract original extension (default to .pdf if missing)
   const ext = jobData.originalName ? path.extname(jobData.originalName) : '.pdf';
@@ -269,8 +307,10 @@ socket.on('physical_print_job', async (jobData) => {
         
         if (jobData.settings) {
           if (jobData.settings.copies) printOptions.copies = jobData.settings.copies;
-          if (jobData.settings.color === 'bw') printOptions.monochrome = true;
-          if (jobData.settings.duplex === 'double') printOptions.duplex = true;
+          // Set monochrome: true for B&W, false for explicit color flag in SumatraPDF
+          printOptions.monochrome = (jobData.settings.color === 'bw');
+          // Set side: 'duplex' for double-sided, 'simplex' for single-sided
+          printOptions.side = (jobData.settings.duplex === 'double') ? 'duplex' : 'simplex';
           if (jobData.settings.pageRangeType === 'custom' && jobData.settings.customRange) {
             if (/^[0-9,-]+$/.test(jobData.settings.customRange)) {
               printOptions.pages = jobData.settings.customRange;
@@ -281,6 +321,7 @@ socket.on('physical_print_job', async (jobData) => {
         }
         
         console.log(`⚙️  Windows Print options:`, JSON.stringify(printOptions));
+        journal.recordDispatched(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
         await ptp.print(printFilePath, printOptions);
       } else {
         // Linux CUPS Support (Raspberry Pi)

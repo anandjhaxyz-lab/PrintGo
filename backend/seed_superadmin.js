@@ -5,7 +5,13 @@ const bcrypt = require('bcrypt');
 const prisma = new PrismaClient();
 
 async function main() {
-  const email = 'superadmin@printgo.com';
+  const email = process.env.ADMIN_USER || 'superadmin@printgo.in';
+  const password = process.env.ADMIN_PASS;
+
+  if (!password) {
+    throw new Error('ADMIN_PASS environment variable is not defined.');
+  }
+
   const existingUser = await prisma.user.findUnique({
     where: { email },
   });
@@ -15,7 +21,7 @@ async function main() {
     return;
   }
 
-  const hashedPassword = await bcrypt.hash('Admin@123!', 12);
+  const hashedPassword = await bcrypt.hash(password, 12);
   const user = await prisma.user.create({
     data: {
       email,
@@ -25,7 +31,7 @@ async function main() {
     },
   });
 
-  console.log(`Created superadmin successfully: ${user.email} (Password: Admin@123!)`);
+  console.log(`Created superadmin successfully: ${user.email} (Password securely loaded from environment)`);
 }
 
 main()
