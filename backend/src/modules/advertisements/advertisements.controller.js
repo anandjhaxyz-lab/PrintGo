@@ -3,6 +3,7 @@ const path = require('path');
 const prisma = require('../../utils/prisma');
 const logger = require('../../utils/logger');
 const AppError = require('../../utils/AppError');
+const { getAdsUploadsDir } = require('../../utils/storage');
 
 /**
  * Public: Get active, non-expired advertisements for customer portal
@@ -166,7 +167,7 @@ const updateAdvertisement = async (req, res, next) => {
 
       // Clean up previous file if local
       if (existing.mediaUrl && existing.mediaUrl.startsWith('/uploads/ads/')) {
-        const oldPath = path.join(__dirname, '../../../uploads/ads', path.basename(existing.mediaUrl));
+        const oldPath = path.join(getAdsUploadsDir(), path.basename(existing.mediaUrl));
         if (fs.existsSync(oldPath)) {
           try {
             fs.unlinkSync(oldPath);
@@ -264,7 +265,7 @@ const deleteAdvertisement = async (req, res, next) => {
 
     // Clean up media file from disk
     if (existing.mediaUrl && existing.mediaUrl.startsWith('/uploads/ads/')) {
-      const filePath = path.join(__dirname, '../../../uploads/ads', path.basename(existing.mediaUrl));
+      const filePath = path.join(getAdsUploadsDir(), path.basename(existing.mediaUrl));
       if (fs.existsSync(filePath)) {
         try {
           fs.unlinkSync(filePath);

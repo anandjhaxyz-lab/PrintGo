@@ -6,10 +6,12 @@ services:
   - type: web
     name: printgo-backend-staging
     env: node
-    plan: starter
+    plan: 0.5c-512mb
     rootDir: backend
-    buildCommand: npm install && npx prisma generate && npx prisma migrate deploy
+    buildCommand: npm install && npx prisma generate
+    preDeployCommand: npx prisma migrate deploy
     startCommand: npm start
+    healthCheckPath: /api/health
     disk:
       name: printgo-storage-staging
       mountPath: /var/data
@@ -26,7 +28,8 @@ services:
           name: printgo-db-staging
           property: connectionString
       - key: ALLOWED_ORIGINS
-        # Set strictly to the staging frontend origin only (e.g. https://s3k-print-staging.vercel.app)
+        # Set to BOTH staging customer portal AND admin dashboard HTTPS origins, comma-separated with no trailing slashes
+        # Example: https://<staging-customer-domain>,https://printgo-admin-staging.onrender.com
         sync: false
       - key: FRONTEND_URL
         # Set to the deployed staging customer frontend HTTPS URL (e.g. https://s3k-print-staging.vercel.app)
@@ -84,9 +87,9 @@ services:
 # confirms single-instance staging runs safely with in-memory Socket.IO and print dispatch fallback,
 # saving $7.00/mo ($16.50/mo total instead of $23.50/mo). Re-add Redis when scaling multi-instance.
 
-# Persistent PostgreSQL Database for Staging (Starter Plan — Non-expiring, Isolated from printgo_db)
+# Persistent PostgreSQL Database for Staging (0.1c-256mb Entry Paid Plan — Non-expiring, Isolated from printgo_db)
 databases:
   - name: printgo-db-staging
     databaseName: printgo_staging
     user: printgo_staging_user
-    plan: starter
+    plan: 0.1c-256mb

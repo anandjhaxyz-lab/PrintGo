@@ -38,6 +38,9 @@ const getSafeExtension = (mimetype) => {
   return map[mimetype] || '.bin';
 };
 
+const getUploadsDir = () => process.env.UPLOADS_DIR || path.join(__dirname, '..', '..', 'uploads');
+const getAdsUploadsDir = () => path.join(getUploadsDir(), 'ads');
+
 const getStorage = () => {
   if (useS3) {
     return multerS3({
@@ -54,7 +57,7 @@ const getStorage = () => {
   } else {
     return multer.diskStorage({
       destination: function (req, file, cb) {
-        const uploadDir = process.env.UPLOADS_DIR || path.join(__dirname, '../../uploads');
+        const uploadDir = getUploadsDir();
         if (!fs.existsSync(uploadDir)) {
           fs.mkdirSync(uploadDir, { recursive: true });
         }
@@ -94,7 +97,7 @@ const deleteFile = async (filename) => {
       // It's a local file
       const filePath = filename.startsWith('/')
         ? path.join(__dirname, '..', '..', filename)
-        : path.join(process.env.UPLOADS_DIR || path.join(__dirname, '..', '..', 'uploads'), path.basename(filename));
+        : path.join(getUploadsDir(), path.basename(filename));
 
       if (fs.existsSync(filePath)) {
         await fs.promises.unlink(filePath);
@@ -109,6 +112,8 @@ const deleteFile = async (filename) => {
 };
 
 module.exports = {
+  getUploadsDir,
+  getAdsUploadsDir,
   getStorage,
   deleteFile,
   useS3

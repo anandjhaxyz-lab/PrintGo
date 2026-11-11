@@ -1,4 +1,5 @@
 const machinesService = require('./machines.service');
+const prisma = require('../../utils/prisma');
 
 const getMachines = async (req, res, next) => {
   try {
@@ -55,8 +56,6 @@ const getAgentVersion = async (req, res, next) => {
 
 const getPublicKey = async (req, res, next) => {
   try {
-    const { PrismaClient } = require('@prisma/client');
-    const prisma = new PrismaClient();
     const machine = await prisma.machine.findUnique({
       where: { id: req.params.id },
       select: { publicKey: true }

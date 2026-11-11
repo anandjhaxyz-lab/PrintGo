@@ -5,20 +5,27 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { protect, restrictTo } = require('../../middlewares/auth');
 const { readOnlyGuard } = require('../../middlewares/readOnlyGuard');
+const { getAdsUploadsDir } = require('../../utils/storage');
 const adController = require('./advertisements.controller');
 
 const router = express.Router();
 
-// Ensure ads upload directory exists
-const adsDir = path.join(__dirname, '../../../uploads/ads');
-if (!fs.existsSync(adsDir)) {
-  fs.mkdirSync(adsDir, { recursive: true });
-}
+const ensureAdsUploadDir = () => {
+  const adsDir = getAdsUploadsDir();
+  if (!fs.existsSync(adsDir)) {
+    fs.mkdirSync(adsDir, { recursive: true });
+  }
+  return adsDir;
+};
 
-// Multer storage for advertisements
+// Multer storage for advertisements (aligned with UPLOADS_DIR and server.js /uploads/ads static mount)
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, adsDir);
+    try {
+      cb(null, ensureAdsUploadDir());
+    } catch (err) {
+      cb(err);
+    }
   },
   filename: function (req, file, cb) {
     const ext = path.extname(file.originalname).toLowerCase() || 
