@@ -15,7 +15,7 @@ services:
     disk:
       name: printgo-storage-staging
       mountPath: /var/data
-      sizeGB: 10
+      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
@@ -32,7 +32,7 @@ services:
         # Example: https://<staging-customer-domain>,https://printgo-admin-staging.onrender.com
         sync: false
       - key: FRONTEND_URL
-        # Set to the deployed staging customer frontend HTTPS URL (e.g. https://s3k-print-staging.vercel.app)
+        # Set to the deployed staging customer frontend HTTPS URL (e.g. https://s3k-print-staging.pages.dev)
         sync: false
       - key: ADMIN_READ_ONLY
         value: "true"
@@ -56,7 +56,7 @@ services:
       - key: CASHFREE_ENV
         value: sandbox
       - key: PUBLIC_APP_URL
-        # Set to the deployed staging customer frontend HTTPS URL (e.g. https://s3k-print-staging.vercel.app)
+        # Set to the deployed staging customer frontend HTTPS URL (e.g. https://s3k-print-staging.pages.dev)
         sync: false
       - key: CASHFREE_NOTIFY_URL
         # Set to the verified staging backend webhook URL (e.g. https://printgo-backend-staging.onrender.com/api/payments/webhook)
@@ -64,7 +64,7 @@ services:
       - key: ENABLE_DEMO_PAYMENT
         value: "false"
 
-  # 2. PrintGo Staging Admin Dashboard (Admin-Only Static Site; Customer Portal deploys on Vercel)
+  # 2. PrintGo Staging Admin Dashboard (Admin-Only Static Site; Customer Portal deploys separately on Cloudflare Pages Free)
   - type: web
     name: printgo-admin-staging
     env: static
@@ -84,12 +84,13 @@ services:
 
 # Note: Redis is intentionally omitted for single-instance staging.
 # Code verification (redisClient.js, queueService.js, upload.controller.js, server.js)
-# confirms single-instance staging runs safely with in-memory Socket.IO and print dispatch fallback,
-# saving $7.00/mo ($16.50/mo total instead of $23.50/mo). Re-add Redis when scaling multi-instance.
+# confirms single-instance staging runs safely with in-memory Socket.IO and print dispatch fallback.
+# Budget-aligned estimate: ~$13.55/mo ($7.00 backend + $0.25 1 GB disk + $6.30 Postgres 0.1c-256mb w/ 1 GB disk).
 
-# Persistent PostgreSQL Database for Staging (0.1c-256mb Entry Paid Plan — Non-expiring, Isolated from printgo_db)
+# Persistent PostgreSQL Database for Staging (0.1c-256mb + 1 GB Disk — Non-expiring, Isolated from printgo_db)
 databases:
   - name: printgo-db-staging
     databaseName: printgo_staging
     user: printgo_staging_user
     plan: 0.1c-256mb
+    diskSizeGB: 1
