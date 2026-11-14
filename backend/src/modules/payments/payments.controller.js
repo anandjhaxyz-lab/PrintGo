@@ -37,10 +37,22 @@ const checkJobAccess = (req, job) => {
       return { status: 403, error: 'Access denied: Machine session required for this job' };
     }
 
+    // Fail-closed kiosk/mobile session ownership check (H-01 remediation)
     const jobSessionId = extractJobSessionId(job);
-    if (jobSessionId && req.session.sessionId && jobSessionId !== req.session.sessionId) {
+    const reqSessionId = req.session.sessionId;
+
+    if (!jobSessionId) {
+      return { status: 403, error: 'Access denied: Job has no bound session' };
+    }
+
+    if (!reqSessionId) {
+      return { status: 403, error: 'Access denied: Request has no active session' };
+    }
+
+    if (jobSessionId !== reqSessionId) {
       return { status: 403, error: 'Access denied: Session does not own this job' };
     }
+
     return null;
   }
 
@@ -61,6 +73,9 @@ const createCashfreeOrder = async (req, res, next) => {
     const sessionId = req.session?.sessionId || req.body?.sessionId;
     const returnUrl = req.body?.returnUrl;
     const ipAddress = req.ip || req.connection?.remoteAddress;
+    // Optional customer contact fields — validated server-side in payments.service
+    const customerPhone = req.body?.customerPhone || null;
+    const customerEmail = req.body?.customerEmail || null;
 
     const job = await prisma.printJob.findUnique({
       where: { shortId: id },
@@ -75,7 +90,9 @@ const createCashfreeOrder = async (req, res, next) => {
     const orderDetails = await paymentsService.createOrder(id, {
       sessionId,
       returnUrl,
-      ipAddress
+      ipAddress,
+      customerPhone,
+      customerEmail
     });
 
     res.json({ success: true, ...orderDetails });
@@ -144,7 +161,9 @@ const verifyPayment = async (req, res, next) => {
     if (updatedJob) {
       if (updatedJob.status === 'WAITING' && wasJustUpdated && startPrintingProcess) {
         logger.info(`Payment confirmed via polling. Triggering print queue for job ${updatedJob.shortId}`);
-        startPrintingProcess(updatedJob.shortId, req.app.get('io'));
+        Promise.resolve(startPrintingProcess(updatedJob.shortId, req.app.get('io'))).catch((err) => {
+          logger.error(`Failed to enqueue print job ${updatedJob.shortId} after poll verification: ${err.message}`);
+        });
       }
       return res.json({ success: true, job: updatedJob, status: updatedJob.status });
     }
@@ -232,16 +251,33 @@ const cashfreeWebhook = async (req, res, next) => {
       return res.status(200).send('Already processed');
     }
 
-    const recordedEvent = existingEvent || await prisma.paymentEvent.create({
-      data: {
-        eventId: uniqueEventId,
-        eventType: eventType || 'UNKNOWN_WEBHOOK',
-        gatewayOrderId: entityKey,
-        signature: signature,
-        payload: redactSensitiveData(event),
-        processed: false
+    let recordedEvent = existingEvent;
+    if (!recordedEvent) {
+      try {
+        recordedEvent = await prisma.paymentEvent.create({
+          data: {
+            eventId: uniqueEventId,
+            eventType: eventType || 'UNKNOWN_WEBHOOK',
+            gatewayOrderId: entityKey,
+            signature: signature,
+            payload: redactSensitiveData(event),
+            processed: false
+          }
+        });
+      } catch (createErr) {
+        // M-03: Handle concurrent duplicate webhook delivery race (Prisma P2002 on eventId)
+        if (createErr && createErr.code === 'P2002') {
+          const target = createErr.meta?.target;
+          const targetStr = Array.isArray(target) ? target.join(',') : String(target || '');
+          if (targetStr.includes('eventId') || targetStr.includes('PaymentEvent_eventId_key') || !target) {
+            logger.info(`Webhook idempotency race: Event ${uniqueEventId} already recorded concurrently. Skipping duplicate.`);
+            return res.status(200).send('Already processing');
+          }
+        }
+        // Unrelated P2002 or other database error must not be swallowed
+        throw createErr;
       }
-    });
+    }
 
     logger.info(`Processing Cashfree webhook: type=${eventType}, entity=${entityKey}`);
 
@@ -259,7 +295,9 @@ const cashfreeWebhook = async (req, res, next) => {
 
       if (updatedJob && wasJustUpdated && startPrintingProcess) {
         logger.info(`Webhook: Payment verified for job ${updatedJob.shortId}. Dispatching to print queue.`);
-        startPrintingProcess(updatedJob.shortId, req.app.get('io'));
+        Promise.resolve(startPrintingProcess(updatedJob.shortId, req.app.get('io'))).catch((err) => {
+          logger.error(`Failed to enqueue print job ${updatedJob.shortId} after webhook verification: ${err.message}`);
+        });
       }
     } else if (eventType === 'PAYMENT_FAILED_WEBHOOK' || eventType === 'PAYMENT_USER_DROPPED_WEBHOOK') {
       const payment = orderId
@@ -519,5 +557,7 @@ module.exports = {
   verifyPayment,
   cashfreeWebhook,
   refundOrder,
-  demoPayment
+  demoPayment,
+  checkJobAccess,
+  extractJobSessionId
 };

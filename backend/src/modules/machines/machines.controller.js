@@ -69,11 +69,56 @@ const getPublicKey = async (req, res, next) => {
   }
 };
 
+const setAdSuppression = async (req, res, next) => {
+  try {
+    const adSuppressionService = require('../../services/adSuppression.service');
+    const result = await adSuppressionService.setAdSuppression(
+      req.params.id,
+      req.body,
+      req.user,
+      req.ip
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const cancelAdSuppression = async (req, res, next) => {
+  try {
+    const adSuppressionService = require('../../services/adSuppression.service');
+    const result = await adSuppressionService.cancelAdSuppression(
+      req.params.id,
+      req.user,
+      req.ip
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getAdSuppressionStatus = async (req, res, next) => {
+  try {
+    const adSuppressionService = require('../../services/adSuppression.service');
+    const result = await adSuppressionService.getAdSuppressionStatus(
+      req.params.id,
+      req.user
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getMachines,
   createMachine,
   updateMachine,
   getMyMachines,
   getAgentVersion,
-  getPublicKey
+  getPublicKey,
+  setAdSuppression,
+  cancelAdSuppression,
+  getAdSuppressionStatus
 };

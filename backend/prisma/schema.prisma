@@ -89,12 +89,21 @@ model Machine {
   sessions        Session[]
   printerQrs      PrinterQr[]
   printPricingProfile PrintPricingProfile?
+  advertisements  Advertisement[]
+
+  // Advertisement Suppression Control
+  adSuppressionMode   AdSuppressionMode @default(ENABLED)
+  adSuppressionUntil  DateTime?
+  adSuppressionReason String?
+  adSuppressedBy      String?
+  adSuppressedAt      DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([companyId])
   @@index([status])
+  @@index([adSuppressionMode, adSuppressionUntil])
 }
 
 model PrinterQr {
@@ -626,26 +635,54 @@ model ReconciliationRecord {
 // 10. ADVERTISEMENT DISPLAY & PROMOTIONS
 // ==============================================
 
+enum AdSuppressionMode {
+  ENABLED
+  PERMANENT
+  TEMPORARY
+}
+
+enum AdvertisementScope {
+  GLOBAL
+  MACHINE_SPECIFIC
+}
+
+enum AdvertisementPlacement {
+  ALL
+  KIOSK_ONLY
+  MOBILE_ONLY
+}
+
 model Advertisement {
-  id              String    @id @default(uuid())
+  id              String                 @id @default(uuid())
   title           String
-  type            String    // 'IMAGE' or 'VIDEO'
+  type            String                 // 'IMAGE' or 'VIDEO'
   mediaUrl        String
   thumbnailUrl    String?
-  displayDuration Int       @default(5) // in seconds for slideshow
-  displayOrder    Int       @default(0)
-  isActive        Boolean   @default(true)
+  displayDuration Int                    @default(5) // in seconds for slideshow
+  displayOrder    Int                    @default(0)
+  isActive        Boolean                @default(true)
+
+  // Scope & Machine Binding
+  scope           AdvertisementScope     @default(GLOBAL)
+  machineId       String?
+  machine         Machine?               @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  // Placement Targeting
+  placement       AdvertisementPlacement @default(ALL)
+
   startDate       DateTime?
   endDate         DateTime?
   fileSize        Int?
   mimeType        String?
   createdBy       String?
   companyId       String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
 
   @@index([isActive])
   @@index([displayOrder])
+  @@index([scope, machineId])
+  @@index([placement])
   @@index([startDate, endDate])
 }
 

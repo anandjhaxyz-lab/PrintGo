@@ -706,8 +706,20 @@ const MobileView = () => {
         }
       }
 
+      // -------------------------------------------------------
+      //  PDF‑MIME COERCION (Windows Chrome)
+      // -------------------------------------------------------
+      // Chrome on Windows reports PDFs as `application/octet-stream`.
+      // Multer only accepts the explicit PDF MIME types listed in upload.routes.js.
+      // To keep the backend happy we override the MIME type for any file whose
+      // extension is .pdf.
+      let uploadBlob = payloadToUpload;
+      if (/\.pdf$/i.test(finalFileName) && payloadToUpload.type === 'application/octet-stream') {
+        // Create a new Blob with the correct MIME type.
+        uploadBlob = new Blob([payloadToUpload], { type: 'application/pdf' });
+      }
       const formData = new FormData();
-      formData.append('file', payloadToUpload, finalFileName);
+      formData.append('file', uploadBlob, finalFileName);
       formData.append('isEncrypted', String(isEncrypted));
       formData.append('claimedPages', String(claimedPages));
 
@@ -1039,7 +1051,11 @@ const MobileView = () => {
       case 1:
         return (
           <div className="flex flex-col justify-center animate-fade-in" style={{ gap: '0.65rem' }}>
-            <AdvertisementDisplay />
+            <AdvertisementDisplay
+              sessionToken={sessionToken}
+              publicCode={publicCode}
+              placement="MOBILE_ONLY"
+            />
 
             <div className="s3k-card py-2 px-3 flex items-center justify-between" style={{ minHeight: 48 }}>
               <div className="flex items-center gap-2.5 overflow-hidden flex-1 min-w-0 mr-2">
@@ -1182,7 +1198,11 @@ const MobileView = () => {
       case 2:
         return (
           <div className="flex flex-col justify-center animate-fade-in" style={{ gap: '0.45rem' }}>
-            <AdvertisementDisplay />
+            <AdvertisementDisplay
+              sessionToken={sessionToken}
+              publicCode={publicCode}
+              placement="MOBILE_ONLY"
+            />
 
             <div className="s3k-card py-2 px-3 flex items-center justify-between">
               <div className="flex items-center gap-2 overflow-hidden flex-1 min-w-0 mr-2">

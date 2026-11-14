@@ -25,61 +25,101 @@ let globalIo = null;
 
 const processJob = async (shortId) => {
   try {
-    const dbJob = await prisma.printJob.findUnique({ 
+    // 1. Atomic conditional claim: transition strictly from WAITING -> PRINTING
+    const claimResult = await prisma.printJob.updateMany({
+      where: {
+        shortId,
+        status: 'WAITING'
+      },
+      data: {
+        status: 'PRINTING'
+      }
+    });
+
+    if (claimResult.count === 0) {
+      // Check current job status to provide clear, observable logging
+      const existingJob = await prisma.printJob.findUnique({
+        where: { shortId },
+        select: { id: true, status: true }
+      });
+      if (!existingJob) {
+        console.warn(`Job ${shortId}: not found in database, skipping`);
+      } else {
+        console.warn(`Job ${shortId}: cannot claim for printing (current status: ${existingJob.status}), skipping duplicate/invalid dispatch`);
+      }
+      return null;
+    }
+
+    // 2. Job claimed atomically. Fetch document and full details for physical print dispatch.
+    const updatedJob = await prisma.printJob.findUnique({
       where: { shortId },
       include: { document: true }
     });
-    if (!dbJob) return;
 
-    // Validate state transition using state machine
-    if (!isValidJobTransition(dbJob.status, 'PRINTING')) {
-      console.warn(`Job ${shortId}: cannot transition from ${dbJob.status} to PRINTING, skipping`);
-      return;
+    if (!updatedJob) {
+      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: claimed successfully but record could not be re-fetched from database`);
+      return null;
     }
 
-    if (dbJob.status === 'WAITING') {
-      const updatedJob = await prisma.printJob.update({
+    // Check document presence
+    if (!updatedJob.document || !updatedJob.document.filename) {
+      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: missing document or filename. Cannot print. Marking job FAILED.`);
+      await prisma.printJob.update({
         where: { shortId },
-        data: { status: 'PRINTING' },
-        include: { document: true }
+        data: { status: 'FAILED' }
       });
-      
-      if (globalIo) {
-        // Emit status change to machine room + admins only
-        // Emit status change is now handled universally by Prisma $extends
-        
-        const printData = {
-          jobId: updatedJob.shortId,
-          fileUrl: (updatedJob.document && updatedJob.document.filename) ? updatedJob.document.filename.replace(/^https:\/\/localhost:5000/, 'http://localhost:5000') : '', 
-          originalName: updatedJob.document ? updatedJob.document.originalName : '',
-          pagesToPrint: updatedJob.pagesToPrint,
-          settings: {
-            color: updatedJob.color,
-            duplex: updatedJob.duplex,
-            copies: updatedJob.copies,
-            pageRangeType: updatedJob.pageRangeType,
-            customRange: updatedJob.customRange
-          },
-          price: updatedJob.cost,
-          encryptedKey: updatedJob.encryptedKey,
-          iv: updatedJob.iv
-        };
-        
-        if (updatedJob.machineId) {
-          globalIo.to(`machine_${updatedJob.machineId}`).emit('physical_print_job', printData);
-        } else {
-          // No machineId assigned — cannot send to a specific printer
-          // Log a warning instead of broadcasting to ALL sockets
-          console.warn(`Job ${updatedJob.shortId} has no machineId — cannot route to printer agent`);
-        }
-      }
-      
-      console.log(`Job ${shortId} is now PRINTING. Waiting for agent feedback...`);
-      // The physical printer agent will now respond with 'print_spooler_success' or 'print_spooler_error'
-      // which will be handled in socket.js to mark the job as COMPLETED or FAILED.
+      return null;
     }
+
+    // Check machine assignment
+    if (!updatedJob.machineId) {
+      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: no machineId assigned. Cannot route to printer. Marking job FAILED.`);
+      await prisma.printJob.update({
+        where: { shortId },
+        data: { status: 'FAILED' }
+      });
+      return null;
+    }
+
+    if (globalIo) {
+      // Emit status change to machine room + admins only
+      // Emit status change is now handled universally by Prisma $extends
+      
+      const printData = {
+        jobId: updatedJob.shortId,
+        fileUrl: updatedJob.document.filename.replace(/^https:\/\/localhost:5000/, 'http://localhost:5000'),
+        originalName: updatedJob.document.originalName || '',
+        pagesToPrint: updatedJob.pagesToPrint,
+        settings: {
+          color: updatedJob.color,
+          duplex: updatedJob.duplex,
+          copies: updatedJob.copies,
+          pageRangeType: updatedJob.pageRangeType,
+          customRange: updatedJob.customRange
+        },
+        price: updatedJob.cost,
+        encryptedKey: updatedJob.encryptedKey,
+        iv: updatedJob.iv
+      };
+      
+      try {
+        globalIo.to(`machine_${updatedJob.machineId}`).emit('physical_print_job', printData);
+      } catch (socketErr) {
+        console.error(`[POST_CLAIM_ERROR] Job ${shortId}: Socket emission to machine_${updatedJob.machineId} failed: ${socketErr.message}`);
+        // Ambiguous-job safety:
+        // Do NOT reset to WAITING because physical print dispatch may already have partially occurred.
+        // Leaving in PRINTING guarantees the 15-minute recovery cleaner safely marks FAILED and refunds if unacknowledged.
+        throw socketErr;
+      }
+    }
+
+    console.log(`Job ${shortId} is now PRINTING. Waiting for agent feedback...`);
+    // The physical printer agent will now respond with 'print_spooler_success' or 'print_spooler_error'
+    // which will be handled in socket.js to mark the job as COMPLETED or FAILED.
+    return updatedJob;
   } catch(e) {
     console.error(`Error processing job ${shortId}:`, e);
+    throw e;
   }
 };
 
@@ -105,26 +145,30 @@ const initWorker = (io) => {
 };
 
 const startPrintingProcess = async (shortId, io) => {
-  if (!globalIo && io) globalIo = io;
+  if (io) globalIo = io;
   
   if (useRedis && printQueue) {
     try {
-      // Race with a 2.5s timeout so a dead/limited Redis never blocks printing
-      await Promise.race([
-        printQueue.add('printJob', { shortId }, {
+      const enqueuedJob = await printQueue.add(
+        'printJob',
+        { shortId },
+        {
+          jobId: `print_${shortId}`, // Deterministic BullMQ job identity
           attempts: 1, // Single execution guarantee for physical printing (NO AUTOMATIC RETRIES)
           removeOnComplete: true,
           removeOnFail: false // Retain failed physical job records for operator inspection
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Redis operation timed out')), 2500))
-      ]);
+        }
+      );
+      return enqueuedJob;
     } catch(e) {
-      console.warn(`Redis queue unavailable (${e.message}), executing print job in-memory fallback.`);
-      processJob(shortId);
+      // Observable error: BullMQ is the sole dispatch mechanism when Redis is configured.
+      // Under no circumstances do we fall back to direct in-memory processJob() on enqueue failure or timeout.
+      console.error(`Failed to enqueue job ${shortId} to BullMQ: ${e.message}`);
+      throw e;
     }
   } else {
-    // In-memory fallback: just process asynchronously
-    processJob(shortId);
+    // In-memory fallback: strictly for local development/testing where Redis is not configured
+    return await processJob(shortId);
   }
 };
 
@@ -335,46 +379,116 @@ const cleanupAbandonedJobs = async (options = {}) => {
   return summary;
 };
 
+/**
+ * P1-02/P1-05 Safety: Evaluates and recovers stuck PRINTING jobs safely.
+ * Excludes ambiguous jobs and rechecks eligibility atomically inside a transaction.
+ */
+const cleanupStuckPrintingJobs = async (options = {}) => {
+  const db = options.prismaClient || prisma;
+  const nowMs = options.now instanceof Date ? options.now.getTime() : Date.now();
+  const fifteenMinsAgo = new Date(nowMs - (options.timeoutMs || 15 * 60000));
+  const refundService = options.refundService || require('./refund.service');
+
+  const stuckJobs = await db.printJob.findMany({
+    where: {
+      status: 'PRINTING',
+      updatedAt: { lt: fifteenMinsAgo },
+      printHistory: {
+        none: {
+          success: false,
+          errorDetails: {
+            contains: 'Ambiguous outcome'
+          }
+        }
+      }
+    }
+  });
+
+  const results = {
+    scanned: stuckJobs.length,
+    failed: 0,
+    refunded: 0,
+    skipped: 0
+  };
+
+  for (const job of stuckJobs) {
+    let shouldRefund = false;
+    let targetPaymentId = null;
+
+    try {
+      await db.$transaction(async (tx) => {
+        // Concurrency Guard: Atomic conditional transition from PRINTING -> FAILED.
+        // Requires:
+        // 1. Exact job ID match
+        // 2. Status is still PRINTING
+        // 3. updatedAt is still older than 15 minutes
+        // 4. Zero ambiguous PrintHistory records exist
+        const updateResult = await tx.printJob.updateMany({
+          where: {
+            id: job.id,
+            status: 'PRINTING',
+            updatedAt: { lt: fifteenMinsAgo },
+            printHistory: {
+              none: {
+                success: false,
+                errorDetails: {
+                  contains: 'Ambiguous outcome'
+                }
+              }
+            }
+          },
+          data: {
+            status: 'FAILED'
+          }
+        });
+
+        // If count === 0, the job was modified, resolved, touched, or acquired ambiguity concurrently.
+        if (updateResult.count === 0) {
+          results.skipped++;
+          return;
+        }
+
+        results.failed++;
+
+        if (job.paymentId) {
+          shouldRefund = true;
+          targetPaymentId = job.paymentId;
+        }
+      });
+    } catch (txErr) {
+      console.error(`[CLEANUP_ERROR] Failed during atomic conditional transition to FAILED for job ${job.shortId}:`, txErr.message);
+      continue;
+    }
+
+    if (shouldRefund && targetPaymentId) {
+      try {
+        await refundService.createRefund({
+          paymentId: targetPaymentId,
+          reason: 'Automated crash recovery refund: print job stuck in PRINTING for >15 minutes',
+          idempotencyKey: `auto_recovery_${job.id}_${targetPaymentId}`,
+          initiatedBy: 'SYSTEM'
+        });
+        results.refunded++;
+      } catch (refundErr) {
+        console.error(`Automated refund failed/skipped for stuck job ${job.shortId}:`, refundErr.message);
+      }
+    }
+  }
+
+  return results;
+};
+
 // Cleanup abandoned jobs and stuck PRINTING jobs every 15 minutes
 const cleanupTimer = setInterval(async () => {
   try {
     const oneHourAgo = new Date(Date.now() - ABANDONED_JOB_TTL_MS);
-    const fifteenMinsAgo = new Date(Date.now() - 15 * 60000);
     const { deleteFile } = require('../utils/storage');
 
     // 1. Delete genuinely abandoned unlinked PENDING_PAYMENT jobs safely
     await cleanupAbandonedJobs({ deleteFileFn: deleteFile });
 
-    // 2. P3-004: Fail and refund stuck PRINTING jobs (Agent crash recovery)
-    const stuckJobs = await prisma.printJob.findMany({
-      where: {
-        status: 'PRINTING',
-        updatedAt: { lt: fifteenMinsAgo }
-      }
-    });
-
-    for (const job of stuckJobs) {
-      console.error(`⚠️  Job ${job.shortId} stuck in PRINTING for >15 mins. Marking FAILED.`);
-      await prisma.printJob.update({
-        where: { id: job.id },
-        data: { status: 'FAILED' }
-      });
-
-      if (job.paymentId) {
-        try {
-          console.log(`Initiating automated recovery refund via refund.service for stuck job ${job.shortId}...`);
-          const refundService = require('./refund.service');
-          await refundService.createRefund({
-            paymentId: job.paymentId,
-            reason: 'Automated crash recovery refund: print job stuck in PRINTING for >15 minutes',
-            idempotencyKey: `auto_recovery_${job.id}_${job.paymentId}`,
-            initiatedBy: 'SYSTEM'
-          });
-        } catch (refundErr) {
-          console.error(`Automated refund failed/skipped for stuck job ${job.shortId}:`, refundErr.message);
-        }
-      }
-    }
+    // 2. P3-004 / P1-02: Fail and refund stuck PRINTING jobs (Agent crash recovery)
+    await cleanupStuckPrintingJobs();
 
     // 3. Delete files for COMPLETED, FAILED, and REFUNDED jobs older than 1 hour
     const oldFinishedJobs = await prisma.printJob.findMany({
@@ -405,11 +519,24 @@ if (typeof cleanupTimer.unref === 'function') {
   cleanupTimer.unref();
 }
 
+const _setQueueForTesting = (mockQueue, isRedis, io) => {
+  printQueue = mockQueue;
+  if (typeof isRedis === 'boolean') {
+    useRedis = isRedis;
+  }
+  if (io !== undefined) {
+    globalIo = io;
+  }
+};
+
 module.exports = {
+  processJob,
   startPrintingProcess,
   calculateEstimatedWaitTime,
   initWorker,
   cleanupAbandonedJobs,
   buildAbandonedJobWhere,
-  hasProtectedJobReferences
+  hasProtectedJobReferences,
+  cleanupStuckPrintingJobs,
+  _setQueueForTesting
 };

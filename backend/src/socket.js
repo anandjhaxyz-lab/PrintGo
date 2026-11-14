@@ -1,6 +1,7 @@
 const prisma = require('./utils/prisma');
 const logger = require('./utils/logger');
 const { isValidJobTransition } = require('./utils/stateMachine');
+const { computeIsOnline } = require('./modules/machines/machines.service');
 
 const jwt = require('jsonwebtoken');
 
@@ -163,9 +164,16 @@ const setupSockets = (io) => {
     socket.on('heartbeat', async () => {
       if (socket.machineId) {
         try {
-          await prisma.machine.update({
+          const now = new Date();
+          const machine = await prisma.machine.update({
             where: { id: socket.machineId },
-            data: { lastOnline: new Date() }
+            data: { lastOnline: now }
+          });
+          const isOnline = computeIsOnline(machine, now);
+          io.to('admins').emit('printer_heartbeat', {
+            machineId: socket.machineId,
+            lastOnline: machine.lastOnline,
+            isOnline
           });
         } catch (err) {
           logger.error(`Error updating heartbeat for machine ${socket.machineId}:`, err);
@@ -176,9 +184,10 @@ const setupSockets = (io) => {
     socket.on('printer_status_update', async (status) => {
       if (socket.machineId) {
         try {
-          await prisma.machine.update({
+          const now = new Date();
+          const machine = await prisma.machine.update({
             where: { id: socket.machineId },
-            data: { lastOnline: new Date() }
+            data: { lastOnline: now }
           });
 
           await prisma.printerStatus.create({
@@ -190,7 +199,12 @@ const setupSockets = (io) => {
             }
           });
           
-          // Telemetry would go here if we create a Telemetry model in the future
+          const isOnline = computeIsOnline(machine, now);
+          io.to('admins').emit('printer_heartbeat', {
+            machineId: socket.machineId,
+            lastOnline: machine.lastOnline,
+            isOnline
+          });
         } catch(err) {
           logger.error('Error saving printer status', err);
         }
@@ -264,9 +278,26 @@ const setupSockets = (io) => {
       if (socket.userType !== 'printer') return;
       logger.warn(`Job ${jobId} physical outcome ambiguous: ${reason}. Keeping status as PRINTING for operator reconciliation.`);
       try {
-        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
-        if (currentJob) {
-          await prisma.printHistory.create({
+        await prisma.$transaction(async (tx) => {
+          const currentJob = await tx.printJob.findUnique({ where: { shortId: jobId } });
+          if (!currentJob) return;
+
+          // P0: Enforce Machine Ownership
+          if (currentJob.machineId && socket.machineId && currentJob.machineId !== socket.machineId) {
+            logger.warn(`Machine ${socket.machineId} attempted to record ambiguous outcome for job ${jobId}, but job belongs to ${currentJob.machineId}`);
+            return;
+          }
+
+          // Concurrency & Status Guard:
+          // An ambiguous event must NEVER alter or record ambiguity on a terminal or non-PRINTING job.
+          // If the job is already COMPLETED, FAILED, or CANCELLED, reject the ambiguity update.
+          if (currentJob.status !== 'PRINTING') {
+            logger.warn(`Ignoring print_physical_ambiguous for job ${jobId}: current status is ${currentJob.status} (expected PRINTING)`);
+            return;
+          }
+
+          // Create audit record in PrintHistory
+          await tx.printHistory.create({
             data: {
               printJobId: currentJob.id,
               success: false,
@@ -274,7 +305,13 @@ const setupSockets = (io) => {
               completedAt: new Date()
             }
           });
-        }
+
+          // Touch updatedAt to reset any cleaner timer while keeping status strictly in PRINTING
+          await tx.printJob.update({
+            where: { id: currentJob.id },
+            data: { updatedAt: new Date() }
+          });
+        });
       } catch (e) {
         logger.error('Error logging ambiguous print outcome:', e);
       }
@@ -341,8 +378,25 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
       logger.info(`User disconnected: ${socket.id}`);
+      if (socket.userType === 'printer' && socket.machineId) {
+        try {
+          const machine = await prisma.machine.findUnique({
+            where: { id: socket.machineId }
+          });
+          if (machine) {
+            const isOnline = computeIsOnline(machine);
+            io.to('admins').emit('printer_disconnected', {
+              machineId: socket.machineId,
+              lastOnline: machine.lastOnline,
+              isOnline
+            });
+          }
+        } catch (err) {
+          logger.error(`Error handling disconnect for machine ${socket.machineId}:`, err);
+        }
+      }
     });
   });
 };

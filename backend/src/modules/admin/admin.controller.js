@@ -1,5 +1,6 @@
 const prisma = require('../../utils/prisma');
 const AppError = require('../../utils/AppError');
+const { computeIsOnline } = require('../machines/machines.service');
 
 // @desc    Get global stats
 // @route   GET /api/admin/stats
@@ -64,14 +65,20 @@ exports.getAllMachines = async (req, res, next) => {
       include: {
         company: {
           select: { name: true }
-        }
+        },
+        printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } }
       },
       orderBy: { createdAt: 'desc' }
     });
 
+    const enrichedMachines = machines.map(m => ({
+      ...m,
+      isOnline: computeIsOnline(m)
+    }));
+
     res.status(200).json({
       status: 'success',
-      data: { machines }
+      data: { machines: enrichedMachines }
     });
   } catch (error) {
     next(new AppError('Failed to fetch machines', 500));

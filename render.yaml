@@ -1,46 +1,87 @@
 services:
   - type: web
-    name: printgo-backend
-    env: node
+    name: printgo-backend-production
+    runtime: node
+    plan: starter
+    region: singapore
+    branch: fix/p1-production-blockers
     rootDir: backend
-    buildCommand: npm install && npx prisma generate && npx prisma db push
+    buildCommand: npm install && npx prisma generate
+    preDeployCommand: npx prisma migrate deploy
     startCommand: npm start
+    healthCheckPath: /api/health
+    disk:
+      name: printgo-production-uploads
+      mountPath: /opt/render/project/src/backend/uploads
+      sizeGB: 1
     envVars:
+      - key: NODE_ENV
+        value: production
       - key: NODE_VERSION
-        value: ~18.0.0
-      - key: PORT
-        value: 10000
+        value: "20.x"
       - key: DATABASE_URL
         fromDatabase:
-          name: printgo-db
+          name: printgo-production-db
           property: connectionString
+      - key: REDIS_HOST
+        fromService:
+          type: keyvalue
+          name: printgo-production-redis
+          property: host
+      - key: REDIS_PORT
+        fromService:
+          type: keyvalue
+          name: printgo-production-redis
+          property: port
+      - key: UPLOADS_DIR
+        value: /opt/render/project/src/backend/uploads
+      - key: CASHFREE_ENV
+        value: production
       - key: CASHFREE_APP_ID
-        sync: false # Set this in Render Dashboard after deployment
+        sync: false
       - key: CASHFREE_SECRET_KEY
-        sync: false # Set this in Render Dashboard after deployment
+        sync: false
+      - key: CASHFREE_NOTIFY_URL
+        sync: false
       - key: JWT_SECRET
         generateValue: true
       - key: ADMIN_USER
         value: admin
       - key: ADMIN_PASS
         generateValue: true
-      - key: REDIS_HOST
-        fromService:
-          type: redis
-          name: printgo-redis
-          property: host
-      - key: REDIS_PORT
-        fromService:
-          type: redis
-          name: printgo-redis
-          property: port
-
-  - type: redis
-    name: printgo-redis
-    plan: free
-
+      - key: MACHINE_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://printgo-frontend-production.onrender.com
+      - key: FRONTEND_URL
+        value: https://printgo-frontend-production.onrender.com
+      - key: PUBLIC_APP_URL
+        value: https://printgo-frontend-production.onrender.com
+  - type: keyvalue
+    name: printgo-production-redis
+    plan: 256mb
+    region: singapore
+    maxmemoryPolicy: noeviction
+    persistenceMode: journal-snapshot
+    ipAllowList: []
+  - type: web
+    name: printgo-frontend-production
+    runtime: static
+    branch: fix/p1-production-blockers
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        value: https://printgo-backend-production.onrender.com
 databases:
-  - name: printgo-db
-    databaseName: printgo
-    user: printgo_user
-    plan: free
+  - name: printgo-production-db
+    databaseName: printgo_production_db
+    user: printgo_production_db_user
+    diskSizeGB: 1
+    region: singapore
+    postgresMajorVersion: "18"

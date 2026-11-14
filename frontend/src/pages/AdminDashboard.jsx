@@ -22,6 +22,48 @@ import { AuditLogsView } from '../components/admin/views/AuditLogsView';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
+/**
+ * Safely updates machine online status from server socket events,
+ * dropping stale, out-of-order, or invalid timestamp events.
+ */
+export const updateMachineFromSocketEvent = (prevMachines, payload) => {
+  if (!payload || !payload.machineId || !Array.isArray(prevMachines)) {
+    return prevMachines || [];
+  }
+
+  const { machineId, lastOnline, isOnline } = payload;
+
+  return prevMachines.map(m => {
+    if (m.id !== machineId) return m;
+
+    // Validate incoming timestamp
+    const incomingTime = lastOnline ? new Date(lastOnline).getTime() : NaN;
+    const hasValidIncoming = !Number.isNaN(incomingTime);
+
+    // Validate existing timestamp
+    const existingTime = m.lastOnline ? new Date(m.lastOnline).getTime() : NaN;
+    const hasValidExisting = !Number.isNaN(existingTime);
+
+    // If we already have a known valid existing timestamp, an incoming event with
+    // a missing or invalid timestamp must not overwrite the valid timestamp or online status.
+    if (hasValidExisting && !hasValidIncoming) {
+      return m;
+    }
+
+    // If both are valid timestamps, reject stale/duplicate events:
+    // Ignore incoming event if incomingTime <= existingTime
+    if (hasValidExisting && hasValidIncoming && incomingTime <= existingTime) {
+      return m;
+    }
+
+    return {
+      ...m,
+      ...(hasValidIncoming ? { lastOnline } : {}),
+      isOnline: isOnline === true
+    };
+  });
+};
+
 const AdminDashboard = () => {
   // Authentication & Session
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -148,8 +190,11 @@ const AdminDashboard = () => {
       if (jobsRes.status === 'fulfilled' && jobsRes.value.data?.success) {
         setJobs(jobsRes.value.data.jobs || []);
       }
-      if (machinesRes.status === 'fulfilled' && machinesRes.value.data?.data) {
-        setMachines(machinesRes.value.data.data.machines || machinesRes.value.data.machines || []);
+      if (machinesRes.status === 'fulfilled') {
+        const list = machinesRes.value.data?.data?.machines || machinesRes.value.data?.machines || [];
+        if (Array.isArray(list)) {
+          setMachines(list);
+        }
       }
       if (paymentsRes.status === 'fulfilled' && paymentsRes.value.data?.success) {
         setPayments(paymentsRes.value.data.payments || []);
@@ -233,8 +278,35 @@ const AdminDashboard = () => {
       }
     });
 
+    socket.on('printer_heartbeat', (payload) => {
+      setMachines(prev => updateMachineFromSocketEvent(prev, payload));
+    });
+
+    socket.on('printer_disconnected', (payload) => {
+      setMachines(prev => updateMachineFromSocketEvent(prev, payload));
+    });
+
     return () => socket.disconnect();
   }, [isAuthenticated, period]);
+
+  // Periodic soft refresh of machine status while dashboard is open (keeps 90s heartbeat status fresh)
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const interval = setInterval(() => {
+      const fetchMachines = currentUser?.role === 'SUPERADMIN'
+        ? axios.get(`${API_URL}/api/admin/machines`)
+        : axios.get(`${API_URL}/api/machines/my-machines`);
+      fetchMachines
+        .then(res => {
+          const list = res.data?.data?.machines || res.data?.machines || [];
+          if (Array.isArray(list)) {
+            setMachines(list);
+          }
+        })
+        .catch(() => {});
+    }, 45000);
+    return () => clearInterval(interval);
+  }, [isAuthenticated, currentUser]);
 
   // Actions
   const handleSavePricingProfile = async (profileData) => {

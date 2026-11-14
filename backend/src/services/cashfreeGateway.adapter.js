@@ -216,6 +216,62 @@ class CashfreeGatewayAdapter {
   }
 
   /**
+   * Fetches order details from Cashfree for lifecycle reconciliation.
+   */
+  async getOrderDetails(orderId) {
+    if (this.mockMode) {
+      if (this.mockHandlers.getOrderDetails) {
+        return await this.mockHandlers.getOrderDetails(orderId);
+      }
+      return {
+        success: true,
+        orderId,
+        order_status: 'ACTIVE',
+        order_amount: 10.0,
+        order_currency: 'INR',
+        payment_session_id: `session_mock_${orderId}`,
+        rawResponse: { order_status: 'ACTIVE', payment_session_id: `session_mock_${orderId}` }
+      };
+    }
+
+    const config = getCashfreeConfig();
+    if (!config.validation.isValid) {
+      throw new AppError(config.validation.reason, 400);
+    }
+
+    const url = `${config.orderUrl}/${orderId}`;
+    try {
+      const response = await axios.get(url, {
+        headers: config.headers,
+        timeout: config.timeout
+      });
+
+      const data = response.data || {};
+      return {
+        success: true,
+        orderId: data.order_id || orderId,
+        order_status: data.order_status, // ACTIVE, PAID, EXPIRED, TERMINATED
+        order_amount: Number(data.order_amount),
+        order_currency: data.order_currency || 'INR',
+        payment_session_id: data.payment_session_id || null,
+        rawResponse: data
+      };
+    } catch (err) {
+      const statusCode = err?.response?.status || 500;
+      const isNotFound = statusCode === 404;
+      const isTimeout = err.code === 'ECONNABORTED' || err.message?.includes('timeout');
+      return {
+        success: false,
+        statusCode,
+        isNotFound,
+        isTimeout,
+        error: err?.response?.data?.message || err.message,
+        rawResponse: err?.response?.data || null
+      };
+    }
+  }
+
+  /**
    * Verifies Cashfree webhook HMAC SHA256 signature using raw request body.
    */
   verifyWebhookSignature(signature, rawBody, timestamp) {

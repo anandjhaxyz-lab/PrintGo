@@ -95,143 +95,185 @@ class SpoolerMonitor {
     if (!this.printerName || this.printerName === 'SimulationMode') {
       console.log(`⚠️  SIMULATION MODE: Bypassing physical print for job ${jobId}`);
       socket.emit('print_spooler_success', { jobId });
-      setTimeout(() => {
-        if (this.journal) this.journal.recordCompleted(jobId, { mode: 'simulation' });
-        socket.emit('print_physical_success', { jobId, mode: 'simulation' });
-        if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-      }, 3000);
-      return null;
+      // P1-01: Return a Promise that resolves/rejects on terminal outcome.
+      // Simulation resolves after the deferred completion callback persists.
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          try {
+            if (this.journal) this.journal.recordCompleted(jobId, { mode: 'simulation' });
+            socket.emit('print_physical_success', { jobId, mode: 'simulation' });
+            resolve({ outcome: 'success', jobId });
+          } catch (journalErr) {
+            console.error(`🔥 Failed to persist simulation completion for Job ${jobId}: ${journalErr.message}`);
+            socket.emit('print_physical_error', { jobId, error: `Terminal evidence persistence failed: ${journalErr.message}` });
+            // Journal persistence failure → ambiguous (caller must lockForAmbiguous)
+            reject(Object.assign(new Error(`Terminal evidence persistence failed: ${journalErr.message}`), { isAmbiguous: true }));
+          }
+          if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
+        }, 3000);
+      });
     }
 
     console.log(`👀 Monitoring spooler queue for Job ${jobId}...`);
     let checkAttempts = 0;
-    let wasSeenInQueue = false; 
+    let wasSeenInQueue = false;
     let isPollingExecution = false;
     const maxAttempts = 60; // 60 iterations (with 2s delay = ~2 minutes)
-    
-    const pollSpooler = setInterval(() => {
-      // Guard against overlapping PowerShell processes
-      if (isPollingExecution) return;
-      
-      checkAttempts++;
-      if (checkAttempts > maxAttempts) {
-        clearInterval(pollSpooler);
-        console.error(`⚠️ Spooler monitoring timed out for Job ${jobId}.`);
-        if (wasSeenInQueue) {
-          // It was seen in queue and never reported error, but didn't clear within 2m
-          socket.emit('print_physical_ambiguous', { 
-            jobId, 
-            reason: 'Spooler Monitoring Timeout while in queue',
-            wasSeenInQueue: true 
+
+    // P1-01: Return a Promise that resolves on verified terminal success,
+    // or rejects with { isAmbiguous: true } on timeout/ambiguous outcome,
+    // or rejects normally on a definite print error.
+    return new Promise((resolve, reject) => {
+      // Helper: resolve/reject and cleanup the temp file
+      const settle = (fn, value) => {
+        if (fs.existsSync(localFilePath)) {
+          try { fs.unlinkSync(localFilePath); } catch (_) {}
+        }
+        fn(value);
+      };
+
+      const pollSpooler = setInterval(() => {
+        // Guard against overlapping PowerShell/lpstat processes
+        if (isPollingExecution) return;
+
+        checkAttempts++;
+        if (checkAttempts > maxAttempts) {
+          clearInterval(pollSpooler);
+          console.error(`⚠️ Spooler monitoring timed out for Job ${jobId}.`);
+          const reason = wasSeenInQueue
+            ? 'Spooler Monitoring Timeout while in queue'
+            : 'Job was never observed in queue within timeout window';
+          socket.emit('print_physical_ambiguous', { jobId, reason, wasSeenInQueue });
+          settle(reject, Object.assign(new Error(`Spooler timeout: ${reason}`), { isAmbiguous: true }));
+          return;
+        }
+
+        if (isWin) {
+          isPollingExecution = true;
+          this.execFile('powershell.exe', [
+            '-NoProfile',
+            '-NonInteractive',
+            '-Command',
+            `Get-PrintJob -PrinterName '${this.printerName}' -ErrorAction SilentlyContinue | Select-Object Id, DocumentName, JobStatus | ConvertTo-Json`
+          ], { timeout: 6000 }, (error, stdout) => {
+            isPollingExecution = false;
+            if (error) {
+              // Transient polling error — do not abort, continue polling
+              return;
+            }
+
+            if (!stdout || stdout.trim() === '') {
+              // Queue is currently empty!
+              // CRITICAL SAFETY RULE: Never mark COMPLETED solely because the spooler queue is empty!
+              if (wasSeenInQueue) {
+                // Verified transition: It was in queue, and now is safely cleared
+                clearInterval(pollSpooler);
+                console.log(`✅ Job ${jobId} physically completed (verified in spooler and cleared)!`);
+                try {
+                  if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
+                  socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
+                  settle(resolve, { outcome: 'success', jobId, wasSeenInQueue: true });
+                } catch (journalErr) {
+                  console.error(`🔥 Failed to persist terminal completion evidence for Job ${jobId}: ${journalErr.message}`);
+                  socket.emit('print_physical_error', { jobId, error: `Terminal evidence persistence failed: ${journalErr.message}` });
+                  settle(reject, Object.assign(new Error(`Terminal evidence persistence failed: ${journalErr.message}`), { isAmbiguous: true }));
+                }
+              } else if (checkAttempts >= 3) {
+                // Fast spooling edge case: If the job cleared faster than our first check,
+                // check if spooler dispatch succeeded and printer has 0 errors
+                clearInterval(pollSpooler);
+                console.log(`ℹ️ Job ${jobId} cleared from spooler before queue capture. Confirming driver state...`);
+                try {
+                  if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true });
+                  socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true });
+                  settle(resolve, { outcome: 'success', jobId, wasSeenInQueue: false, fastSpoolCleared: true });
+                } catch (journalErr) {
+                  console.error(`🔥 Failed to persist terminal completion evidence for Job ${jobId}: ${journalErr.message}`);
+                  socket.emit('print_physical_error', { jobId, error: `Terminal evidence persistence failed: ${journalErr.message}` });
+                  settle(reject, Object.assign(new Error(`Terminal evidence persistence failed: ${journalErr.message}`), { isAmbiguous: true }));
+                }
+              }
+              return;
+            }
+
+            try {
+              let jobs = JSON.parse(stdout);
+              if (!Array.isArray(jobs)) jobs = [jobs];
+
+              const ourJob = jobs.find(j => j.DocumentName && j.DocumentName.includes(jobId));
+
+              if (ourJob) {
+                wasSeenInQueue = true;
+                const status = ourJob.JobStatus || '';
+                if (status.includes('Error') || status.includes('PaperOut') || status.includes('PaperJam') || status.includes('Blocked')) {
+                  clearInterval(pollSpooler);
+                  console.error(`❌ Physical Print Error for Job ${jobId}: ${status}`);
+                  socket.emit('print_physical_error', { jobId, error: status });
+                  this.execFile('powershell.exe', [
+                    '-NoProfile',
+                    '-NonInteractive',
+                    '-Command',
+                    `Get-PrintJob -PrinterName '${this.printerName}' | Where-Object DocumentName -like '*${jobId}*' | Remove-PrintJob`
+                  ], { timeout: 5000 });
+                  // Definite error: reject (not ambiguous); caller may release the lock
+                  settle(reject, Object.assign(new Error(`Physical print error: ${status}`), { isAmbiguous: false }));
+                }
+              } else if (wasSeenInQueue) {
+                // Was seen in queue on previous check, now gone -> completed!
+                clearInterval(pollSpooler);
+                console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
+                try {
+                  if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
+                  socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
+                  settle(resolve, { outcome: 'success', jobId, wasSeenInQueue: true });
+                } catch (journalErr) {
+                  console.error(`🔥 Failed to persist terminal completion evidence for Job ${jobId}: ${journalErr.message}`);
+                  socket.emit('print_physical_error', { jobId, error: `Terminal evidence persistence failed: ${journalErr.message}` });
+                  settle(reject, Object.assign(new Error(`Terminal evidence persistence failed: ${journalErr.message}`), { isAmbiguous: true }));
+                }
+              }
+            } catch (e) {
+              // JSON parse error — do not abort, continue polling
+            }
           });
         } else {
-          // Never seen in queue and timed out
-          socket.emit('print_physical_ambiguous', { 
-            jobId, 
-            reason: 'Job was never observed in queue within timeout window',
-            wasSeenInQueue: false 
-          });
-        }
-        if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-        return;
-      }
+          // Linux CUPS
+          isPollingExecution = true;
+          this.execFile('lpstat', ['-o', this.printerName], { timeout: 5000 }, (error, stdout) => {
+            isPollingExecution = false;
+            if (error) return;
+            const output = stdout || '';
 
-      if (isWin) {
-        isPollingExecution = true;
-        this.execFile('powershell.exe', [
-          '-NoProfile',
-          '-NonInteractive',
-          '-Command',
-          `Get-PrintJob -PrinterName '${this.printerName}' -ErrorAction SilentlyContinue | Select-Object Id, DocumentName, JobStatus | ConvertTo-Json`
-        ], { timeout: 6000 }, (error, stdout) => {
-          isPollingExecution = false;
-          if (error) {
-            // Log warning but do not abort polling
-            return; 
-          }
-
-          if (!stdout || stdout.trim() === '') {
-            // Queue is currently empty!
-            // CRITICAL SAFETY RULE: Never mark COMPLETED solely because the spooler queue is empty!
-            if (wasSeenInQueue) {
-              // Verified transition: It was in queue, and now is safely cleared
-              clearInterval(pollSpooler);
-              console.log(`✅ Job ${jobId} physically completed (verified in spooler and cleared)!`);
-              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
-              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
-              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-            } else if (checkAttempts >= 3) {
-              // Fast spooling edge case: If the job cleared faster than our first check,
-              // check if spooler dispatch succeeded and printer has 0 errors
-              clearInterval(pollSpooler);
-              console.log(`ℹ️ Job ${jobId} cleared from spooler before queue capture. Confirming driver state...`);
-              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true });
-              socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true });
-              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-            }
-            return;
-          }
-
-          try {
-            let jobs = JSON.parse(stdout);
-            if (!Array.isArray(jobs)) jobs = [jobs];
-
-            const ourJob = jobs.find(j => j.DocumentName && j.DocumentName.includes(jobId));
-            
-            if (ourJob) {
-              wasSeenInQueue = true; 
-              const status = ourJob.JobStatus || '';
-              if (status.includes('Error') || status.includes('PaperOut') || status.includes('PaperJam') || status.includes('Blocked')) {
-                clearInterval(pollSpooler);
-                console.error(`❌ Physical Print Error for Job ${jobId}: ${status}`);
-                socket.emit('print_physical_error', { jobId, error: status });
-                this.execFile('powershell.exe', [
-                  '-NoProfile',
-                  '-NonInteractive',
-                  '-Command',
-                  `Get-PrintJob -PrinterName '${this.printerName}' | Where-Object DocumentName -like '*${jobId}*' | Remove-PrintJob`
-                ], { timeout: 5000 });
-                if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-              }
+            if (output.includes(jobId)) {
+              wasSeenInQueue = true;
             } else if (wasSeenInQueue) {
-              // Was seen in queue on previous check, now gone -> completed!
               clearInterval(pollSpooler);
               console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
-              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
-              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
-              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
+              try {
+                if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
+                socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
+                settle(resolve, { outcome: 'success', jobId, wasSeenInQueue: true });
+              } catch (journalErr) {
+                console.error(`🔥 Failed to persist terminal completion evidence for Job ${jobId}: ${journalErr.message}`);
+                socket.emit('print_physical_error', { jobId, error: `Terminal evidence persistence failed: ${journalErr.message}` });
+                settle(reject, Object.assign(new Error(`Terminal evidence persistence failed: ${journalErr.message}`), { isAmbiguous: true }));
+              }
+            } else if (checkAttempts >= 3) {
+              clearInterval(pollSpooler);
+              try {
+                if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true });
+                socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true });
+                settle(resolve, { outcome: 'success', jobId, wasSeenInQueue: false, fastSpoolCleared: true });
+              } catch (journalErr) {
+                console.error(`🔥 Failed to persist terminal completion evidence for Job ${jobId}: ${journalErr.message}`);
+                socket.emit('print_physical_error', { jobId, error: `Terminal evidence persistence failed: ${journalErr.message}` });
+                settle(reject, Object.assign(new Error(`Terminal evidence persistence failed: ${journalErr.message}`), { isAmbiguous: true }));
+              }
             }
-          } catch (e) {
-            // JSON parse error, ignore and continue
-          }
-        });
-      } else {
-        // Linux CUPS
-        isPollingExecution = true;
-        this.execFile('lpstat', ['-o', this.printerName], { timeout: 5000 }, (error, stdout) => {
-          isPollingExecution = false;
-          if (error) return;
-          const output = stdout || '';
-          
-          if (output.includes(jobId)) {
-            wasSeenInQueue = true;
-          } else if (wasSeenInQueue) {
-             clearInterval(pollSpooler);
-             console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
-             if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
-             socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
-             if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-          } else if (checkAttempts >= 3) {
-             clearInterval(pollSpooler);
-             if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true });
-             socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true });
-             if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-          }
-        });
-      }
-    }, 2000); // 2 second interval avoids CPU/process starvation
-
-    return pollSpooler;
+          });
+        }
+      }, 2000); // 2 second interval avoids CPU/process starvation
+    });
   }
 }
 

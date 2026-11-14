@@ -11,7 +11,7 @@ import {
   AlertCircle 
 } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
-import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.js?url';
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
 // Set up PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
@@ -70,14 +70,15 @@ export const DocumentPreviewModal = ({
     if (!isOpen || !fileUrl || !isPdf) return;
 
     let isCancelled = false;
+    let loadingTask = null;
     setLoading(true);
     setError(null);
 
     const loadPdf = async () => {
       try {
-        const loadingTask = pdfjsLib.getDocument({
+        loadingTask = pdfjsLib.getDocument({
           url: fileUrl,
-          cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
+          cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@6.5.438/cmaps/',
           cMapPacked: true
         });
 
@@ -103,6 +104,15 @@ export const DocumentPreviewModal = ({
       isCancelled = true;
       if (renderTaskRef.current) {
         renderTaskRef.current.cancel();
+        renderTaskRef.current = null;
+      }
+      pdfDocRef.current = null;
+      const taskToDestroy = loadingTask;
+      loadingTask = null;
+      if (taskToDestroy) {
+        taskToDestroy.destroy().catch((destroyError) => {
+          console.warn('PDF loading task cleanup error:', destroyError);
+        });
       }
     };
   }, [isOpen, fileUrl, isPdf]);

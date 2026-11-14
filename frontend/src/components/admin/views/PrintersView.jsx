@@ -15,7 +15,11 @@ import {
   AlertCircle,
   Eye,
   Shield,
-  RefreshCw
+  RefreshCw,
+  VolumeX,
+  Volume2,
+  Clock,
+  Megaphone
 } from 'lucide-react';
 import { TelemetryDashboard } from '../TelemetryDashboard';
 import {
@@ -26,6 +30,7 @@ import {
   PrinterQrRevokeModal,
   PrinterQrLedgerModal
 } from './PrinterQrModals';
+import { PrinterAdSuppressionModal } from './PrinterAdSuppressionModal';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
@@ -49,6 +54,50 @@ export const PrintersView = ({
   const [rotateState, setRotateState] = useState({ isOpen: false, qr: null, machine: null, isSubmitting: false, errorMsg: '' });
   const [revokeState, setRevokeState] = useState({ isOpen: false, qr: null, machine: null, isSubmitting: false, errorMsg: '' });
   const [ledgerState, setLedgerState] = useState({ isOpen: false, machine: null, ledger: null, isLoading: false });
+  const [suppressionModalState, setSuppressionModalState] = useState({ isOpen: false, machine: null });
+  const [, setTick] = useState(0);
+
+  // Live countdown timer ticker (1s interval)
+  useEffect(() => {
+    const interval = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const formatCountdown = (untilDate) => {
+    if (!untilDate) return '';
+    const diffMs = new Date(untilDate).getTime() - Date.now();
+    if (diffMs <= 0) return 'Expiring now...';
+    const totalSecs = Math.floor(diffMs / 1000);
+    const hrs = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    const secs = totalSecs % 60;
+    if (hrs > 0) return `${hrs}h ${mins}m ${secs}s`;
+    if (mins > 0) return `${mins}m ${secs}s`;
+    return `${secs}s`;
+  };
+
+  const handleResumeAds = async (machine) => {
+    if (!window.confirm(`Resume advertisements immediately for machine "${machine.name}"?`)) {
+      return;
+    }
+    try {
+      const res = await axios.delete(`${API_URL}/api/machines/${machine.id}/ad-suppression`);
+      if (res.data?.success) {
+        setGlobalSuccess(`Advertisements resumed for ${machine.name}`);
+        setTimeout(() => setGlobalSuccess(''), 4000);
+        if (onRefresh) onRefresh();
+      }
+    } catch (err) {
+      console.error('Failed to resume ads:', err);
+      const serverError = err.response?.data?.error || err.response?.data?.message || err.message;
+      if (err.response?.status === 403 && serverError.includes('Read-Only')) {
+        setGlobalError('Action blocked: Cloud Admin Dashboard is operating in Read-Only Monitoring Mode (ADMIN_READ_ONLY=true). Remote mutations are disabled.');
+      } else {
+        setGlobalError(serverError || 'Failed to resume advertisements.');
+      }
+      setTimeout(() => setGlobalError(''), 6000);
+    }
+  };
 
   // Determine if current user can manage a machine
   const canManageMachine = useCallback((machine) => {
@@ -255,7 +304,12 @@ export const PrintersView = ({
           </p>
         </div>
         <button
-          onClick={loadPrinterQrs}
+          onClick={async () => {
+            loadPrinterQrs();
+            if (typeof onRefresh === 'function') {
+              onRefresh();
+            }
+          }}
           disabled={isLoadingQrs}
           className="btn"
           style={{
@@ -268,7 +322,7 @@ export const PrintersView = ({
           }}
         >
           <RefreshCw size={13} className={isLoadingQrs ? 'animate-spin' : ''} />
-          Refresh QR Status
+          Refresh Fleet Status
         </button>
       </div>
 
@@ -276,10 +330,21 @@ export const PrintersView = ({
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: '1rem', marginBottom: '1.5rem' }}>
         {machines && machines.length > 0 ? (
           machines.map(machine => {
-            const isOnline = machine.status === 'ACTIVE' && (!printerStatus?.isError);
+            const isOnline = machine.isOnline === true;
             const latestStatus = machine.printerStatuses?.[0];
-            const paperStatus = latestStatus?.paperStatus || 'OK';
-            const tonerStatus = latestStatus?.tonerStatus || 'OK';
+            const paperDisplay = latestStatus?.paperStatus
+              ? (latestStatus.paperStatus === 'OK' ? 'Sufficient' : latestStatus.paperStatus)
+              : 'Unknown';
+            const paperColor = !latestStatus?.paperStatus
+              ? '#64748b'
+              : (latestStatus.paperStatus === 'OK' ? '#059669' : '#d97706');
+
+            const tonerDisplay = latestStatus?.tonerStatus
+              ? (latestStatus.tonerStatus === 'OK' ? 'Optimal' : latestStatus.tonerStatus)
+              : 'Unknown';
+            const tonerColor = !latestStatus?.tonerStatus
+              ? '#64748b'
+              : (latestStatus.tonerStatus === 'OK' ? '#059669' : '#d97706');
 
             // QR Info for this machine
             const qrEntry = machineQrData[machine.id];
@@ -345,22 +410,22 @@ export const PrintersView = ({
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', background: '#f8fafc', padding: '0.625rem', borderRadius: '8px', fontSize: '0.75rem', marginBottom: '0.75rem' }}>
                     <div>
                       <span style={{ color: '#64748b' }}>Model:</span>
-                      <div style={{ fontWeight: 600, color: '#1e293b' }}>{machine.printerModel || 'EPSON L6460 Series'}</div>
+                      <div style={{ fontWeight: 600, color: '#1e293b' }}>{machine.printerModel?.trim() || 'Unknown'}</div>
                     </div>
                     <div>
                       <span style={{ color: '#64748b' }}>Connection:</span>
-                      <div style={{ fontWeight: 600, color: '#1e293b' }}>USB / Direct IP</div>
+                      <div style={{ fontWeight: 600, color: '#1e293b' }}>{machine.connectionType?.trim() || 'Unknown'}</div>
                     </div>
                     <div>
                       <span style={{ color: '#64748b' }}>Paper Tray:</span>
-                      <div style={{ fontWeight: 600, color: paperStatus === 'OK' ? '#059669' : '#d97706', display: 'flex', alignItems: 'center', gap: '2px' }}>
-                        <File size={12} /> {paperStatus === 'OK' ? 'Sufficient' : paperStatus}
+                      <div style={{ fontWeight: 600, color: paperColor, display: 'flex', alignItems: 'center', gap: '2px' }}>
+                        <File size={12} /> {paperDisplay}
                       </div>
                     </div>
                     <div>
                       <span style={{ color: '#64748b' }}>Toner/Ink:</span>
-                      <div style={{ fontWeight: 600, color: tonerStatus === 'OK' ? '#059669' : '#d97706', display: 'flex', alignItems: 'center', gap: '2px' }}>
-                        <Droplet size={12} /> {tonerStatus === 'OK' ? 'Optimal' : tonerStatus}
+                      <div style={{ fontWeight: 600, color: tonerColor, display: 'flex', alignItems: 'center', gap: '2px' }}>
+                        <Droplet size={12} /> {tonerDisplay}
                       </div>
                     </div>
                   </div>
@@ -565,6 +630,131 @@ export const PrintersView = ({
                       )}
                     </div>
                   </div>
+
+                  {/* MACHINE ADVERTISEMENT SUPPRESSION / STATUS */}
+                  <div
+                    style={{
+                      border: '1px solid #e2e8f0',
+                      borderRadius: '10px',
+                      padding: '0.75rem',
+                      background: '#ffffff',
+                      marginBottom: '0.75rem'
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <Megaphone size={16} color={machine.adSuppressionMode === 'PERMANENT' ? '#ef4444' : machine.adSuppressionMode === 'TEMPORARY' ? '#f59e0b' : '#059669'} />
+                        <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#1e293b' }}>
+                          Advertisement Status
+                        </span>
+                      </div>
+
+                      {/* Mode Badge */}
+                      <span
+                        style={{
+                          fontSize: '0.625rem',
+                          fontWeight: 700,
+                          padding: '2px 8px',
+                          borderRadius: '9999px',
+                          background:
+                            machine.adSuppressionMode === 'PERMANENT' ? '#fef2f2' :
+                            machine.adSuppressionMode === 'TEMPORARY' ? '#fffbeb' : '#ecfdf5',
+                          color:
+                            machine.adSuppressionMode === 'PERMANENT' ? '#dc2626' :
+                            machine.adSuppressionMode === 'TEMPORARY' ? '#b45309' : '#059669',
+                          border: `1px solid ${
+                            machine.adSuppressionMode === 'PERMANENT' ? '#fecaca' :
+                            machine.adSuppressionMode === 'TEMPORARY' ? '#fde68a' : '#a7f3d0'
+                          }`
+                        }}
+                      >
+                        {machine.adSuppressionMode === 'PERMANENT' ? 'PERMANENTLY SILENCED' :
+                         machine.adSuppressionMode === 'TEMPORARY' ? 'TEMPORARILY SILENCED' : 'ADS ACTIVE'}
+                      </span>
+                    </div>
+
+                    {/* Details or Countdown */}
+                    {machine.adSuppressionMode === 'TEMPORARY' ? (
+                      <div style={{ fontSize: '0.6875rem', color: '#b45309', background: '#fffbeb', padding: '6px 8px', borderRadius: '6px', marginBottom: '6px', display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontWeight: 700 }}>
+                          <Clock size={12} />
+                          <span>Countdown: {formatCountdown(machine.adSuppressionUntil)}</span>
+                        </div>
+                        {machine.adSuppressionReason && (
+                          <div style={{ color: '#78350f', fontStyle: 'italic' }}>
+                            Reason: {machine.adSuppressionReason}
+                          </div>
+                        )}
+                      </div>
+                    ) : machine.adSuppressionMode === 'PERMANENT' ? (
+                      <div style={{ fontSize: '0.6875rem', color: '#991b1b', background: '#fef2f2', padding: '6px 8px', borderRadius: '6px', marginBottom: '6px', display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', fontWeight: 700 }}>
+                          <Ban size={12} />
+                          <span>Ads disabled indefinitely</span>
+                        </div>
+                        {machine.adSuppressionReason && (
+                          <div style={{ color: '#7f1d1d', fontStyle: 'italic' }}>
+                            Reason: {machine.adSuppressionReason}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: '0.6875rem', color: '#64748b', padding: '2px 0 6px 0' }}>
+                        Advertisements are actively running on this kiosk and customer mobile screens.
+                      </div>
+                    )}
+
+                    {/* Action Buttons */}
+                    {isAuthorized && (
+                      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '4px' }}>
+                        {machine.adSuppressionMode === 'PERMANENT' || machine.adSuppressionMode === 'TEMPORARY' ? (
+                          <button
+                            type="button"
+                            onClick={() => handleResumeAds(machine)}
+                            style={{
+                              flex: 1,
+                              padding: '5px 8px',
+                              background: '#ecfdf5',
+                              color: '#059669',
+                              border: '1px solid #a7f3d0',
+                              borderRadius: '6px',
+                              fontSize: '0.6875rem',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: '4px'
+                            }}
+                          >
+                            <Volume2 size={12} /> Resume Advertisements
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setSuppressionModalState({ isOpen: true, machine })}
+                            style={{
+                              flex: 1,
+                              padding: '5px 8px',
+                              background: '#fffbeb',
+                              color: '#b45309',
+                              border: '1px solid #fde68a',
+                              borderRadius: '6px',
+                              fontSize: '0.6875rem',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              gap: '4px'
+                            }}
+                          >
+                            <VolumeX size={12} /> Silence Advertisements
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 {/* Footer Metadata */}
@@ -653,6 +843,19 @@ export const PrintersView = ({
           onOpenPreview={(qr, machine) => {
             setLedgerState({ isOpen: false, machine: null, ledger: null, isLoading: false });
             setPreviewState({ isOpen: true, qr, machine });
+          }}
+        />
+      )}
+
+      {suppressionModalState.isOpen && (
+        <PrinterAdSuppressionModal
+          machine={suppressionModalState.machine}
+          isOpen={suppressionModalState.isOpen}
+          onClose={() => setSuppressionModalState({ isOpen: false, machine: null })}
+          onSuccess={() => {
+            setGlobalSuccess('Advertisement suppression updated successfully');
+            setTimeout(() => setGlobalSuccess(''), 4000);
+            if (onRefresh) onRefresh();
           }}
         />
       )}

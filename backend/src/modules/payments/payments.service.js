@@ -10,6 +10,8 @@ const {
   validateReturnUrl,
   redactSensitiveData
 } = require('../../config/cashfree.config');
+const { resolveCustomerDetails } = require('../../utils/customerContact');
+const { persistCustomerForJob } = require('../../utils/customerPersistence');
 
 /**
  * Resolves the PrintJob associated with a Payment across retry attempts
@@ -61,9 +63,9 @@ const resolvePrintJobForPayment = async (db, payment) => {
     }
   }
 
-  // Fallback 2: Deterministically parse shortId from order_<shortId>_<timestamp>
+  // Fallback 2: Deterministically parse shortId from order_<shortId>_<timestamp> or order_<shortId>_att<num>
   if (payment.gatewayOrderId && db.printJob && typeof db.printJob.findUnique === 'function') {
-    const match = payment.gatewayOrderId.match(/^(?:demo_)?order_([^_]+)_\d+$/);
+    const match = payment.gatewayOrderId.match(/^(?:demo_)?order_([^_]+)_(?:att\d+|\d+)$/);
     if (match?.[1]) {
       const byShortId = await db.printJob.findUnique({
         where: { shortId: match[1] },
@@ -101,13 +103,20 @@ const findSuccessfulPaymentForJob = async (db, job, excludePaymentId = null) => 
   return db.payment.findFirst({ where });
 };
 
+const cashfreeGateway = require('../../services/cashfreeGateway.adapter');
+const crypto = require('crypto');
+
+const CASHFREE_ORDER_TTL_MS = 15 * 60 * 1000; // 15-minute validity window for pending gateway order reuse
+const ORDER_LEASE_TIMEOUT_MS = 30 * 1000;    // 30-second in-flight order attempt lease
+
 /**
  * Creates a Cashfree payment order for a pending print job.
- * Enforces server-side authoritative pricing, validates returnUrl, preserves
- * multi-attempt payment history, and records immutable Transaction audit metadata.
+ * Enforces server-side authoritative pricing, validates returnUrl, serializes concurrent
+ * requests via short-transaction PostgreSQL advisory locks, safely reuses active pending
+ * orders, and reconciles stale attempts with the gateway without holding connections during I/O.
  */
 const createOrder = async (jobId, options = {}) => {
-  const { sessionId, returnUrl: clientReturnUrl, ipAddress } = options;
+  const { sessionId, returnUrl: clientReturnUrl, ipAddress, customerPhone: overridePhone, customerEmail: overrideEmail } = options;
 
   // Validate Cashfree configuration first
   const config = getCashfreeConfig();
@@ -119,18 +128,18 @@ const createOrder = async (jobId, options = {}) => {
   // Strictly validate client returnUrl against whitelisted frontend origins
   const validatedReturnUrl = validateReturnUrl(clientReturnUrl);
 
-  const job = await prisma.printJob.findUnique({
+  const initialJob = await prisma.printJob.findUnique({
     where: { shortId: jobId },
     include: { payment: true, customer: true }
   });
 
-  if (!job) throw new AppError('Job not found', 404);
-  if (job.status !== 'PENDING_PAYMENT') {
-    throw new AppError(`Job cannot be paid. Current status: ${job.status}`, 400);
+  if (!initialJob) throw new AppError('Job not found', 404);
+  if (initialJob.status !== 'PENDING_PAYMENT') {
+    throw new AppError(`Job cannot be paid. Current status: ${initialJob.status}`, 400);
   }
 
-  // Block creating a duplicate payment order if any payment for this job already succeeded
-  const existingSuccess = await findSuccessfulPaymentForJob(prisma, job);
+  // A4: Guard against creating orders if payment already succeeded
+  const existingSuccess = await findSuccessfulPaymentForJob(prisma, initialJob);
   if (existingSuccess) {
     throw new AppError('A successful payment already exists for this job', 409);
   }
@@ -142,14 +151,135 @@ const createOrder = async (jobId, options = {}) => {
       throw new AppError('Payment return URL configuration (PUBLIC_APP_URL or FRONTEND_URL) is missing', 500);
     }
     targetReturnUrl = sessionId
-      ? `${frontendBase}/m/${sessionId}?order_id={order_id}&job_id=${job.shortId}`
-      : `${frontendBase}/?order_id={order_id}&job_id=${job.shortId}`;
+      ? `${frontendBase}/m/${sessionId}?order_id={order_id}&job_id=${initialJob.shortId}`
+      : `${frontendBase}/?order_id={order_id}&job_id=${initialJob.shortId}`;
   }
 
-  const uniqueOrderId = `order_${job.shortId}_${Date.now()}`;
+  // Generate lease token for this worker
+  const currentLeaseToken = crypto.randomUUID();
+  const leaseExpiresAt = new Date(Date.now() + ORDER_LEASE_TIMEOUT_MS);
 
-  // 1. Create local Payment record (PENDING) + immutable linkage metadata atomically
-  const { payment, auditTx } = await prisma.$transaction(async (tx) => {
+  // --------------------------------------------------------------------------
+  // SHORT DB TRANSACTION 1: Serialization, Existing Order Inspection & Lease Acquisition
+  // --------------------------------------------------------------------------
+  const setupResult = await prisma.$transaction(async (tx) => {
+    // 1. Transaction-level advisory lock serializes order creation for this job
+    if (typeof tx.$executeRawUnsafe === 'function') {
+      await tx.$executeRawUnsafe(
+        `SELECT pg_advisory_xact_lock(hashtext($1))`,
+        `printjob_create_order_${initialJob.id}`
+      );
+    }
+
+    // Re-verify authoritative job status inside lock
+    const job = await tx.printJob.findUnique({
+      where: { id: initialJob.id },
+      include: { customer: true, payment: true }
+    });
+
+    if (!job || job.status !== 'PENDING_PAYMENT') {
+      throw new AppError(`Job cannot be paid. Current status: ${job?.status || 'NOT_FOUND'}`, 400);
+    }
+
+    const currentSuccess = await findSuccessfulPaymentForJob(tx, job);
+    if (currentSuccess) {
+      throw new AppError('A successful payment already exists for this job', 409);
+    }
+
+    // Find any existing PENDING payment for this job across attempts
+    const existingPayments = await tx.payment.findMany({
+      where: {
+        status: 'PENDING',
+        OR: [
+          { gatewayOrderId: { startsWith: `order_${job.shortId}_` } },
+          { id: job.paymentId || 'none' }
+        ]
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const activeAttempt = existingPayments[0];
+
+    if (activeAttempt) {
+      // Find audit transaction to check in-flight lease
+      const latestTx = await tx.transaction.findFirst({
+        where: { paymentId: activeAttempt.id, action: 'ORDER_CREATION_ATTEMPT' },
+        orderBy: { createdAt: 'desc' }
+      });
+
+      let leaseMeta = {};
+      try {
+        leaseMeta = JSON.parse(latestTx?.gatewayResponse || '{}');
+      } catch {}
+
+      const hasSessionId = Boolean(activeAttempt.gatewaySessionId);
+      const isLeaseActive = leaseMeta.leaseExpiresAt && new Date(leaseMeta.leaseExpiresAt) > new Date();
+
+      if (hasSessionId) {
+        // Ready active session exists
+        const ageMs = Date.now() - new Date(activeAttempt.createdAt).getTime();
+        return {
+          action: 'REUSE_CHECK',
+          job,
+          payment: activeAttempt,
+          auditTx: latestTx,
+          ageMs,
+          gatewayOrderId: activeAttempt.gatewayOrderId,
+          gatewaySessionId: activeAttempt.gatewaySessionId
+        };
+      } else if (isLeaseActive) {
+        // Another worker is actively creating this order right now (< 30s)
+        return {
+          action: 'IN_FLIGHT_WAIT',
+          job,
+          payment: activeAttempt,
+          gatewayOrderId: activeAttempt.gatewayOrderId
+        };
+      } else {
+        // In-flight attempt without session ID whose lease expired (Worker crash recovery)
+        // Refresh lease for this worker so we own the recovery
+        await tx.transaction.update({
+          where: { id: latestTx.id },
+          data: {
+            gatewayResponse: JSON.stringify({
+              ...leaseMeta,
+              leaseToken: currentLeaseToken,
+              leaseExpiresAt: leaseExpiresAt.toISOString(),
+              recoveredBy: process.pid
+            })
+          }
+        });
+
+        return {
+          action: 'CRASH_RECOVERY',
+          job,
+          payment: activeAttempt,
+          auditTx: latestTx,
+          gatewayOrderId: activeAttempt.gatewayOrderId,
+          leaseToken: currentLeaseToken
+        };
+      }
+    }
+
+    // No existing pending payment: calculate next deterministic attempt number
+    const allAttemptsCount = await tx.payment.count({
+      where: {
+        OR: [
+          { gatewayOrderId: { startsWith: `order_${job.shortId}_` } },
+          { id: job.paymentId || 'none' }
+        ]
+      }
+    });
+
+    const attemptNumber = allAttemptsCount + 1;
+    const uniqueOrderId = `order_${job.shortId}_att${attemptNumber}`;
+
+    const customer = await persistCustomerForJob(tx, job, {
+      overridePhone,
+      overrideEmail,
+      isSandbox: !config.validation.isProduction
+    });
+
     const newPayment = await tx.payment.create({
       data: {
         amount: job.cost,
@@ -160,13 +290,14 @@ const createOrder = async (jobId, options = {}) => {
       }
     });
 
-    // Update job.paymentId to point at latest PENDING attempt only if not already linked to a SUCCESS payment
-    if (!job.payment || job.payment.status !== 'SUCCESS') {
-      await tx.printJob.update({
-        where: { id: job.id },
-        data: { paymentId: newPayment.id }
-      });
-    }
+    const updatedJob = await tx.printJob.update({
+      where: { id: job.id },
+      data: {
+        paymentId: newPayment.id,
+        customerId: customer?.id ?? job.customerId ?? null
+      },
+      include: { customer: true, payment: true }
+    });
 
     const newAuditTx = await tx.transaction.create({
       data: {
@@ -179,56 +310,271 @@ const createOrder = async (jobId, options = {}) => {
           printJobId: job.id,
           jobShortId: job.shortId,
           machineId: job.machineId || null,
-          gatewayOrderId: uniqueOrderId
+          gatewayOrderId: uniqueOrderId,
+          leaseToken: currentLeaseToken,
+          leaseExpiresAt: leaseExpiresAt.toISOString(),
+          attemptNumber
         })
       }
     });
 
-    return { payment: newPayment, auditTx: newAuditTx };
+    return {
+      action: 'CREATE_NEW',
+      job: updatedJob,
+      payment: newPayment,
+      auditTx: newAuditTx,
+      gatewayOrderId: uniqueOrderId,
+      leaseToken: currentLeaseToken
+    };
   });
 
-  const customerId = job.customer?.id || `cust_${job.shortId}`;
-  const customerPhone = job.customer?.phone || '9999999999';
-  const customerName = job.customer?.name || 'PrintGo Customer';
-  const customerEmail = job.customer?.email || `kiosk_${job.shortId}@printgo.local`;
+  const { job } = setupResult;
 
+  // --------------------------------------------------------------------------
+  // BRANCH 1: IN_FLIGHT_WAIT (Another worker is currently calling Cashfree)
+  // --------------------------------------------------------------------------
+  if (setupResult.action === 'IN_FLIGHT_WAIT') {
+    // Wait briefly for the peer worker to complete session persistence
+    for (let i = 0; i < 6; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const poll = await prisma.payment.findUnique({
+        where: { id: setupResult.payment.id }
+      });
+      if (poll?.gatewaySessionId) {
+        return {
+          paymentSessionId: poll.gatewaySessionId,
+          orderId: poll.gatewayOrderId,
+          environment: config.validation.environment
+        };
+      }
+    }
+    // If still pending, advise client to retry without creating duplicate order
+    throw new AppError('Payment initialization in progress. Please retry in a few seconds.', 429);
+  }
+
+  // --------------------------------------------------------------------------
+  // BRANCH 2: REUSE_CHECK (A1: Reuse active session or A2: Reconcile stale session)
+  // --------------------------------------------------------------------------
+  if (setupResult.action === 'REUSE_CHECK') {
+    const { ageMs, gatewayOrderId, gatewaySessionId, payment } = setupResult;
+
+    // A1: If younger than TTL, reuse immediately without network roundtrip
+    if (ageMs < CASHFREE_ORDER_TTL_MS && gatewaySessionId) {
+      logger.info(`Reusing active Cashfree order ${gatewayOrderId} for job ${job.shortId} (age: ${Math.round(ageMs / 1000)}s)`);
+      return {
+        paymentSessionId: gatewaySessionId,
+        orderId: gatewayOrderId,
+        environment: config.validation.environment
+      };
+    }
+
+    // A2: If older than TTL, verify with gateway before reusing or invalidating
+    logger.info(`Reconciling stale Cashfree order ${gatewayOrderId} with gateway...`);
+    const gatewayStatus = await cashfreeGateway.getOrderDetails(gatewayOrderId);
+
+    if (gatewayStatus.success) {
+      if (gatewayStatus.order_status === 'ACTIVE' && gatewayStatus.payment_session_id) {
+        return {
+          paymentSessionId: gatewayStatus.payment_session_id,
+          orderId: gatewayOrderId,
+          environment: config.validation.environment
+        };
+      }
+
+      if (gatewayStatus.order_status === 'PAID') {
+        // Customer paid! Reuse authoritative payment verification
+        logger.info(`Stale order ${gatewayOrderId} is already PAID at gateway. Authoritatively capturing payment...`);
+        await verifyPayment(gatewayOrderId, { source: 'ORDER_REUSE_RECONCILIATION', ipAddress });
+        throw new AppError('A successful payment already exists for this job', 409);
+      }
+
+      if (gatewayStatus.order_status === 'EXPIRED' || gatewayStatus.order_status === 'TERMINATED') {
+        // Order is definitively dead at gateway: mark local payment FAILED
+        await prisma.payment.update({
+          where: { id: payment.id },
+          data: { status: 'FAILED' }
+        });
+        logger.info(`Stale order ${gatewayOrderId} confirmed EXPIRED at gateway. Re-invoking createOrder for fresh attempt.`);
+        return createOrder(jobId, options);
+      }
+    }
+
+    // If gateway check fails ambiguously, reuse cached session if available or fail closed
+    if (gatewaySessionId) {
+      return {
+        paymentSessionId: gatewaySessionId,
+        orderId: gatewayOrderId,
+        environment: config.validation.environment
+      };
+    }
+    throw new AppError('Unable to verify existing payment order with gateway. Please retry.', 502);
+  }
+
+  // --------------------------------------------------------------------------
+  // BRANCH 3: CRASH_RECOVERY (Worker 1 died before persisting gatewaySessionId)
+  // --------------------------------------------------------------------------
+  if (setupResult.action === 'CRASH_RECOVERY') {
+    const { gatewayOrderId, payment, auditTx, leaseToken } = setupResult;
+    logger.warn(`Recovering crashed order creation attempt for ${gatewayOrderId}...`);
+
+    const gatewayStatus = await cashfreeGateway.getOrderDetails(gatewayOrderId);
+
+    if (gatewayStatus.success && gatewayStatus.order_status === 'ACTIVE' && gatewayStatus.payment_session_id) {
+      // Recovered successfully from gateway! Save session conditionally verifying lease token
+      await prisma.$transaction(async (tx) => {
+        const currentAudit = await tx.transaction.findUnique({ where: { id: auditTx.id } });
+        let currentMeta = {};
+        try { currentMeta = JSON.parse(currentAudit?.gatewayResponse || '{}'); } catch {}
+
+        if (currentMeta.leaseToken && currentMeta.leaseToken !== leaseToken) {
+          logger.warn(`Crash recovery lease token mismatch: ${leaseToken} vs ${currentMeta.leaseToken}. Aborting.`);
+          return;
+        }
+
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: { gatewaySessionId: gatewayStatus.payment_session_id }
+        });
+        await tx.transaction.update({
+          where: { id: auditTx.id },
+          data: { status: 'SUCCESS' }
+        });
+      });
+
+      return {
+        paymentSessionId: gatewayStatus.payment_session_id,
+        orderId: gatewayOrderId,
+        environment: config.validation.environment
+      };
+    }
+
+    if (gatewayStatus.success && gatewayStatus.order_status === 'PAID') {
+      await verifyPayment(gatewayOrderId, { source: 'ORDER_CRASH_RECOVERY', ipAddress });
+      throw new AppError('A successful payment already exists for this job', 409);
+    }
+
+    if (gatewayStatus.isNotFound) {
+      // Order never reached Cashfree. Safe to mark old attempt FAILED and create fresh one
+      await prisma.$transaction(async (tx) => {
+        await tx.payment.update({
+          where: { id: payment.id },
+          data: { status: 'FAILED' }
+        });
+        await tx.transaction.update({
+          where: { id: auditTx.id },
+          data: { status: 'FAILED', errorMessage: 'Crash recovery: order never reached gateway' }
+        });
+      });
+      return createOrder(jobId, options);
+    }
+
+    // Ambiguous gateway response during crash recovery: fail closed safely
+    throw new AppError('Payment gateway status is currently ambiguous. Please retry.', 504);
+  }
+
+  // --------------------------------------------------------------------------
+  // BRANCH 4: CREATE_NEW (Network I/O Outside Database Transaction)
+  // --------------------------------------------------------------------------
+  const { payment, auditTx, gatewayOrderId, leaseToken } = setupResult;
+
+  const isSandbox = !config.validation.isProduction;
+  const customerDetails = resolveCustomerDetails(job, { isSandbox });
+
+  const payload = {
+    order_id: gatewayOrderId,
+    order_amount: job.cost,
+    order_currency: 'INR',
+    customer_details: customerDetails,
+    order_meta: {
+      return_url: targetReturnUrl,
+      ...(config.notifyUrl ? { notify_url: config.notifyUrl } : {})
+    },
+    order_note: `PrintGo Self-Service Kiosk Job ${job.shortId}`
+  };
+
+  logger.info(`Creating Cashfree order ${gatewayOrderId} for job ${job.shortId} (amount: ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹${job.cost})`);
+
+  let response;
   try {
-    const payload = {
-      order_id: uniqueOrderId,
-      order_amount: job.cost,
-      order_currency: 'INR',
-      customer_details: {
-        customer_id: customerId,
-        customer_phone: customerPhone,
-        customer_name: customerName,
-        customer_email: customerEmail
-      },
-      order_meta: {
-        return_url: targetReturnUrl,
-        ...(config.notifyUrl ? { notify_url: config.notifyUrl } : {})
-      },
-      order_note: `PrintGo Self-Service Kiosk Job ${job.shortId}`
-    };
-
-    logger.info(`Creating Cashfree order ${uniqueOrderId} for job ${job.shortId} (amount: ₹${job.cost})`);
-
-    const response = await axios.post(config.orderUrl, payload, {
+    response = await axios.post(config.orderUrl, payload, {
       headers: config.headers,
       timeout: config.timeout
     });
+  } catch (error) {
+    const isTimeout = error.code === 'ECONNABORTED' || error.message?.includes('timeout');
+    logger.warn(`Cashfree order creation error for ${gatewayOrderId} (timeout=${isTimeout}):`, error.message);
 
-    const returnedOrderId = response.data.order_id || uniqueOrderId;
+    // If ambiguous timeout or 5xx, attempt reconciliation using the exact same orderId
+    if (isTimeout || (error?.response?.status && error.response.status >= 500)) {
+      const reconciled = await cashfreeGateway.getOrderDetails(gatewayOrderId);
+      if (reconciled.success && reconciled.order_status === 'ACTIVE' && reconciled.payment_session_id) {
+        response = { data: reconciled.rawResponse || { payment_session_id: reconciled.payment_session_id, order_id: gatewayOrderId } };
+      }
+    }
 
-    // 4. Update Payment with gateway references
-    await prisma.payment.update({
+    // If still unresolved, mark FAILED and throw
+    if (!response) {
+      await prisma.$transaction(async (tx) => {
+        await tx.payment.updateMany({
+          where: { id: payment.id, status: 'PENDING' },
+          data: { status: 'FAILED' }
+        }).catch(() => {});
+
+        await tx.transaction.update({
+          where: { id: auditTx.id },
+          data: {
+            status: 'FAILED',
+            errorCode: String(error?.response?.status || '500'),
+            errorMessage: String(error?.response?.data?.message || error.message)
+          }
+        }).catch(() => {});
+      });
+
+      throw new AppError(`Failed to create Cashfree payment order: ${error?.response?.data?.message || error.message}`, 502);
+    }
+  }
+
+  const returnedOrderId = response.data.order_id || gatewayOrderId;
+  const paymentSessionId = response.data.payment_session_id;
+
+  // --------------------------------------------------------------------------
+  // SHORT DB TRANSACTION 2: Commit Gateway References with Lease Verification
+  // --------------------------------------------------------------------------
+  const commitResult = await prisma.$transaction(async (tx) => {
+    // 1. Atomically verify lease ownership inside transaction
+    const latestAuditTx = await tx.transaction.findUnique({
+      where: { id: auditTx.id }
+    });
+
+    let currentLeaseMeta = {};
+    try {
+      currentLeaseMeta = JSON.parse(latestAuditTx?.gatewayResponse || '{}');
+    } catch {}
+
+    // Check if another worker took over our lease
+    if (currentLeaseMeta.leaseToken && currentLeaseMeta.leaseToken !== leaseToken) {
+      logger.warn(
+        `Lease lost for order ${gatewayOrderId}: worker lease '${leaseToken}' replaced by '${currentLeaseMeta.leaseToken}'. Rejecting stale persistence.`
+      );
+      // Fetch latest payment state to see if the newer worker succeeded
+      const currentPayment = await tx.payment.findUnique({
+        where: { id: payment.id }
+      });
+      return {
+        leaseLost: true,
+        currentPayment
+      };
+    }
+
+    // 2. Ownership verified: proceed with atomic update
+    await tx.payment.update({
       where: { id: payment.id },
       data: {
         gatewayOrderId: returnedOrderId,
-        gatewaySessionId: response.data.payment_session_id
+        gatewaySessionId: paymentSessionId
       }
     });
 
-    // 5. Preserve job linkage metadata alongside redacted gateway response
     const redactedGateway = (() => {
       try {
         return JSON.parse(redactSensitiveData(response.data) || '{}');
@@ -237,7 +583,7 @@ const createOrder = async (jobId, options = {}) => {
       }
     })();
 
-    await prisma.transaction.update({
+    await tx.transaction.update({
       where: { id: auditTx.id },
       data: {
         status: 'SUCCESS',
@@ -245,45 +591,38 @@ const createOrder = async (jobId, options = {}) => {
           printJobId: job.id,
           jobShortId: job.shortId,
           machineId: job.machineId || null,
+          leaseToken,
           ...redactedGateway
         })
       }
     });
 
     return {
-      paymentSessionId: response.data.payment_session_id,
-      orderId: returnedOrderId,
-      environment: config.validation.environment
+      leaseLost: false,
+      paymentSessionId,
+      orderId: returnedOrderId
     };
-  } catch (error) {
-    const gatewayError = error?.response?.data || error.message;
-    logger.error('Cashfree order creation error:', gatewayError);
+  });
 
-    // Mark PENDING local order as FAILED cleanly so stale attempt cannot dangle
-    await prisma.payment.updateMany({
-      where: { id: payment.id, status: 'PENDING' },
-      data: { status: 'FAILED' }
-    }).catch(() => {});
-
-    // Record failure in audit ledger while preserving printJobId linkage
-    await prisma.transaction.update({
-      where: { id: auditTx.id },
-      data: {
-        status: 'FAILED',
-        errorCode: String(error?.response?.status || '500'),
-        errorMessage: typeof gatewayError === 'object' ? JSON.stringify(gatewayError) : String(gatewayError),
-        gatewayResponse: JSON.stringify({
-          printJobId: job.id,
-          jobShortId: job.shortId,
-          error: (() => {
-            try { return JSON.parse(redactSensitiveData(gatewayError) || 'null'); } catch { return String(gatewayError); }
-          })()
-        })
-      }
-    }).catch(e => logger.error('Failed to update audit transaction:', e));
-
-    throw new AppError(`Failed to create Cashfree payment order: ${gatewayError?.message || error.message}`, 502);
+  if (commitResult.leaseLost) {
+    // If the newer worker already persisted a session, return that authoritative session
+    if (commitResult.currentPayment?.gatewaySessionId) {
+      logger.info(`Stale worker yielding to newer worker's active session for order ${gatewayOrderId}`);
+      return {
+        paymentSessionId: commitResult.currentPayment.gatewaySessionId,
+        orderId: commitResult.currentPayment.gatewayOrderId,
+        environment: config.validation.environment
+      };
+    }
+    // Otherwise fail closed and advise client to retry/reconcile
+    throw new AppError('Payment attempt lease expired and was reassigned. Please retry.', 409);
   }
+
+  return {
+    paymentSessionId,
+    orderId: returnedOrderId,
+    environment: config.validation.environment
+  };
 };
 
 /**
@@ -300,7 +639,7 @@ const verifyPayment = async (orderId, metadata = {}) => {
 
   if (!payment) throw new AppError('Payment not found', 404);
 
-  // Already processed — idempotent return using resilient resolver
+  // Already processed ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â idempotent return using resilient resolver
   if (payment.status === 'SUCCESS') {
     const job = await resolvePrintJobForPayment(prisma, payment);
     return { updatedJob: job, wasJustUpdated: false, status: 'SUCCESS' };
@@ -331,7 +670,7 @@ const verifyPayment = async (orderId, metadata = {}) => {
       const paidAmount = Number(orderData.order_amount);
       const expectedAmount = Number(payment.amount);
       if (Math.abs(paidAmount - expectedAmount) > 0.01) {
-        logger.error(`CRITICAL: Payment amount mismatch for order ${orderId}! Expected: ₹${expectedAmount}, Received: ₹${paidAmount}`);
+        logger.error(`CRITICAL: Payment amount mismatch for order ${orderId}! Expected: ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹${expectedAmount}, Received: ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹${paidAmount}`);
 
         await prisma.transaction.create({
           data: {
@@ -339,7 +678,7 @@ const verifyPayment = async (orderId, metadata = {}) => {
             action: 'AMOUNT_MISMATCH_DETECTED',
             status: 'FAILED',
             amount: paidAmount,
-            errorMessage: `Amount mismatch. Expected ₹${expectedAmount}, got ₹${paidAmount}`,
+            errorMessage: `Amount mismatch. Expected ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹${expectedAmount}, got ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹${paidAmount}`,
             gatewayResponse: redactSensitiveData(orderData)
           }
         });
@@ -395,7 +734,8 @@ const verifyPayment = async (orderId, metadata = {}) => {
               data: { status: 'SUCCESS', paidAt: new Date() }
             }).then(() => ({ count: 1 }));
 
-        if (updateResult.count === 0) {
+        const updatedCount = updateResult?.count !== undefined ? updateResult.count : 1;
+        if (updatedCount === 0) {
           const job = await resolvePrintJobForPayment(tx, payment);
           return { updatedJob: job, wasJustUpdated: false, status: 'SUCCESS' };
         }
@@ -468,7 +808,7 @@ const verifyPayment = async (orderId, metadata = {}) => {
 
         logger.error(
           `CRITICAL: ${discrepancyType} detected for job ${job.shortId}! ` +
-          `Primary payment: ${priorSuccessPayment?.id || job.paymentId}, secondary order: ${orderId} (₹${paidAmount}). Suppressing duplicate print.`
+          `Primary payment: ${priorSuccessPayment?.id || job.paymentId}, secondary order: ${orderId} (ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¹${paidAmount}). Suppressing duplicate print.`
         );
 
         if (tx.transaction && typeof tx.transaction.create === 'function') {

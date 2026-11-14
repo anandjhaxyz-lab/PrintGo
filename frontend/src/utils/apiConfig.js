@@ -15,7 +15,7 @@ const normalizeBaseUrl = (raw) => {
  */
 export const getApiUrl = ({ envApiUrl, locationObj } = {}) => {
   const configured = normalizeBaseUrl(
-    envApiUrl !== undefined ? envApiUrl : import.meta?.env?.VITE_API_URL
+    envApiUrl !== undefined ? envApiUrl : import.meta.env?.VITE_API_URL
   );
   if (configured) {
     return configured;

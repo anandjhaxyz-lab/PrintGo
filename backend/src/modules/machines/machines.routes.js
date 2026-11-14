@@ -15,4 +15,9 @@ router.get('/agent-version', protectMachine, machinesController.getAgentVersion)
 
 router.get('/:id/public-key', machinesController.getPublicKey);
 
+// Machine Advertisement Suppression (Silence Ads)
+router.post('/:id/ad-suppression', protect, restrictTo('SUPERADMIN', 'FRANCHISEE'), readOnlyGuard, machinesController.setAdSuppression);
+router.delete('/:id/ad-suppression', protect, restrictTo('SUPERADMIN', 'FRANCHISEE'), readOnlyGuard, machinesController.cancelAdSuppression);
+router.get('/:id/ad-suppression', protect, restrictTo('SUPERADMIN', 'FRANCHISEE'), machinesController.getAdSuppressionStatus);
+
 module.exports = router;
