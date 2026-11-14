@@ -261,19 +261,24 @@ const autoSeed = async () => {
   try {
     const prisma = require('./utils/prisma');
     
-    // Seed Machine
-    const machineKey = process.env.MACHINE_KEY;
-    const existingMachine = await prisma.machine.findUnique({ where: { machineKey }});
-    if (!existingMachine) {
-      await prisma.machine.create({
-        data: {
-          name: 'Main Shop Printer',
-          location: 'Front Desk',
-          machineKey: machineKey,
-          status: 'ACTIVE',
-        }
-      });
-      logger.info('Auto-seeded default machine!');
+    // Seed default machine only when a key has been explicitly configured.
+    // Missing MACHINE_KEY must not block the Superadmin bootstrap below.
+    const machineKey = process.env.MACHINE_KEY?.trim();
+    if (machineKey) {
+      const existingMachine = await prisma.machine.findUnique({ where: { machineKey }});
+      if (!existingMachine) {
+        await prisma.machine.create({
+          data: {
+            name: 'Main Shop Printer',
+            location: 'Front Desk',
+            machineKey,
+            status: 'ACTIVE',
+          }
+        });
+        logger.info('Auto-seeded default machine!');
+      }
+    } else {
+      logger.info('Skipping default machine auto-seed: MACHINE_KEY is not configured. Register a machine from the admin panel.');
     }
 
     // Seed Admin
