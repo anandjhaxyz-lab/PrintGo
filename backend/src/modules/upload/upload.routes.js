@@ -49,5 +49,6 @@ const upload = multer({
 const { requireSessionOrUser } = require('../../middlewares/session');
 
 router.post('/', requireSessionOrUser, upload.single('file'), uploadController.handleUpload);
+router.get('/preview/:filename', requireSessionOrUser, uploadController.handlePreview);
 
 module.exports = router;

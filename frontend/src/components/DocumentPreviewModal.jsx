@@ -22,7 +22,8 @@ export const DocumentPreviewModal = ({
   fileUrl,
   fileName,
   fileSize,
-  initialPages = 1
+  initialPages = 1,
+  sessionToken
 }) => {
   const [currentPage, setCurrentPage] = useState(1);
   const [totalPages, setTotalPages] = useState(initialPages || 1);
@@ -75,11 +76,21 @@ export const DocumentPreviewModal = ({
 
     const loadPdf = async () => {
       try {
-        const loadingTask = pdfjsLib.getDocument({
+        const docInitParams = {
           url: fileUrl,
           cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/',
           cMapPacked: true
-        });
+        };
+
+        // Attach authenticated session bearer header if loading directly over HTTP
+        if (sessionToken && typeof fileUrl === 'string' && fileUrl.startsWith('http')) {
+          docInitParams.httpHeaders = {
+            Authorization: `Bearer ${sessionToken}`
+          };
+          docInitParams.withCredentials = true;
+        }
+
+        const loadingTask = pdfjsLib.getDocument(docInitParams);
 
         const pdf = await loadingTask.promise;
         if (isCancelled) return;
@@ -105,7 +116,7 @@ export const DocumentPreviewModal = ({
         renderTaskRef.current.cancel();
       }
     };
-  }, [isOpen, fileUrl, isPdf]);
+  }, [isOpen, fileUrl, isPdf, sessionToken]);
 
   // Render specific PDF page to canvas
   const renderPage = async (pageNumber, pdfInstance, currentZoom) => {

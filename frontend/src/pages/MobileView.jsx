@@ -293,6 +293,72 @@ const MobileView = () => {
           if (urlJobId || recovered.jobId) setJobId(urlJobId || recovered.jobId);
           if (urlOrderId || recovered.orderId) setOrderId(urlOrderId || recovered.orderId);
 
+          // Restore E2E encryption keys if session was encrypted
+          if (recovered.e2e?.isEncrypted) {
+            if (recovered.e2e.encryptedKey) setEncryptedKey(recovered.e2e.encryptedKey);
+            if (recovered.e2e.iv) setIv(recovered.e2e.iv);
+          }
+
+          // Advance to Step 2 if file was already uploaded and no checkout is active
+          if (recovered.fileData && !urlOrderId && !urlJobId && !recovered.jobId) {
+            setStep(2);
+          }
+
+          // Rehydrate preview Blob URL from the authenticated preview endpoint
+          if (recovered.fileData?.filename && token) {
+            const diskFilename = recovered.fileData.filename.split('/').pop();
+            axios
+              .get(`${API_URL}/api/upload/preview/${encodeURIComponent(diskFilename)}`, {
+                headers: { Authorization: `Bearer ${token}` },
+                responseType: 'arraybuffer',
+              })
+              .then(async (res) => {
+                if (cancelled || !res.data) return;
+                let finalBuffer = res.data;
+
+                // Client-side decryption if the recovered file was E2E encrypted
+                if (recovered.e2e?.isEncrypted && recovered.e2e?.rawKey && recovered.e2e?.rawIv) {
+                  try {
+                    const rawKeyStr = forge.util.decode64(recovered.e2e.rawKey);
+                    const rawIvStr = forge.util.decode64(recovered.e2e.rawIv);
+                    const rawKeyBytes = new Uint8Array(rawKeyStr.length);
+                    for (let i = 0; i < rawKeyStr.length; i++) rawKeyBytes[i] = rawKeyStr.charCodeAt(i);
+                    const rawIvBytes = new Uint8Array(rawIvStr.length);
+                    for (let i = 0; i < rawIvStr.length; i++) rawIvBytes[i] = rawIvStr.charCodeAt(i);
+
+                    const cryptoKey = await window.crypto.subtle.importKey(
+                      'raw',
+                      rawKeyBytes,
+                      { name: 'AES-GCM' },
+                      false,
+                      ['decrypt']
+                    );
+                    finalBuffer = await window.crypto.subtle.decrypt(
+                      { name: 'AES-GCM', iv: rawIvBytes },
+                      cryptoKey,
+                      res.data
+                    );
+                  } catch (decErr) {
+                    console.warn('Client-side decryption of recovered preview failed:', decErr);
+                    return;
+                  }
+                }
+
+                const mime = recovered.fileData.mimetype || 'application/pdf';
+                const blob = new Blob([finalBuffer], { type: mime });
+                assignPreviewBlob(blob, recovered.fileData.originalName);
+              })
+              .catch((err) => {
+                const status = err.response?.status;
+                console.warn('Preview blob rehydration status:', status || err.message);
+                if (status === 410) {
+                  clearRecoveredSession(scopeParams);
+                  setStep(1);
+                  showError('Session expired. Please scan the QR flyer again.');
+                }
+              });
+          }
+
           // Best-effort live pricing profile refresh without minting a new session
           axios
             .get(`${API_URL}/api/auth/pricing`, {
@@ -668,6 +734,7 @@ const MobileView = () => {
 
       // E2E Encryption Flow when publicKey & WebCrypto are available
       const hasSubtleCrypto = typeof window !== 'undefined' && window.crypto && window.crypto.subtle;
+      let e2eMetadata = null;
       if (publicKey && hasSubtleCrypto) {
         try {
           const rawKey = window.crypto.getRandomValues(new Uint8Array(32));
@@ -697,9 +764,21 @@ const MobileView = () => {
             mgf1: { md: forge.md.sha256.create() },
           });
 
-          setEncryptedKey(forge.util.encode64(encryptedRawKey));
-          setIv(forge.util.encode64(rawIvStr));
+          const encryptedRawKeyB64 = forge.util.encode64(encryptedRawKey);
+          const rawIvB64 = forge.util.encode64(rawIvStr);
+          const rawKeyB64 = forge.util.encode64(rawKeyStr);
+
+          setEncryptedKey(encryptedRawKeyB64);
+          setIv(rawIvB64);
           isEncrypted = true;
+
+          e2eMetadata = {
+            isEncrypted: true,
+            rawKey: rawKeyB64,
+            rawIv: rawIvB64,
+            encryptedKey: encryptedRawKeyB64,
+            iv: rawIvB64,
+          };
         } catch (encErr) {
           console.warn('E2E encryption failed, proceeding with direct upload:', encErr);
           isEncrypted = false;
@@ -723,6 +802,7 @@ const MobileView = () => {
 
         saveRecoveredSession(scopeParams, {
           fileData: data,
+          e2e: e2eMetadata || { isEncrypted: false },
         });
 
         const currentSid = activeSessionId || sessionId;
@@ -972,9 +1052,7 @@ const MobileView = () => {
   const effectivePreviewUrl =
     previewUrl ||
     (fileData?.filename
-      ? fileData.filename.startsWith('http')
-        ? fileData.filename
-        : `${API_URL}${fileData.filename.startsWith('/') ? '' : '/'}${fileData.filename}`
+      ? `${API_URL}/api/upload/preview/${encodeURIComponent(fileData.filename.split('/').pop())}`
       : null);
 
   const displayedTotal = step >= 3 && price > 0 ? price : liveBreakdown.totalAmount;
@@ -1895,6 +1973,7 @@ const MobileView = () => {
         fileName={previewFileName || fileData?.originalName}
         fileSize={fileData?.size}
         initialPages={fileData?.pages || 1}
+        sessionToken={sessionToken}
       />
     </div>
   );

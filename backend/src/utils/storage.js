@@ -51,7 +51,12 @@ const getStorage = () => {
       },
       key: function (req, file, cb) {
         const ext = getSafeExtension(file.mimetype);
-        cb(null, `uploads/${uuidv4()}${ext}`);
+        const ownerPrefix = req.session?.id
+          ? `sess_${req.session.id}_`
+          : req.user?.id
+            ? `user_${req.user.id}_`
+            : '';
+        cb(null, `uploads/${ownerPrefix}${uuidv4()}${ext}`);
       }
     });
   } else {
@@ -65,7 +70,12 @@ const getStorage = () => {
       },
       filename: function (req, file, cb) {
         const ext = getSafeExtension(file.mimetype);
-        cb(null, `${uuidv4()}${ext}`);
+        const ownerPrefix = req.session?.id
+          ? `sess_${req.session.id}_`
+          : req.user?.id
+            ? `user_${req.user.id}_`
+            : '';
+        cb(null, `${ownerPrefix}${uuidv4()}${ext}`);
       }
     });
   }
