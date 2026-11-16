@@ -6,6 +6,7 @@ const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('../../services/pricing.service');
 const { resolveCashfreeEnv } = require('../../config/cashfree.config');
+const { isDemoPaymentPermitted } = require('../../utils/demoPaymentGuard');
 
 const login = async (req, res, next) => {
   try {
@@ -175,6 +176,7 @@ const joinSession = async (req, res, next) => {
       expiresAt: session.expiresAt,
       cashfreeEnv: cashfreeEnv || 'sandbox',
       pricingProfile,
+      enableDemoPayment: isDemoPaymentPermitted(),
     });
   } catch (error) {
     next(error);
@@ -238,7 +240,8 @@ const getPublicPricing = async (req, res, next) => {
     res.status(200).json({
       success: true,
       cashfreeEnv: cashfreeEnv || 'sandbox',
-      pricingProfile
+      pricingProfile,
+      enableDemoPayment: isDemoPaymentPermitted()
     });
   } catch (error) {
     next(error);

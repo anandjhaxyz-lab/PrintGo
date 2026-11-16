@@ -6,7 +6,7 @@ import {
   Upload, CheckCircle, Loader, CreditCard,
   WifiOff, Printer, AlertTriangle, RefreshCw, FileText,
   ShieldCheck, ChevronRight, ChevronLeft, Check, Eye,
-  Download, Receipt, RotateCcw
+  Download, Receipt, RotateCcw, Zap, Sparkles
 } from 'lucide-react';
 import { StepIndicator } from '../components/mobile/StepIndicator';
 import { AdvertisementDisplay } from '../components/AdvertisementDisplay';
@@ -100,6 +100,8 @@ const MobileView = () => {
   const [isInitializingPayment, setIsInitializingPayment] = useState(false);
   const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
   const [paymentOutcome, setPaymentOutcome] = useState(null); // { type: 'FAILED'|'CANCELLED'|'DROPPED'|'PENDING'|'MISMATCH', message }
+  const [enableDemoPayment, setEnableDemoPayment] = useState(false);
+  const [isExecutingDemoPay, setIsExecutingDemoPay] = useState(false);
   const [error, setError] = useState('');
   const [price, setPrice] = useState(0);
   const [serverBreakdown, setServerBreakdown] = useState(null);
@@ -124,6 +126,7 @@ const MobileView = () => {
   // Refs for cleanup and concurrency guards
   const previewUrlRef = useRef(null);
   const checkoutInFlightRef = useRef(false);
+  const demoPayInFlightRef = useRef(false);
   const submitSettingsInFlightRef = useRef(false);
 
   const [settings, setSettings] = useState({
@@ -286,6 +289,7 @@ const MobileView = () => {
           if (recovered.printerInfo) setPrinterInfo(recovered.printerInfo);
           if (recovered.pricingProfile) setPricingProfile(recovered.pricingProfile);
           if (recovered.cashfreeEnv) setCashfreeEnv(normalizeCashfreeMode(recovered.cashfreeEnv));
+          if (recovered.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(recovered.enableDemoPayment));
           if (recovered.fileData) setFileData(recovered.fileData);
           if (recovered.settings) setSettings(recovered.settings);
           if (recovered.price) setPrice(recovered.price);
@@ -368,6 +372,7 @@ const MobileView = () => {
               if (!cancelled && pRes.data?.success) {
                 if (pRes.data.pricingProfile) setPricingProfile(pRes.data.pricingProfile);
                 if (pRes.data.cashfreeEnv) setCashfreeEnv(normalizeCashfreeMode(pRes.data.cashfreeEnv));
+                if (pRes.data.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(pRes.data.enableDemoPayment));
               }
             })
             .catch(() => {});
@@ -382,6 +387,8 @@ const MobileView = () => {
             if (res.data.pricingProfile) setPricingProfile(res.data.pricingProfile);
             const envMode = normalizeCashfreeMode(res.data.cashfreeEnv);
             setCashfreeEnv(envMode);
+            const demoAllowed = Boolean(res.data.enableDemoPayment);
+            setEnableDemoPayment(demoAllowed);
 
             saveRecoveredSession(scopeParams, {
               publicCode,
@@ -390,6 +397,7 @@ const MobileView = () => {
               printerInfo: res.data.printer || null,
               pricingProfile: res.data.pricingProfile || DEFAULT_PRICING_PROFILE,
               cashfreeEnv: envMode,
+              enableDemoPayment: demoAllowed,
               expiresAt: res.data.expiresAt || null,
             });
           }
@@ -404,6 +412,8 @@ const MobileView = () => {
             if (res.data.pricingProfile) setPricingProfile(res.data.pricingProfile);
             const envMode = normalizeCashfreeMode(res.data.cashfreeEnv);
             setCashfreeEnv(envMode);
+            const demoAllowed = Boolean(res.data.enableDemoPayment);
+            setEnableDemoPayment(demoAllowed);
 
             saveRecoveredSession(scopeParams, {
               sessionCode: effectiveCode,
@@ -411,6 +421,7 @@ const MobileView = () => {
               machineId: res.data.machineId || null,
               pricingProfile: res.data.pricingProfile || DEFAULT_PRICING_PROFILE,
               cashfreeEnv: envMode,
+              enableDemoPayment: demoAllowed,
               expiresAt: res.data.expiresAt || null,
             });
           }
@@ -1021,6 +1032,54 @@ const MobileView = () => {
     } finally {
       setIsInitializingPayment(false);
       checkoutInFlightRef.current = false;
+    }
+  };
+
+  // Simulated Staging Demo Payment Flow (Produces real physical print on Staging Epson printer)
+  const handleDemoPayment = async () => {
+    if (!jobId) {
+      showError('Missing Print Job ID. Please confirm your print settings again.');
+      return;
+    }
+    if (demoPayInFlightRef.current || isExecutingDemoPay || isInitializingPayment || isVerifyingPayment) {
+      return;
+    }
+
+    demoPayInFlightRef.current = true;
+    setIsExecutingDemoPay(true);
+    setPaymentOutcome(null);
+
+    try {
+      const res = await axios.post(
+        `${API_URL}/api/payments/demo-pay/${encodeURIComponent(jobId)}`,
+        {},
+        { headers: authHeaders() }
+      );
+
+      if (res.data?.success && res.data?.job) {
+        const returnedJob = res.data.job;
+        setJobId(returnedJob.shortId);
+        setJobStatus(returnedJob.status || 'WAITING');
+        setStep(4);
+        saveRecoveredSession(scopeParams, {
+          jobId: returnedJob.shortId,
+          orderId: res.data.payment?.gatewayOrderId || `demo_order_${returnedJob.shortId}`,
+          paymentState: 'PAID',
+        });
+      } else {
+        throw new Error(res.data?.error || 'Demo payment failed.');
+      }
+    } catch (err) {
+      console.error('Demo payment error:', err);
+      const msg = extractErrorMessage(err, 'Failed to complete simulated demo payment.');
+      setPaymentOutcome({
+        type: 'FAILED',
+        message: msg,
+      });
+      showError(msg);
+    } finally {
+      setIsExecutingDemoPay(false);
+      demoPayInFlightRef.current = false;
     }
   };
 
@@ -1732,6 +1791,38 @@ const MobileView = () => {
                 >
                   <RotateCcw size={12} /> Already paid? Check server status
                 </button>
+              )}
+
+              {/* Staging-Only Simulated Demo Payment Section */}
+              {enableDemoPayment && (
+                <div className="w-full mt-4 pt-4 border-t border-slate-700/80">
+                  <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-3 text-left mb-2.5">
+                    <div className="flex items-center gap-1.5 text-amber-400 font-bold text-xs uppercase tracking-wider mb-1">
+                      <Sparkles size={14} />
+                      <span>Staging Simulation Warning</span>
+                    </div>
+                    <p className="text-[11px] text-amber-200/90 font-semibold leading-relaxed">
+                      NO REAL PAYMENT WILL BE CHARGED.<br />
+                      A REAL PHYSICAL PRINT WILL BE PRODUCED.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="s3k-primary-btn bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-sm py-3.5 w-full shadow-lg transition-all flex items-center justify-center gap-2"
+                    onClick={handleDemoPayment}
+                    disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay}
+                  >
+                    {isExecutingDemoPay ? (
+                      <>
+                        <Loader size={18} className="animate-spin" /> Authorizing & Dispatching Print...
+                      </>
+                    ) : (
+                      <>
+                        <Zap size={16} /> SIMULATE DEMO PAYMENT — STAGING ONLY
+                      </>
+                    )}
+                  </button>
+                </div>
               )}
 
               <button

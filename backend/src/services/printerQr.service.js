@@ -5,6 +5,7 @@ const AppError = require('../utils/AppError');
 const logger = require('../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('./pricing.service');
 const { resolveCashfreeEnv } = require('../config/cashfree.config');
+const { isDemoPaymentPermitted } = require('../utils/demoPaymentGuard');
 
 /**
  * Validates that an IP or hostname is not private/loopback in production.
@@ -527,6 +528,7 @@ const resolvePrinterQr = async (publicCode) => {
     expiresAt: session.expiresAt,
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
+    enableDemoPayment: isDemoPaymentPermitted(),
     printer: {
       name: qr.machine_name,
       model: qr.machine_printer_model || 'EPSON L6460 Series',

@@ -61,8 +61,10 @@ services:
       - key: CASHFREE_NOTIFY_URL
         # Set to the verified staging backend webhook URL (e.g. https://printgo-backend-staging.onrender.com/api/payments/webhook)
         sync: false
+      - key: APP_ENV
+        value: staging
       - key: ENABLE_DEMO_PAYMENT
-        value: "false"
+        value: "true"
 
   # 2. PrintGo Staging Admin Dashboard (Admin-Only Static Site; Customer Portal deploys separately on Cloudflare Pages Free)
   - type: web

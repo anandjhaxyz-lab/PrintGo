@@ -5,6 +5,7 @@ const { startPrintingProcess } = require('../../services/queueService');
 const cashfreeGateway = require('../../services/cashfreeGateway.adapter');
 const { issueCreditNoteForInvoice } = require('../../services/invoice.service');
 const { redactSensitiveData } = require('../../config/cashfree.config');
+const { isDemoPaymentPermitted } = require('../../utils/demoPaymentGuard');
 
 /**
  * Extracts sessionId stored inside a job's pricingSnapshot JSON, if present.
@@ -424,12 +425,14 @@ const refundOrder = async (req, res, next) => {
 
 /**
  * Demo Payment (1-Click Simulation)
- * Disabled by default, permanently blocked in production, requires session/user ownership.
+ * Authorized strictly on Staging via isDemoPaymentPermitted.
+ * Permanently blocked in Production. Requires session/user ownership.
+ * Dispatches physical printing idempotently reusing startPrintingProcess.
  */
 const demoPayment = async (req, res, next) => {
   try {
-    if (process.env.NODE_ENV === 'production' || process.env.ENABLE_DEMO_PAYMENT !== 'true') {
-      logger.warn('Rejected request to disabled demo-pay endpoint');
+    if (!isDemoPaymentPermitted()) {
+      logger.warn('Rejected request to disabled demo-pay endpoint: staging authorization check failed');
       return res.status(403).json({
         success: false,
         error: 'Demo payment endpoint is disabled'
@@ -441,7 +444,7 @@ const demoPayment = async (req, res, next) => {
 
     const job = await prisma.printJob.findUnique({
       where: { shortId: id },
-      include: { machine: true, document: true }
+      include: { machine: true, document: true, payment: true }
     });
 
     const accessErr = checkJobAccess(req, job);
@@ -449,14 +452,32 @@ const demoPayment = async (req, res, next) => {
       return res.status(accessErr.status).json({ success: false, error: accessErr.error });
     }
 
-    // Idempotency: If already paid/waiting, return existing
+    // Idempotency: If already paid/waiting/printing/completed, return existing without re-dispatching
     if (job.status !== 'PENDING_PAYMENT') {
+      logger.info(`Demo payment idempotency: Job ${job.shortId} already in status ${job.status}`);
       return res.json({ success: true, message: 'Job already paid', job });
     }
 
     const demoOrderId = `demo_order_${job.shortId}_${Date.now()}`;
 
-    const { payment, updatedJob } = await prisma.$transaction(async (tx) => {
+    const { payment, updatedJob, wasAlreadyProcessed } = await prisma.$transaction(async (tx) => {
+      // Re-fetch inside transaction with advisory lock to ensure strictly ONE concurrent request transitions the job
+      if (typeof tx.$executeRawUnsafe === 'function') {
+        await tx.$executeRawUnsafe(
+          `SELECT pg_advisory_xact_lock(hashtext($1))`,
+          `printjob_demo_pay_${job.id}`
+        );
+      }
+
+      const freshJob = await tx.printJob.findUnique({
+        where: { id: job.id },
+        include: { payment: true }
+      });
+
+      if (!freshJob || freshJob.status !== 'PENDING_PAYMENT') {
+        return { payment: freshJob?.payment, updatedJob: freshJob, wasAlreadyProcessed: true };
+      }
+
       const newPayment = await tx.payment.create({
         data: {
           amount: job.cost,
@@ -471,7 +492,7 @@ const demoPayment = async (req, res, next) => {
       });
 
       const updated = await tx.printJob.update({
-        where: { shortId: id },
+        where: { id: job.id },
         data: {
           status: 'WAITING',
           paymentId: newPayment.id
@@ -479,22 +500,25 @@ const demoPayment = async (req, res, next) => {
         include: { document: true, machine: true }
       });
 
-      await tx.transaction.create({
-        data: {
-          paymentId: newPayment.id,
-          action: 'DEMO_PAYMENT_SIMULATION',
-          status: 'SUCCESS',
-          amount: job.cost,
-          ipAddress: ipAddress || null,
-          gatewayResponse: JSON.stringify({
-            note: 'Simulated 1-click demo payment',
-            printJobId: job.id,
-            jobShortId: job.shortId
-          })
-        }
-      });
+      if (tx.transaction && typeof tx.transaction.create === 'function') {
+        await tx.transaction.create({
+          data: {
+            paymentId: newPayment.id,
+            action: 'DEMO_PAYMENT_SIMULATION',
+            status: 'SUCCESS',
+            amount: job.cost,
+            ipAddress: ipAddress || null,
+            gatewayResponse: JSON.stringify({
+              note: 'Simulated 1-click demo payment on Staging',
+              printJobId: job.id,
+              jobShortId: job.shortId,
+              gatewayOrderId: demoOrderId
+            })
+          }
+        });
+      }
 
-      return { payment: newPayment, updatedJob: updated };
+      return { payment: newPayment, updatedJob: updated, wasAlreadyProcessed: false };
     });
 
     logger.info(`⚡ Demo Payment confirmed for job ${job.shortId} (cost: ₹${job.cost}). Status: WAITING. Transaction logged.`);
@@ -508,7 +532,17 @@ const demoPayment = async (req, res, next) => {
       io.to('admins').emit('job_status_changed', updatedJob);
     }
 
-    res.json({ success: true, message: 'Demo payment confirmed', job: updatedJob, payment });
+    // Call the approved physical printing dispatch function (reusing Cashfree queue path)
+    if (!wasAlreadyProcessed && updatedJob?.status === 'WAITING' && startPrintingProcess) {
+      try {
+        logger.info(`⚡ Demo Payment: Dispatching job ${updatedJob.shortId} to print queue.`);
+        await startPrintingProcess(updatedJob.shortId, io);
+      } catch (dispatchErr) {
+        logger.error(`Failed to dispatch demo print job ${updatedJob.shortId}:`, dispatchErr);
+      }
+    }
+
+    res.json({ success: true, message: 'Demo payment confirmed and dispatched to printer', job: updatedJob, payment });
   } catch (error) {
     next(error);
   }
