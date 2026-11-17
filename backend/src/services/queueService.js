@@ -377,25 +377,7 @@ const cleanupTimer = setInterval(async () => {
     }
 
     // 3. Delete files for COMPLETED, FAILED, and REFUNDED jobs older than 1 hour
-    const oldFinishedJobs = await prisma.printJob.findMany({
-      where: {
-        status: { in: ['COMPLETED', 'FAILED', 'REFUNDED'] },
-        updatedAt: { lt: oneHourAgo }
-      },
-      include: { document: true }
-    });
-
-    for (const job of oldFinishedJobs) {
-      if (job.document && job.document.filename) {
-        await deleteFile(job.document.filename);
-        // Clear filename in DB so we don't try to delete it again
-        await prisma.document.update({
-          where: { id: job.document.id },
-          data: { filename: null, originalName: 'File deleted (retention period ended)' }
-        });
-        console.log(`🧹 Deleted stale file for job ${job.shortId}.`);
-      }
-    }
+    await cleanupExpiredJobFiles({ deleteFileFn: deleteFile });
   } catch (error) {
     console.error('Error during cleanup:', error);
   }
@@ -405,11 +387,102 @@ if (typeof cleanupTimer.unref === 'function') {
   cleanupTimer.unref();
 }
 
+/**
+ * Safely deletes files for COMPLETED, FAILED, and REFUNDED jobs older than the retention period.
+ * Excludes documents already cleaned (filename === '') and isolates errors per record.
+ */
+const cleanupExpiredJobFiles = async (options = {}) => {
+  const db = options.prismaClient || prisma;
+  const nowMs = options.now instanceof Date ? options.now.getTime() : Date.now();
+  const retentionMs = typeof options.retentionMs === 'number' ? options.retentionMs : 3600000; // 1 hour default
+  const cutoffDate = new Date(nowMs - retentionMs);
+  const deleteFileFn = options.deleteFileFn || require('../utils/storage').deleteFile;
+
+  const oldFinishedJobs = (await db.printJob.findMany({
+    where: {
+      status: { in: ['COMPLETED', 'FAILED', 'REFUNDED'] },
+      updatedAt: { lt: cutoffDate },
+      document: {
+        filename: { not: '' }
+      }
+    },
+    include: { document: true }
+  })) || [];
+
+  const summary = {
+    scannedCount: oldFinishedJobs.length,
+    cleanedCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    errors: []
+  };
+
+  for (const job of oldFinishedJobs) {
+    try {
+      if (!job.document || !job.document.filename) {
+        summary.skippedCount++;
+        continue;
+      }
+
+      // Check if another active job is still referencing this document
+      if (job.document.id) {
+        const activeSiblingCount = await db.printJob.count({
+          where: {
+            documentId: job.document.id,
+            id: { not: job.id },
+            status: { in: ['PENDING_PAYMENT', 'PAID', 'PRINTING'] }
+          }
+        });
+
+        if (activeSiblingCount > 0) {
+          summary.skippedCount++;
+          continue;
+        }
+      }
+
+      const fileDeleted = await deleteFileFn(job.document.filename);
+      if (fileDeleted === false) {
+        summary.failedCount++;
+        summary.errors.push({
+          jobId: job.id,
+          shortId: job.shortId,
+          error: 'Storage deleteFile returned false'
+        });
+        console.error(`Failed to delete storage file for job ${job.shortId}. Skipping DB update.`);
+        continue;
+      }
+
+      // Clear filename in DB with empty string (satisfies non-nullable String schema)
+      await db.document.update({
+        where: { id: job.document.id },
+        data: {
+          filename: '',
+          originalName: 'File deleted (retention period ended)'
+        }
+      });
+
+      summary.cleanedCount++;
+      console.log(`🧹 Deleted stale file for job ${job.shortId}.`);
+    } catch (jobErr) {
+      summary.failedCount++;
+      summary.errors.push({
+        jobId: job.id,
+        shortId: job.shortId,
+        error: jobErr.message
+      });
+      console.error(`Error deleting stale file for job ${job.shortId}:`, jobErr.message);
+    }
+  }
+
+  return summary;
+};
+
 module.exports = {
   startPrintingProcess,
   calculateEstimatedWaitTime,
   initWorker,
   cleanupAbandonedJobs,
+  cleanupExpiredJobFiles,
   buildAbandonedJobWhere,
   hasProtectedJobReferences
 };
