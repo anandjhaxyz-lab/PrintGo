@@ -6,6 +6,7 @@
 const prisma = require('../utils/prisma');
 const logger = require('../utils/logger');
 const AppError = require('../utils/AppError');
+const { computePrinterAvailability } = require('./printerAvailability.service');
 
 /**
  * Parses date range filter from query parameters.
@@ -77,12 +78,23 @@ const getOverviewStats = async (user, query = {}) => {
   // Fetch machines to determine active/offline counts & tenant machine IDs
   const machines = await prisma.machine.findMany({
     where: machineWhere,
-    select: { id: true, status: true, healthStatus: true }
+    select: {
+      id: true,
+      status: true,
+      lastOnline: true,
+      printerStatuses: {
+        take: 1,
+        orderBy: { timestamp: 'desc' }
+      }
+    }
   });
 
   const machineIds = machines.map(m => m.id);
-  const activePrinters = machines.filter(m => m.status === 'ACTIVE').length;
-  const offlinePrinters = machines.filter(m => m.status !== 'ACTIVE' || m.healthStatus === 'OFFLINE').length;
+  const activePrinters = machines.filter(m => {
+    const availability = computePrinterAvailability(m, m.printerStatuses?.[0] || null);
+    return availability.isReady === true;
+  }).length;
+  const offlinePrinters = machines.length - activePrinters;
 
   // Jobs filter
   const jobWhere = {

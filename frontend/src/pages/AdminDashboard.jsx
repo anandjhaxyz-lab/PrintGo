@@ -207,6 +207,23 @@ const AdminDashboard = () => {
       auth: { token }
     });
 
+    let overviewRefreshTimer = null;
+
+    const scheduleOverviewRefresh = () => {
+      if (overviewRefreshTimer) {
+        clearTimeout(overviewRefreshTimer);
+      }
+      overviewRefreshTimer = setTimeout(() => {
+        axios.get(`${API_URL}/api/admin/analytics/overview?period=${period}`)
+          .then(res => {
+            if (res.data?.success && res.data?.data) {
+              setOverviewStats(res.data.data);
+            }
+          })
+          .catch(() => {});
+      }, 400);
+    };
+
     socket.on('job_status_changed', (updatedJob) => {
       setJobs(prev => {
         const exists = prev.find(j => j.id === updatedJob.id);
@@ -231,9 +248,17 @@ const AdminDashboard = () => {
           return updated.slice(Math.max(0, updated.length - 30));
         });
       }
+      if (status?.machineId) {
+        scheduleOverviewRefresh();
+      }
     });
 
-    return () => socket.disconnect();
+    return () => {
+      if (overviewRefreshTimer) {
+        clearTimeout(overviewRefreshTimer);
+      }
+      socket.disconnect();
+    };
   }, [isAuthenticated, period]);
 
   // Actions
