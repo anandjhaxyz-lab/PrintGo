@@ -7,6 +7,7 @@ import { Step2Connected } from '../components/kiosk/Step2Connected';
 import { Step3Settings } from '../components/kiosk/Step3Settings';
 import { Step4Payment } from '../components/kiosk/Step4Payment';
 import { Step5Status } from '../components/kiosk/Step5Status';
+import { AdvertisementDisplay } from '../components/AdvertisementDisplay';
 import { getApiUrl } from '../utils/apiConfig';
 
 const API_URL = getApiUrl();
@@ -207,6 +208,14 @@ const KioskView = () => {
       </div>
       
       {renderContent()}
+
+      {/* Kiosk Advertisement Display */}
+      <div style={{ width: '100%', maxWidth: 520, margin: '1.5rem auto 0 auto', padding: '0 1rem' }}>
+        <AdvertisementDisplay
+          sessionToken={sessionToken}
+          placement="KIOSK_ONLY"
+        />
+      </div>
 
       {/* Manual Start Over Button */}
       {step > 1 && (

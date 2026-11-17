@@ -4,7 +4,13 @@ import { getApiUrl } from '../utils/apiConfig';
 
 const API_URL = getApiUrl();
 
-export const AdvertisementDisplay = ({ ads: initialAds }) => {
+export const AdvertisementDisplay = ({
+  ads: initialAds,
+  sessionToken,
+  publicCode,
+  placement,
+  onSuppressed
+}) => {
   const [ads, setAds] = useState(initialAds || []);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
@@ -15,23 +21,63 @@ export const AdvertisementDisplay = ({ ads: initialAds }) => {
 
   // Fetch active ads if not provided via props
   useEffect(() => {
-    if (!initialAds) {
-      const fetchAds = async () => {
-        try {
-          const res = await fetch(`${API_URL}/api/advertisements/active`);
-          const data = await res.json();
-          if (data?.success && Array.isArray(data.advertisements)) {
+    if (initialAds) {
+      setAds(initialAds);
+      return;
+    }
+
+    let isMounted = true;
+
+    const fetchAds = async () => {
+      try {
+        const params = new URLSearchParams();
+        if (placement) params.append('placement', placement);
+        if (publicCode) params.append('publicCode', publicCode);
+
+        const queryString = params.toString();
+        const url = `${API_URL}/api/advertisements/active${queryString ? `?${queryString}` : ''}`;
+        const headers = {};
+        if (sessionToken) {
+          headers['Authorization'] = `Bearer ${sessionToken}`;
+        }
+
+        const res = await fetch(url, { headers });
+        const data = await res.json();
+        if (!isMounted) return;
+
+        if (data?.success) {
+          if (data.suppressed) {
+            setAds([]);
+            if (onSuppressed) onSuppressed(data.reason);
+          } else if (Array.isArray(data.advertisements)) {
             setAds(data.advertisements);
           }
-        } catch (e) {
-          console.warn('Could not load advertisements:', e);
         }
-      };
-      fetchAds();
-    } else {
-      setAds(initialAds);
-    }
-  }, [initialAds]);
+      } catch (e) {
+        console.warn('Could not load advertisements:', e);
+      }
+    };
+
+    fetchAds();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [initialAds, sessionToken, publicCode, placement, onSuppressed]);
+
+  // Clean unmount guard: pause any playing video
+  useEffect(() => {
+    return () => {
+      if (videoRef.current) {
+        try {
+          videoRef.current.pause();
+        } catch (_) {}
+      }
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+      }
+    };
+  }, []);
 
   // Filter out any broken media
   const validAds = ads.filter(ad => !failedIds.has(ad.id));

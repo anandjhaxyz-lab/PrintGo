@@ -1194,7 +1194,11 @@ const MobileView = () => {
       case 1:
         return (
           <div className="flex flex-col justify-center animate-fade-in" style={{ gap: '0.65rem' }}>
-            <AdvertisementDisplay />
+            <AdvertisementDisplay
+              sessionToken={sessionToken}
+              publicCode={publicCode}
+              placement="MOBILE_ONLY"
+            />
 
             <div className="s3k-card py-2 px-3 flex items-center justify-between" style={{ minHeight: 48 }}>
               <div className="flex items-center gap-2.5 overflow-hidden flex-1 min-w-0 mr-2">
@@ -1337,7 +1341,11 @@ const MobileView = () => {
       case 2:
         return (
           <div className="flex flex-col justify-center animate-fade-in" style={{ gap: '0.45rem' }}>
-            <AdvertisementDisplay />
+            <AdvertisementDisplay
+              sessionToken={sessionToken}
+              publicCode={publicCode}
+              placement="MOBILE_ONLY"
+            />
 
             <div className="s3k-card py-2 px-3 flex items-center justify-between">
               <div className="flex items-center gap-2 overflow-hidden flex-1 min-w-0 mr-2">

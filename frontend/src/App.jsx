@@ -159,6 +159,7 @@ const App = () => {
                 <Route path="/" element={<KioskView />} />
                 <Route path="/kiosk" element={<KioskView />} />
                 <Route path="/m/:sessionId" element={<MobileView />} />
+                <Route path="/m" element={<MobileView />} />
                 <Route path="/p/:publicCode" element={<MobileView />} />
                 <Route path="/admin" element={<AdminDashboard />} />
                 <Route path="/login" element={<AdminDashboard />} />

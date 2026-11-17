@@ -1,34 +1,46 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
-import { 
-  Megaphone, 
-  Plus, 
-  Trash2, 
-  Eye, 
-  ArrowUp, 
-  ArrowDown, 
-  Check, 
-  X, 
-  Calendar, 
-  Clock, 
-  Film, 
-  Image as ImageIcon, 
-  UploadCloud, 
+import {
+  Megaphone,
+  Plus,
+  Trash2,
+  Eye,
+  ArrowUp,
+  ArrowDown,
+  Check,
+  X,
+  Calendar,
+  Clock,
+  Film,
+  Image as ImageIcon,
+  UploadCloud,
   RefreshCw,
   Volume2,
   VolumeX,
   Play,
-  Pause
+  Pause,
+  Pencil,
+  Monitor,
+  Smartphone,
+  Layers,
+  MapPin
 } from 'lucide-react';
+import { getApiUrl } from '../../../utils/apiConfig';
 
-const API_URL = import.meta.env.VITE_API_URL || '';
+const API_URL = getApiUrl();
 
 export const AdvertisementsView = ({ isSuperadmin }) => {
   const [advertisements, setAdvertisements] = useState([]);
+  const [machines, setMachines] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingAdId, setEditingAdId] = useState(null);
   const [previewAd, setPreviewAd] = useState(null);
   const [statusMsg, setStatusMsg] = useState({ text: '', type: '' });
+
+  // Filters State
+  const [filterScope, setFilterScope] = useState('ALL');
+  const [filterPlacement, setFilterPlacement] = useState('ALL');
 
   // Form State for creating/editing ad
   const [formData, setFormData] = useState({
@@ -40,7 +52,10 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
     endDate: '',
     mediaFile: null,
     mediaPreviewUrl: '',
-    mediaType: 'IMAGE'
+    mediaType: 'IMAGE',
+    scope: isSuperadmin ? 'GLOBAL' : 'MACHINE_SPECIFIC',
+    placement: 'ALL',
+    machineId: ''
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -60,9 +75,23 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
     }
   };
 
+  // Fetch available machines for selector
+  const fetchMachines = async () => {
+    try {
+      const endpoint = isSuperadmin ? `${API_URL}/api/machines` : `${API_URL}/api/machines/my-machines`;
+      const res = await axios.get(endpoint);
+      if (res.data?.success) {
+        setMachines(res.data.machines || []);
+      }
+    } catch (err) {
+      console.warn('Could not load machines for advertisement selector:', err);
+    }
+  };
+
   useEffect(() => {
     fetchAdvertisements();
-  }, []);
+    fetchMachines();
+  }, [isSuperadmin]);
 
   const showMessage = (text, type = 'success') => {
     setStatusMsg({ text, type });
@@ -86,15 +115,41 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
     }));
   };
 
-  // Submit new advertisement
-  const handleCreateAd = async (e) => {
+  // Helper to open edit modal
+  const handleOpenEdit = (ad) => {
+    setEditingAdId(ad.id);
+    setFormData({
+      title: ad.title || '',
+      displayDuration: ad.displayDuration || 5,
+      displayOrder: ad.displayOrder !== undefined ? ad.displayOrder : 0,
+      isActive: Boolean(ad.isActive),
+      startDate: ad.startDate ? ad.startDate.slice(0, 10) : '',
+      endDate: ad.endDate ? ad.endDate.slice(0, 10) : '',
+      mediaFile: null,
+      mediaPreviewUrl: ad.mediaUrl ? (ad.mediaUrl.startsWith('http') ? ad.mediaUrl : `${API_URL}${ad.mediaUrl}`) : '',
+      mediaType: ad.type || 'IMAGE',
+      scope: ad.scope || (isSuperadmin ? 'GLOBAL' : 'MACHINE_SPECIFIC'),
+      placement: ad.placement || 'ALL',
+      machineId: ad.machineId || ''
+    });
+    setIsModalOpen(true);
+  };
+
+  // Submit advertisement (Create or Update)
+  const handleSaveAd = async (e) => {
     e.preventDefault();
     if (!formData.title.trim()) {
       showMessage('Please enter an advertisement title', 'error');
       return;
     }
-    if (!formData.mediaFile) {
+
+    if (!editingAdId && !formData.mediaFile) {
       showMessage('Please select an image or video file', 'error');
+      return;
+    }
+
+    if (formData.scope === 'MACHINE_SPECIFIC' && !formData.machineId) {
+      showMessage('Please select an authoritative machine for machine-specific ad', 'error');
       return;
     }
 
@@ -107,21 +162,35 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
       data.append('isActive', formData.isActive);
       if (formData.startDate) data.append('startDate', formData.startDate);
       if (formData.endDate) data.append('endDate', formData.endDate);
-      data.append('media', formData.mediaFile);
+      data.append('scope', formData.scope);
+      data.append('placement', formData.placement);
+      if (formData.scope === 'MACHINE_SPECIFIC') {
+        data.append('machineId', formData.machineId);
+      }
+      if (formData.mediaFile) {
+        data.append('media', formData.mediaFile);
+      }
 
-      const res = await axios.post(`${API_URL}/api/advertisements/admin`, data, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      });
+      let res;
+      if (editingAdId) {
+        res = await axios.put(`${API_URL}/api/advertisements/admin/${editingAdId}`, data, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        });
+      } else {
+        res = await axios.post(`${API_URL}/api/advertisements/admin`, data, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        });
+      }
 
       if (res.data?.success) {
-        showMessage('Advertisement published successfully!', 'success');
+        showMessage(editingAdId ? 'Advertisement updated successfully!' : 'Advertisement published successfully!', 'success');
         setIsModalOpen(false);
         resetForm();
         fetchAdvertisements();
       }
     } catch (err) {
-      console.error('Failed to create advertisement:', err);
-      const errMsg = err.response?.data?.error || err.message || 'Failed to create advertisement';
+      console.error('Failed to save advertisement:', err);
+      const errMsg = err.response?.data?.error || err.message || 'Failed to save advertisement';
       showMessage(errMsg, 'error');
     } finally {
       setIsSubmitting(false);
@@ -129,9 +198,10 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
   };
 
   const resetForm = () => {
-    if (formData.mediaPreviewUrl) {
+    if (formData.mediaPreviewUrl && formData.mediaFile) {
       URL.revokeObjectURL(formData.mediaPreviewUrl);
     }
+    setEditingAdId(null);
     setFormData({
       title: '',
       displayDuration: 5,
@@ -141,7 +211,10 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
       endDate: '',
       mediaFile: null,
       mediaPreviewUrl: '',
-      mediaType: 'IMAGE'
+      mediaType: 'IMAGE',
+      scope: isSuperadmin ? 'GLOBAL' : 'MACHINE_SPECIFIC',
+      placement: 'ALL',
+      machineId: machines[0]?.id || ''
     });
   };
 
@@ -270,12 +343,40 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
         <div style={{ padding: '1rem 1.25rem', borderBottom: '1px solid #1E293B', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
           <div>
             <h2 style={{ fontSize: '1rem', fontWeight: 700, color: '#FFFFFF', margin: 0 }}>Customer Portal Slideshow Ads</h2>
-            <p style={{ fontSize: '0.75rem', color: '#94A3B8', margin: '0.2rem 0 0' }}>Manage photos, video banners, durations and display order shown to mobile kiosk customers.</p>
+            <p style={{ fontSize: '0.75rem', color: '#94A3B8', margin: '0.2rem 0 0' }}>Manage photos, video banners, scopes, and placements shown on kiosks and customer mobile screens.</p>
           </div>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.625rem' }}>
+            {/* Scope Filter */}
+            <select
+              value={filterScope}
+              onChange={(e) => setFilterScope(e.target.value)}
+              style={{
+                background: '#1E293B', border: '1px solid #334155', borderRadius: '8px',
+                padding: '0.5rem 0.65rem', color: '#CBD5E1', fontSize: '0.75rem', fontWeight: 600, outline: 'none'
+              }}
+            >
+              <option value="ALL">All Scopes</option>
+              <option value="GLOBAL">Global Only</option>
+              <option value="MACHINE_SPECIFIC">Machine-Specific Only</option>
+            </select>
+
+            {/* Placement Filter */}
+            <select
+              value={filterPlacement}
+              onChange={(e) => setFilterPlacement(e.target.value)}
+              style={{
+                background: '#1E293B', border: '1px solid #334155', borderRadius: '8px',
+                padding: '0.5rem 0.65rem', color: '#CBD5E1', fontSize: '0.75rem', fontWeight: 600, outline: 'none'
+              }}
+            >
+              <option value="ALL">All Placements</option>
+              <option value="KIOSK_ONLY">Kiosk Only</option>
+              <option value="MOBILE_ONLY">Mobile Only</option>
+            </select>
+
             <button
-              onClick={fetchAdvertisements}
+              onClick={() => { fetchAdvertisements(); fetchMachines(); }}
               disabled={isLoading}
               style={{
                 display: 'flex', alignItems: 'center', gap: '0.4rem',
@@ -307,7 +408,7 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
             <Megaphone size={42} style={{ color: '#475569', margin: '0 auto 1rem' }} />
             <h3 style={{ color: '#FFFFFF', fontSize: '1rem', fontWeight: 700, margin: '0 0 0.5rem' }}>No Advertisements Configured</h3>
             <p style={{ color: '#94A3B8', fontSize: '0.8125rem', maxWidth: '360px', margin: '0 auto 1.25rem' }}>
-              Upload promotional posters, shop offers, or video advertisements to display in the customer mobile portal slideshow.
+              Upload promotional posters, shop offers, or video advertisements to display in the customer mobile portal and kiosk screens.
             </p>
             <button
               onClick={() => { resetForm(); setIsModalOpen(true); }}
@@ -329,6 +430,8 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                   <th style={{ padding: '0.75rem 1rem', width: '50px' }}>Order</th>
                   <th style={{ padding: '0.75rem 1rem', width: '90px' }}>Media</th>
                   <th style={{ padding: '0.75rem 1rem' }}>Title & Format</th>
+                  <th style={{ padding: '0.75rem 1rem' }}>Scope & Machine</th>
+                  <th style={{ padding: '0.75rem 1rem' }}>Placement</th>
                   <th style={{ padding: '0.75rem 1rem' }}>Display Duration</th>
                   <th style={{ padding: '0.75rem 1rem' }}>Campaign Schedule</th>
                   <th style={{ padding: '0.75rem 1rem' }}>Status</th>
@@ -336,167 +439,223 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                 </tr>
               </thead>
               <tbody>
-                {advertisements.map((ad, idx) => {
-                  const mediaUrl = getFullMediaUrl(ad.mediaUrl);
-                  const isNowActive = ad.isActive && 
-                    (!ad.startDate || new Date(ad.startDate) <= new Date()) &&
-                    (!ad.endDate || new Date(ad.endDate) >= new Date());
+                {advertisements
+                  .filter(ad => {
+                    if (filterScope !== 'ALL' && (ad.scope || 'GLOBAL') !== filterScope) return false;
+                    if (filterPlacement !== 'ALL' && (ad.placement || 'ALL') !== filterPlacement) return false;
+                    return true;
+                  })
+                  .map((ad, idx) => {
+                    const mediaUrl = getFullMediaUrl(ad.mediaUrl);
+                    const isNowActive = ad.isActive &&
+                      (!ad.startDate || new Date(ad.startDate) <= new Date()) &&
+                      (!ad.endDate || new Date(ad.endDate) >= new Date());
 
-                  return (
-                    <tr key={ad.id} style={{ borderBottom: '1px solid #1E293B', background: idx % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.01)' }}>
-                      {/* Order and Move Buttons */}
-                      <td style={{ padding: '0.75rem 1rem' }}>
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' }}>
-                          <button
-                            onClick={() => handleReorder(idx, 'up')}
-                            disabled={idx === 0}
-                            style={{
-                              background: 'transparent', border: 'none',
-                              color: idx === 0 ? '#334155' : '#94A3B8',
-                              cursor: idx === 0 ? 'default' : 'pointer', padding: 0
-                            }}
-                            title="Move Up"
-                          >
-                            <ArrowUp size={14} />
-                          </button>
-                          <span style={{ fontSize: '0.75rem', fontWeight: 800, color: '#F59E0B' }}>#{idx + 1}</span>
-                          <button
-                            onClick={() => handleReorder(idx, 'down')}
-                            disabled={idx === advertisements.length - 1}
-                            style={{
-                              background: 'transparent', border: 'none',
-                              color: idx === advertisements.length - 1 ? '#334155' : '#94A3B8',
-                              cursor: idx === advertisements.length - 1 ? 'default' : 'pointer', padding: 0
-                            }}
-                            title="Move Down"
-                          >
-                            <ArrowDown size={14} />
-                          </button>
-                        </div>
-                      </td>
+                    return (
+                      <tr key={ad.id} style={{ borderBottom: '1px solid #1E293B', background: idx % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.01)' }}>
+                        {/* Order and Move Buttons */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' }}>
+                            <button
+                              onClick={() => handleReorder(idx, 'up')}
+                              disabled={idx === 0}
+                              style={{
+                                background: 'transparent', border: 'none',
+                                color: idx === 0 ? '#334155' : '#94A3B8',
+                                cursor: idx === 0 ? 'default' : 'pointer', padding: 0
+                              }}
+                              title="Move Up"
+                            >
+                              <ArrowUp size={14} />
+                            </button>
+                            <span style={{ fontSize: '0.75rem', fontWeight: 800, color: '#F59E0B' }}>#{idx + 1}</span>
+                            <button
+                              onClick={() => handleReorder(idx, 'down')}
+                              disabled={idx === advertisements.length - 1}
+                              style={{
+                                background: 'transparent', border: 'none',
+                                color: idx === advertisements.length - 1 ? '#334155' : '#94A3B8',
+                                cursor: idx === advertisements.length - 1 ? 'default' : 'pointer', padding: 0
+                              }}
+                              title="Move Down"
+                            >
+                              <ArrowDown size={14} />
+                            </button>
+                          </div>
+                        </td>
 
-                      {/* Thumbnail Preview */}
-                      <td style={{ padding: '0.75rem 1rem' }}>
-                        <div 
-                          onClick={() => setPreviewAd(ad)}
-                          style={{
-                            width: '74px', height: '46px', borderRadius: '6px', overflow: 'hidden',
-                            background: '#070E1E', border: '1px solid #334155', cursor: 'pointer',
-                            display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative'
-                          }}
-                          title="Click to preview"
-                        >
-                          {ad.type === 'VIDEO' ? (
-                            <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#020617' }}>
-                              <Film size={18} color="#60A5FA" />
-                              <span style={{ position: 'absolute', bottom: 2, right: 2, fontSize: '8px', background: 'rgba(0,0,0,0.7)', color: '#60A5FA', padding: '1px 3px', borderRadius: '2px', fontWeight: 700 }}>MP4</span>
-                            </div>
-                          ) : (
-                            <img 
-                              src={mediaUrl} 
-                              alt={ad.title} 
-                              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                              onError={(e) => { e.target.style.display = 'none'; }}
-                            />
-                          )}
-                        </div>
-                      </td>
-
-                      {/* Title & Format */}
-                      <td style={{ padding: '0.75rem 1rem' }}>
-                        <div style={{ fontWeight: 700, color: '#FFFFFF', fontSize: '0.875rem' }}>{ad.title}</div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: '0.2rem' }}>
-                          <span style={{
-                            padding: '2px 6px', borderRadius: '4px', fontSize: '0.6875rem', fontWeight: 700,
-                            background: ad.type === 'VIDEO' ? 'rgba(37, 99, 235, 0.2)' : 'rgba(245, 158, 11, 0.15)',
-                            color: ad.type === 'VIDEO' ? '#93C5FD' : '#FCD34D',
-                            border: `1px solid ${ad.type === 'VIDEO' ? 'rgba(37, 99, 235, 0.4)' : 'rgba(245, 158, 11, 0.3)'}`
-                          }}>
-                            {ad.type === 'VIDEO' ? '🎥 Video Banner' : '🖼️ Promotional Photo'}
-                          </span>
-                          {ad.fileSize && (
-                            <span style={{ color: '#64748B', fontSize: '0.6875rem' }}>
-                              {(ad.fileSize / (1024 * 1024)).toFixed(1)} MB
-                            </span>
-                          )}
-                        </div>
-                      </td>
-
-                      {/* Duration */}
-                      <td style={{ padding: '0.75rem 1rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#CBD5E1' }}>
-                          <Clock size={14} color="#94A3B8" />
-                          <span>{ad.type === 'VIDEO' ? 'Full Video Length' : `${ad.displayDuration || 5}s Slideshow`}</span>
-                        </div>
-                      </td>
-
-                      {/* Campaign Schedule */}
-                      <td style={{ padding: '0.75rem 1rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#94A3B8', fontSize: '0.75rem' }}>
-                          <Calendar size={13} />
-                          {ad.startDate || ad.endDate ? (
-                            <span>
-                              {ad.startDate ? new Date(ad.startDate).toLocaleDateString() : 'Now'} - {ad.endDate ? new Date(ad.endDate).toLocaleDateString() : 'Forever'}
-                            </span>
-                          ) : (
-                            <span style={{ color: '#38BDF8' }}>Always Active</span>
-                          )}
-                        </div>
-                      </td>
-
-                      {/* Status */}
-                      <td style={{ padding: '0.75rem 1rem' }}>
-                        <button
-                          onClick={() => handleToggleActive(ad.id)}
-                          style={{
-                            padding: '3px 8px', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700,
-                            background: isNowActive ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
-                            border: `1px solid ${isNowActive ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
-                            color: isNowActive ? '#34D399' : '#F87171',
-                            cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.3rem'
-                          }}
-                          title="Click to toggle status"
-                        >
-                          <span style={{ width: 6, height: 6, borderRadius: '50%', background: isNowActive ? '#10B981' : '#EF4444' }} />
-                          {isNowActive ? 'ACTIVE' : 'DISABLED'}
-                        </button>
-                      </td>
-
-                      {/* Actions */}
-                      <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                          <button
+                        {/* Thumbnail Preview */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          <div
                             onClick={() => setPreviewAd(ad)}
                             style={{
-                              background: '#1E293B', border: '1px solid #334155', borderRadius: '6px',
-                              padding: '5px 8px', color: '#60A5FA', cursor: 'pointer', display: 'flex', alignItems: 'center'
+                              width: '74px', height: '46px', borderRadius: '6px', overflow: 'hidden',
+                              background: '#070E1E', border: '1px solid #334155', cursor: 'pointer',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative'
                             }}
-                            title="Preview Advertisement"
+                            title="Click to preview"
                           >
-                            <Eye size={14} />
-                          </button>
+                            {ad.type === 'VIDEO' ? (
+                              <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#020617' }}>
+                                <Film size={18} color="#60A5FA" />
+                                <span style={{ position: 'absolute', bottom: 2, right: 2, fontSize: '8px', background: 'rgba(0,0,0,0.7)', color: '#60A5FA', padding: '1px 3px', borderRadius: '2px', fontWeight: 700 }}>MP4</span>
+                              </div>
+                            ) : (
+                              <img
+                                src={mediaUrl}
+                                alt={ad.title}
+                                style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                onError={(e) => { e.target.style.display = 'none'; }}
+                              />
+                            )}
+                          </div>
+                        </td>
+
+                        {/* Title & Format */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          <div style={{ fontWeight: 700, color: '#FFFFFF', fontSize: '0.875rem' }}>{ad.title}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: '0.2rem' }}>
+                            <span style={{
+                              padding: '2px 6px', borderRadius: '4px', fontSize: '0.6875rem', fontWeight: 700,
+                              background: ad.type === 'VIDEO' ? 'rgba(37, 99, 235, 0.2)' : 'rgba(245, 158, 11, 0.15)',
+                              color: ad.type === 'VIDEO' ? '#93C5FD' : '#FCD34D',
+                              border: `1px solid ${ad.type === 'VIDEO' ? 'rgba(37, 99, 235, 0.4)' : 'rgba(245, 158, 11, 0.3)'}`
+                            }}>
+                              {ad.type === 'VIDEO' ? '🎥 Video Banner' : '🖼️ Promotional Photo'}
+                            </span>
+                            {ad.fileSize && (
+                              <span style={{ color: '#64748B', fontSize: '0.6875rem' }}>
+                                {(ad.fileSize / (1024 * 1024)).toFixed(1)} MB
+                              </span>
+                            )}
+                          </div>
+                        </td>
+
+                        {/* Scope & Machine */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          {ad.scope === 'MACHINE_SPECIFIC' ? (
+                            <div style={{
+                              display: 'inline-flex', alignItems: 'center', gap: '4px',
+                              background: 'rgba(16, 185, 129, 0.15)', border: '1px solid rgba(16, 185, 129, 0.3)',
+                              color: '#34D399', padding: '2px 7px', borderRadius: '4px', fontSize: '0.72rem', fontWeight: 700
+                            }}>
+                              <MapPin size={11} />
+                              <span>{ad.machine?.name || 'Machine-Specific'}</span>
+                            </div>
+                          ) : (
+                            <div style={{
+                              display: 'inline-flex', alignItems: 'center', gap: '4px',
+                              background: 'rgba(99, 102, 241, 0.15)', border: '1px solid rgba(99, 102, 241, 0.3)',
+                              color: '#A5B4FC', padding: '2px 7px', borderRadius: '4px', fontSize: '0.72rem', fontWeight: 700
+                            }}>
+                              <Layers size={11} />
+                              <span>Fleet Global</span>
+                            </div>
+                          )}
+                        </td>
+
+                        {/* Placement */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          {ad.placement === 'KIOSK_ONLY' ? (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', color: '#FCD34D', fontSize: '0.72rem', fontWeight: 600 }}>
+                              <Monitor size={12} /> Kiosk Only
+                            </span>
+                          ) : ad.placement === 'MOBILE_ONLY' ? (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', color: '#67E8F9', fontSize: '0.72rem', fontWeight: 600 }}>
+                              <Smartphone size={12} /> Mobile Only
+                            </span>
+                          ) : (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '3px', color: '#CBD5E1', fontSize: '0.72rem', fontWeight: 600 }}>
+                              <Layers size={12} /> All Screens
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Duration */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#CBD5E1' }}>
+                            <Clock size={14} color="#94A3B8" />
+                            <span>{ad.type === 'VIDEO' ? 'Full Video Length' : `${ad.displayDuration || 5}s Slideshow`}</span>
+                          </div>
+                        </td>
+
+                        {/* Campaign Schedule */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#94A3B8', fontSize: '0.75rem' }}>
+                            <Calendar size={13} />
+                            {ad.startDate || ad.endDate ? (
+                              <span>
+                                {ad.startDate ? new Date(ad.startDate).toLocaleDateString() : 'Now'} - {ad.endDate ? new Date(ad.endDate).toLocaleDateString() : 'Forever'}
+                              </span>
+                            ) : (
+                              <span style={{ color: '#38BDF8' }}>Always Active</span>
+                            )}
+                          </div>
+                        </td>
+
+                        {/* Status */}
+                        <td style={{ padding: '0.75rem 1rem' }}>
                           <button
-                            onClick={() => handleDelete(ad.id, ad.title)}
+                            onClick={() => handleToggleActive(ad.id)}
                             style={{
-                              background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '6px',
-                              padding: '5px 8px', color: '#EF4444', cursor: 'pointer', display: 'flex', alignItems: 'center'
+                              padding: '3px 8px', borderRadius: '9999px', fontSize: '0.72rem', fontWeight: 700,
+                              background: isNowActive ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)',
+                              border: `1px solid ${isNowActive ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+                              color: isNowActive ? '#34D399' : '#F87171',
+                              cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '0.3rem'
                             }}
-                            title="Delete Advertisement"
+                            title="Click to toggle status"
                           >
-                            <Trash2 size={14} />
+                            <span style={{ width: 6, height: 6, borderRadius: '50%', background: isNowActive ? '#10B981' : '#EF4444' }} />
+                            {isNowActive ? 'ACTIVE' : 'DISABLED'}
                           </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
+                        </td>
+
+                        {/* Actions */}
+                        <td style={{ padding: '0.75rem 1rem', textAlign: 'right' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.4rem' }}>
+                            <button
+                              onClick={() => handleOpenEdit(ad)}
+                              style={{
+                                background: '#1E293B', border: '1px solid #334155', borderRadius: '6px',
+                                padding: '5px 8px', color: '#FCD34D', cursor: 'pointer', display: 'flex', alignItems: 'center'
+                              }}
+                              title="Edit Advertisement"
+                            >
+                              <Pencil size={14} />
+                            </button>
+                            <button
+                              onClick={() => setPreviewAd(ad)}
+                              style={{
+                                background: '#1E293B', border: '1px solid #334155', borderRadius: '6px',
+                                padding: '5px 8px', color: '#60A5FA', cursor: 'pointer', display: 'flex', alignItems: 'center'
+                              }}
+                              title="Preview Advertisement"
+                            >
+                              <Eye size={14} />
+                            </button>
+                            <button
+                              onClick={() => handleDelete(ad.id, ad.title)}
+                              style={{
+                                background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', borderRadius: '6px',
+                                padding: '5px 8px', color: '#EF4444', cursor: 'pointer', display: 'flex', alignItems: 'center'
+                              }}
+                              title="Delete Advertisement"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
           </div>
         )}
       </div>
 
-      {/* CREATE ADVERTISEMENT MODAL */}
+      {/* CREATE / EDIT ADVERTISEMENT MODAL */}
       {isModalOpen && (
         <div style={{
           position: 'fixed', inset: 0, zIndex: 9999,
@@ -505,13 +664,15 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
         }}>
           <div style={{
             background: '#0B132B', border: '1px solid #2A3B5C', borderRadius: '14px',
-            width: '100%', maxWidth: '520px', maxHeight: '90vh', overflowY: 'auto',
+            width: '100%', maxWidth: '540px', maxHeight: '90vh', overflowY: 'auto',
             padding: '1.5rem', boxShadow: '0 20px 40px rgba(0,0,0,0.6)'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem', borderBottom: '1px solid #1E293B', paddingBottom: '0.75rem' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <Megaphone size={20} color="#F59E0B" />
-                <h3 style={{ color: '#FFFFFF', fontSize: '1.1rem', fontWeight: 800, margin: 0 }}>Add New Advertisement</h3>
+                <h3 style={{ color: '#FFFFFF', fontSize: '1.1rem', fontWeight: 800, margin: 0 }}>
+                  {editingAdId ? 'Edit Advertisement' : 'Add New Advertisement'}
+                </h3>
               </div>
               <button
                 onClick={() => { setIsModalOpen(false); resetForm(); }}
@@ -521,13 +682,141 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
               </button>
             </div>
 
-            <form onSubmit={handleCreateAd} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            <form onSubmit={handleSaveAd} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              {/* Scope Selection */}
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 700, color: '#CBD5E1', marginBottom: '0.35rem' }}>
+                  Advertisement Scope *
+                </label>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+                  <button
+                    type="button"
+                    disabled={!isSuperadmin}
+                    onClick={() => setFormData(p => ({ ...p, scope: 'GLOBAL', machineId: '' }))}
+                    style={{
+                      padding: '8px',
+                      borderRadius: '8px',
+                      border: `1.5px solid ${formData.scope === 'GLOBAL' ? '#6366F1' : '#334155'}`,
+                      background: formData.scope === 'GLOBAL' ? 'rgba(99, 102, 241, 0.15)' : '#070E1E',
+                      color: formData.scope === 'GLOBAL' ? '#A5B4FC' : '#94A3B8',
+                      fontWeight: 700,
+                      fontSize: '0.78rem',
+                      cursor: isSuperadmin ? 'pointer' : 'not-allowed',
+                      opacity: isSuperadmin ? 1 : 0.5,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '6px'
+                    }}
+                  >
+                    <Layers size={14} /> Fleet Global
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setFormData(p => ({ ...p, scope: 'MACHINE_SPECIFIC', machineId: p.machineId || machines[0]?.id || '' }))}
+                    style={{
+                      padding: '8px',
+                      borderRadius: '8px',
+                      border: `1.5px solid ${formData.scope === 'MACHINE_SPECIFIC' ? '#10B981' : '#334155'}`,
+                      background: formData.scope === 'MACHINE_SPECIFIC' ? 'rgba(16, 185, 129, 0.15)' : '#070E1E',
+                      color: formData.scope === 'MACHINE_SPECIFIC' ? '#6EE7B7' : '#94A3B8',
+                      fontWeight: 700,
+                      fontSize: '0.78rem',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '6px'
+                    }}
+                  >
+                    <MapPin size={14} /> Machine-Specific
+                  </button>
+                </div>
+                {!isSuperadmin && (
+                  <span style={{ fontSize: '0.65rem', color: '#6EE7B7', marginTop: '4px', display: 'block' }}>
+                    Franchisees manage advertisements targeted to their assigned kiosks.
+                  </span>
+                )}
+              </div>
+
+              {/* Machine Selector (When MACHINE_SPECIFIC) */}
+              {formData.scope === 'MACHINE_SPECIFIC' && (
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 700, color: '#CBD5E1', marginBottom: '0.35rem' }}>
+                    Target Machine / Kiosk *
+                  </label>
+                  <select
+                    value={formData.machineId}
+                    onChange={(e) => setFormData(p => ({ ...p, machineId: e.target.value }))}
+                    required
+                    style={{
+                      width: '100%', padding: '0.55rem 0.75rem', borderRadius: '8px',
+                      background: '#070E1E', border: '1px solid #10B981', color: '#FFFFFF',
+                      fontSize: '0.8125rem', outline: 'none'
+                    }}
+                  >
+                    <option value="">-- Select Target Machine --</option>
+                    {machines.map(m => (
+                      <option key={m.id} value={m.id}>
+                        {m.name} {m.location ? `(${m.location})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {machines.length === 0 && (
+                    <span style={{ fontSize: '0.65rem', color: '#EF4444', marginTop: '4px', display: 'block' }}>
+                      No available machines found for your account.
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Placement Selector */}
+              <div>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 700, color: '#CBD5E1', marginBottom: '0.35rem' }}>
+                  Screen Placement *
+                </label>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem' }}>
+                  {[
+                    { id: 'ALL', label: 'All Screens', icon: Layers },
+                    { id: 'KIOSK_ONLY', label: 'Kiosk Only', icon: Monitor },
+                    { id: 'MOBILE_ONLY', label: 'Mobile Only', icon: Smartphone }
+                  ].map(item => {
+                    const Icon = item.icon;
+                    const isSel = formData.placement === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setFormData(p => ({ ...p, placement: item.id }))}
+                        style={{
+                          padding: '7px 4px',
+                          borderRadius: '8px',
+                          border: `1.5px solid ${isSel ? '#F59E0B' : '#334155'}`,
+                          background: isSel ? 'rgba(245, 158, 11, 0.15)' : '#070E1E',
+                          color: isSel ? '#FCD34D' : '#94A3B8',
+                          fontWeight: 700,
+                          fontSize: '0.72rem',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: '4px'
+                        }}
+                      >
+                        <Icon size={13} /> {item.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               {/* Media File Picker & Live Preview */}
               <div>
                 <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 700, color: '#CBD5E1', marginBottom: '0.35rem' }}>
-                  Advertisement Media (Photo or MP4 Video) *
+                  Advertisement Media (Photo or MP4 Video) {editingAdId ? '(Optional if keeping current media)' : '*'}
                 </label>
-                
+
                 {formData.mediaPreviewUrl ? (
                   <div style={{
                     position: 'relative', borderRadius: '10px', overflow: 'hidden',
@@ -535,17 +824,17 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                     display: 'flex', alignItems: 'center', justifyContent: 'center'
                   }}>
                     {formData.mediaType === 'VIDEO' ? (
-                      <video 
-                        src={formData.mediaPreviewUrl} 
-                        controls 
-                        muted 
+                      <video
+                        src={formData.mediaPreviewUrl}
+                        controls
+                        muted
                         style={{ width: '100%', maxHeight: '180px', objectFit: 'contain' }}
                       />
                     ) : (
-                      <img 
-                        src={formData.mediaPreviewUrl} 
-                        alt="Preview" 
-                        style={{ width: '100%', maxHeight: '180px', objectFit: 'contain' }} 
+                      <img
+                        src={formData.mediaPreviewUrl}
+                        alt="Preview"
+                        style={{ width: '100%', maxHeight: '180px', objectFit: 'contain' }}
                       />
                     )}
                     <button
@@ -571,11 +860,11 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                     <UploadCloud size={32} color="#F59E0B" style={{ marginBottom: '0.5rem' }} />
                     <span style={{ color: '#FFFFFF', fontSize: '0.8125rem', fontWeight: 600 }}>Click to browse Photo or Video</span>
                     <span style={{ color: '#64748B', fontSize: '0.7rem', marginTop: '0.2rem' }}>Supports PNG, JPG, WEBP, MP4, WEBM (Max 50MB)</span>
-                    <input 
-                      type="file" 
+                    <input
+                      type="file"
                       accept="image/png,image/jpeg,image/webp,video/mp4,video/webm"
-                      onChange={handleFileChange} 
-                      style={{ display: 'none' }} 
+                      onChange={handleFileChange}
+                      style={{ display: 'none' }}
                     />
                   </label>
                 )}
@@ -720,11 +1009,11 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                 >
                   {isSubmitting ? (
                     <>
-                      <RefreshCw size={14} className="animate-spin" /> Uploading Media...
+                      <RefreshCw size={14} className="animate-spin" /> Saving...
                     </>
                   ) : (
                     <>
-                      <Check size={16} /> Publish Advertisement
+                      <Check size={16} /> {editingAdId ? 'Update Advertisement' : 'Publish Advertisement'}
                     </>
                   )}
                 </button>
