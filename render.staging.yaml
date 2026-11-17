@@ -65,6 +65,9 @@ services:
         value: staging
       - key: ENABLE_DEMO_PAYMENT
         value: "true"
+      - key: DEMO_PAYMENT_ACCESS_CODE
+        # Secret supervised access code for Staging demo payment simulation (set in Render Dashboard)
+        sync: false
 
   # 2. PrintGo Staging Admin Dashboard (Admin-Only Static Site; Customer Portal deploys separately on Cloudflare Pages Free)
   - type: web

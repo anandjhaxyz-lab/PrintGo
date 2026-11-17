@@ -22,6 +22,7 @@ const jwt = require('jsonwebtoken');
 const JWT_SECRET = 'phase3s_test_jwt_secret_isolated_key_64_bytes_secure_string_pilot';
 process.env.JWT_SECRET = JWT_SECRET;
 process.env.NODE_ENV = 'test';
+process.env.DEMO_PAYMENT_ACCESS_CODE = 'phase3s_demo_access_code_secret';
 
 const {
   isDemoPaymentPermitted,
@@ -388,7 +389,7 @@ async function runTestSuite() {
     const res = await request(app)
       .post(`/api/payments/demo-pay/${job.shortId}`)
       .set('Authorization', `Bearer ${token}`)
-      .send();
+      .send({ accessCode: 'phase3s_demo_access_code_secret' });
 
     assert.strictEqual(res.status, 200);
     assert.strictEqual(res.body.success, true);
@@ -427,7 +428,7 @@ async function runTestSuite() {
     const res1 = await request(app)
       .post(`/api/payments/demo-pay/${job.shortId}`)
       .set('Authorization', `Bearer ${token}`)
-      .send();
+      .send({ accessCode: 'phase3s_demo_access_code_secret' });
     assert.strictEqual(res1.status, 200);
     assert.strictEqual(printDispatchCalls.length, 1);
 
@@ -437,7 +438,7 @@ async function runTestSuite() {
     const res2 = await request(app)
       .post(`/api/payments/demo-pay/${job.shortId}`)
       .set('Authorization', `Bearer ${token}`)
-      .send();
+      .send({ accessCode: 'phase3s_demo_access_code_secret' });
     assert.strictEqual(res2.status, 200);
     assert.strictEqual(res2.body.message, 'Job already paid');
 

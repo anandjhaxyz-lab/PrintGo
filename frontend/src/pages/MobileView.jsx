@@ -6,7 +6,7 @@ import {
   Upload, CheckCircle, Loader, CreditCard,
   WifiOff, Printer, AlertTriangle, RefreshCw, FileText,
   ShieldCheck, ChevronRight, ChevronLeft, Check, Eye,
-  Download, Receipt, RotateCcw, Zap, Sparkles
+  Download, Receipt, RotateCcw, Zap, Sparkles, Lock
 } from 'lucide-react';
 import { StepIndicator } from '../components/mobile/StepIndicator';
 import { AdvertisementDisplay } from '../components/AdvertisementDisplay';
@@ -101,7 +101,9 @@ const MobileView = () => {
   const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
   const [paymentOutcome, setPaymentOutcome] = useState(null); // { type: 'FAILED'|'CANCELLED'|'DROPPED'|'PENDING'|'MISMATCH', message }
   const [enableDemoPayment, setEnableDemoPayment] = useState(false);
+  const [demoAccessCode, setDemoAccessCode] = useState('');
   const [isExecutingDemoPay, setIsExecutingDemoPay] = useState(false);
+  const [dispatchWarning, setDispatchWarning] = useState(null);
   const [error, setError] = useState('');
   const [price, setPrice] = useState(0);
   const [serverBreakdown, setServerBreakdown] = useState(null);
@@ -1041,6 +1043,11 @@ const MobileView = () => {
       showError('Missing Print Job ID. Please confirm your print settings again.');
       return;
     }
+    const trimmedCode = (demoAccessCode || '').trim();
+    if (!trimmedCode) {
+      showError('Demo access code is required for simulated physical printing.');
+      return;
+    }
     if (demoPayInFlightRef.current || isExecutingDemoPay || isInitializingPayment || isVerifyingPayment) {
       return;
     }
@@ -1052,7 +1059,7 @@ const MobileView = () => {
     try {
       const res = await axios.post(
         `${API_URL}/api/payments/demo-pay/${encodeURIComponent(jobId)}`,
-        {},
+        { accessCode: trimmedCode },
         { headers: authHeaders() }
       );
 
@@ -1060,7 +1067,17 @@ const MobileView = () => {
         const returnedJob = res.data.job;
         setJobId(returnedJob.shortId);
         setJobStatus(returnedJob.status || 'WAITING');
+
+        if (res.data.dispatched === false) {
+          setDispatchWarning(
+            res.data.message || 'Demo payment confirmed, but print queue dispatch encountered an error. Please notify the counter operator to release your print job.'
+          );
+        } else {
+          setDispatchWarning(null);
+        }
+
         setStep(4);
+        // Note: demoAccessCode is strictly NEVER persisted to localStorage or sessionStorage
         saveRecoveredSession(scopeParams, {
           jobId: returnedJob.shortId,
           orderId: res.data.payment?.gatewayOrderId || `demo_order_${returnedJob.shortId}`,
@@ -1078,6 +1095,7 @@ const MobileView = () => {
       });
       showError(msg);
     } finally {
+      setDemoAccessCode(''); // Always clear access code after use
       setIsExecutingDemoPay(false);
       demoPayInFlightRef.current = false;
     }
@@ -1806,11 +1824,28 @@ const MobileView = () => {
                       A REAL PHYSICAL PRINT WILL BE PRODUCED.
                     </p>
                   </div>
+
+                  <div className="mb-3 text-left">
+                    <label className="block text-xs font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
+                      <Lock size={12} className="text-amber-400" />
+                      <span>Supervised Demo Access Code</span>
+                    </label>
+                    <input
+                      type="password"
+                      value={demoAccessCode}
+                      onChange={(e) => setDemoAccessCode(e.target.value)}
+                      placeholder="Enter demo access code"
+                      autoComplete="off"
+                      disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 transition-colors"
+                    />
+                  </div>
+
                   <button
                     type="button"
-                    className="s3k-primary-btn bg-amber-500 hover:bg-amber-600 text-slate-950 font-black text-sm py-3.5 w-full shadow-lg transition-all flex items-center justify-center gap-2"
+                    className="s3k-primary-btn bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-black text-sm py-3.5 w-full shadow-lg transition-all flex items-center justify-center gap-2"
                     onClick={handleDemoPayment}
-                    disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay}
+                    disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay || !demoAccessCode.trim()}
                   >
                     {isExecutingDemoPay ? (
                       <>
@@ -1916,6 +1951,21 @@ const MobileView = () => {
                 <span className="w-2 h-2 rounded-full animate-ping" style={{ background: 'currentColor' }} />
                 Status: {jobStatus}
               </div>
+
+              {/* Operator attention notice when payment succeeded but dispatch failed */}
+              {dispatchWarning && (
+                <div className="w-full bg-amber-500/15 border border-amber-500/50 rounded-xl p-3 text-left mb-3">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-bold text-xs uppercase tracking-wider mb-1">
+                    <AlertTriangle size={14} />
+                    <span>Print Queue Notice — Operator Attention Required</span>
+                  </div>
+                  <p className="text-[11px] text-amber-200 font-medium leading-relaxed">
+                    Your demo payment was verified, but the print queue could not immediately start.
+                    <br />
+                    <strong>Do not pay again.</strong> Please inform the store operator to release Job ID <strong>{jobId}</strong> from the Admin Dashboard.
+                  </p>
+                </div>
+              )}
 
               <div className="w-full bg-slate-900/70 border border-slate-700/80 rounded-xl p-3 text-left mb-3">
                 <p className="text-xs font-bold text-amber-400 mb-1">Collection Details</p>

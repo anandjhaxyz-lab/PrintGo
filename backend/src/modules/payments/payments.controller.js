@@ -1,11 +1,17 @@
 const paymentsService = require('./payments.service');
 const prisma = require('../../utils/prisma');
 const logger = require('../../utils/logger');
-const { startPrintingProcess } = require('../../services/queueService');
+const queueService = require('../../services/queueService');
 const cashfreeGateway = require('../../services/cashfreeGateway.adapter');
 const { issueCreditNoteForInvoice } = require('../../services/invoice.service');
 const { redactSensitiveData } = require('../../config/cashfree.config');
-const { isDemoPaymentPermitted } = require('../../utils/demoPaymentGuard');
+const {
+  isDemoPaymentPermitted,
+  verifyDemoAccessCode,
+  isDemoAccessRateLimited,
+  recordDemoAccessFailure,
+  clearDemoAccessFailures
+} = require('../../utils/demoPaymentGuard');
 
 /**
  * Extracts sessionId stored inside a job's pricingSnapshot JSON, if present.
@@ -143,9 +149,9 @@ const verifyPayment = async (req, res, next) => {
     );
 
     if (updatedJob) {
-      if (updatedJob.status === 'WAITING' && wasJustUpdated && startPrintingProcess) {
+      if (updatedJob.status === 'WAITING' && wasJustUpdated && queueService?.startPrintingProcess) {
         logger.info(`Payment confirmed via polling. Triggering print queue for job ${updatedJob.shortId}`);
-        startPrintingProcess(updatedJob.shortId, req.app.get('io'));
+        queueService.startPrintingProcess(updatedJob.shortId, req.app.get('io'));
       }
       return res.json({ success: true, job: updatedJob, status: updatedJob.status });
     }
@@ -258,9 +264,9 @@ const cashfreeWebhook = async (req, res, next) => {
         data: { processed: true, processedAt: new Date() }
       });
 
-      if (updatedJob && wasJustUpdated && startPrintingProcess) {
+      if (updatedJob && wasJustUpdated && queueService?.startPrintingProcess) {
         logger.info(`Webhook: Payment verified for job ${updatedJob.shortId}. Dispatching to print queue.`);
-        startPrintingProcess(updatedJob.shortId, req.app.get('io'));
+        queueService.startPrintingProcess(updatedJob.shortId, req.app.get('io'));
       }
     } else if (eventType === 'PAYMENT_FAILED_WEBHOOK' || eventType === 'PAYMENT_USER_DROPPED_WEBHOOK') {
       const payment = orderId
@@ -452,10 +458,52 @@ const demoPayment = async (req, res, next) => {
       return res.status(accessErr.status).json({ success: false, error: accessErr.error });
     }
 
+    // Rate-limit failed access attempts per session and IP
+    const sessionIdentifier = req.session?.sessionId || req.session?.code || req.headers['x-session-id'] || 'session_unknown';
+    const ipIdentifier = ipAddress || 'ip_unknown';
+    const rateLimitKey = `${sessionIdentifier}:${ipIdentifier}`;
+
+    if (isDemoAccessRateLimited(rateLimitKey)) {
+      logger.warn(`Demo payment rate limit exceeded for ${rateLimitKey}`);
+      return res.status(429).json({
+        success: false,
+        error: 'Too many failed demo access code attempts. Rate limit exceeded. Please wait before retrying.'
+      });
+    }
+
+    // Require and validate demo access code using constant-time timingSafeEqual
+    const providedCode = req.body?.accessCode || req.body?.demoAccessCode || req.headers['x-demo-access-code'];
+
+    if (!providedCode || typeof providedCode !== 'string' || !providedCode.trim()) {
+      recordDemoAccessFailure(rateLimitKey);
+      logger.warn(`Demo payment rejected: missing access code from ${rateLimitKey}`);
+      return res.status(400).json({
+        success: false,
+        error: 'Demo payment access code is required'
+      });
+    }
+
+    if (!verifyDemoAccessCode(providedCode)) {
+      recordDemoAccessFailure(rateLimitKey);
+      logger.warn(`Demo payment rejected: invalid access code from ${rateLimitKey}`);
+      return res.status(403).json({
+        success: false,
+        error: 'Invalid demo payment access code'
+      });
+    }
+
+    // Clear failed attempt record on successful authentication
+    clearDemoAccessFailures(rateLimitKey);
+
     // Idempotency: If already paid/waiting/printing/completed, return existing without re-dispatching
     if (job.status !== 'PENDING_PAYMENT') {
       logger.info(`Demo payment idempotency: Job ${job.shortId} already in status ${job.status}`);
-      return res.json({ success: true, message: 'Job already paid', job });
+      return res.json({
+        success: true,
+        dispatched: job.status === 'PRINTING' || job.status === 'COMPLETED',
+        message: 'Job already paid',
+        job
+      });
     }
 
     const demoOrderId = `demo_order_${job.shortId}_${Date.now()}`;
@@ -533,16 +581,43 @@ const demoPayment = async (req, res, next) => {
     }
 
     // Call the approved physical printing dispatch function (reusing Cashfree queue path)
-    if (!wasAlreadyProcessed && updatedJob?.status === 'WAITING' && startPrintingProcess) {
-      try {
-        logger.info(`⚡ Demo Payment: Dispatching job ${updatedJob.shortId} to print queue.`);
-        await startPrintingProcess(updatedJob.shortId, io);
-      } catch (dispatchErr) {
-        logger.error(`Failed to dispatch demo print job ${updatedJob.shortId}:`, dispatchErr);
+    let dispatched = false;
+    let dispatchError = null;
+
+    if (!wasAlreadyProcessed && updatedJob?.status === 'WAITING') {
+      if (typeof queueService?.startPrintingProcess === 'function') {
+        try {
+          logger.info(`⚡ Demo Payment: Dispatching job ${updatedJob.shortId} to print queue.`);
+          await queueService.startPrintingProcess(updatedJob.shortId, io);
+          dispatched = true;
+        } catch (dispatchErr) {
+          dispatched = false;
+          dispatchError = dispatchErr?.message || 'Print queue dispatch failed';
+          logger.error(`Failed to dispatch demo print job ${updatedJob.shortId}:`, dispatchErr);
+        }
+      } else {
+        dispatched = false;
+        dispatchError = 'Print queue dispatcher is unavailable';
+        logger.warn(`startPrintingProcess is unavailable for job ${updatedJob.shortId}`);
       }
+    } else if (wasAlreadyProcessed) {
+      dispatched = updatedJob?.status === 'PRINTING' || updatedJob?.status === 'COMPLETED';
     }
 
-    res.json({ success: true, message: 'Demo payment confirmed and dispatched to printer', job: updatedJob, payment });
+    const message = dispatched
+      ? 'Demo payment confirmed and dispatched to printer'
+      : (dispatchError
+          ? `Demo payment confirmed, but print queue dispatch encountered an error: ${dispatchError}. Job is queued in WAITING state for operator retry.`
+          : 'Demo payment confirmed');
+
+    res.json({
+      success: true,
+      dispatched,
+      message,
+      job: updatedJob,
+      payment,
+      dispatchError: dispatchError || undefined
+    });
   } catch (error) {
     next(error);
   }
