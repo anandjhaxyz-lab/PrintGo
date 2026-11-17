@@ -6,6 +6,7 @@ const logger = require('../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('./pricing.service');
 const { resolveCashfreeEnv } = require('../config/cashfree.config');
 const { isDemoPaymentPermitted } = require('../utils/demoPaymentGuard');
+const { getMachineAvailability } = require('./printerAvailability.service');
 
 /**
  * Validates that an IP or hostname is not private/loopback in production.
@@ -519,7 +520,12 @@ const resolvePrinterQr = async (publicCode) => {
   const pricingProfile = serializePublicPricingProfile(rawProfile);
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
-  logger.info(`Customer scanned QR [${qr.publicCode}]; created fresh session [${session.code}] bound to printer [${qr.machine_id}]`);
+  const availability = await getMachineAvailability(qr.machine_id, prisma);
+  const isReady = availability ? availability.isReady : false;
+  const hardwareStatus = availability ? availability.status : 'UNKNOWN';
+  const statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
+
+  logger.info(`Customer scanned QR [${qr.publicCode}]; created fresh session [${session.code}] bound to printer [${qr.machine_id}] (Status: ${hardwareStatus})`);
 
   return {
     success: true,
@@ -530,10 +536,16 @@ const resolvePrinterQr = async (publicCode) => {
     pricingProfile,
     enableDemoPayment: isDemoPaymentPermitted(),
     printer: {
-      name: qr.machine_name,
-      model: qr.machine_printer_model || 'EPSON L6460 Series',
-      location: qr.machine_location || 'Front Desk',
-      isOnline: qr.machine_status === 'ACTIVE'
+      name: qr.machine_name || availability?.name,
+      model: qr.machine_printer_model || availability?.printerModel || 'EPSON L6460 Series',
+      location: qr.machine_location || availability?.location || 'Front Desk',
+      isOnline: isReady,
+      hardwareStatus,
+      statusMessage,
+      agentOnline: availability ? availability.agentOnline : false,
+      paperStatus: availability ? availability.paperStatus : 'UNKNOWN',
+      tonerStatus: availability ? availability.tonerStatus : 'UNKNOWN',
+      jamStatus: availability ? availability.jamStatus : false
     }
   };
 };
@@ -573,6 +585,11 @@ const getPublicPrinterQrInfo = async (publicCode) => {
   const pricingProfile = serializePublicPricingProfile(rawProfile);
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
+  const availability = await getMachineAvailability(qr.machine.id, prisma);
+  const isReady = availability ? availability.isReady : false;
+  const hardwareStatus = availability ? availability.status : 'UNKNOWN';
+  const statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
+
   return {
     success: true,
     status: qr.status,
@@ -583,7 +600,13 @@ const getPublicPrinterQrInfo = async (publicCode) => {
       name: qr.machine.name,
       model: qr.machine.printerModel || 'EPSON L6460 Series',
       location: qr.machine.location,
-      isOnline: qr.machine.status === 'ACTIVE'
+      isOnline: isReady,
+      hardwareStatus,
+      statusMessage,
+      agentOnline: availability ? availability.agentOnline : false,
+      paperStatus: availability ? availability.paperStatus : 'UNKNOWN',
+      tonerStatus: availability ? availability.tonerStatus : 'UNKNOWN',
+      jamStatus: availability ? availability.jamStatus : false
     }
   };
 };

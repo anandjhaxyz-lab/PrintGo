@@ -402,7 +402,7 @@ export const PrintersView = ({
                       color: isOnline ? '#059669' : '#dc2626'
                     }}>
                       {isOnline ? <Wifi size={12} /> : <WifiOff size={12} />}
-                      {isOnline ? 'ONLINE' : 'OFFLINE'}
+                      {isOnline ? 'ONLINE' : (machine.hardwareStatus ? machine.hardwareStatus.replace('_', ' ') : 'OFFLINE')}
                     </span>
                   </div>
 

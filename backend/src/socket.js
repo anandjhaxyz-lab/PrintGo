@@ -1,6 +1,7 @@
 const prisma = require('./utils/prisma');
 const logger = require('./utils/logger');
 const { isValidJobTransition } = require('./utils/stateMachine');
+const { getMachineAvailability, computePrinterAvailability } = require('./services/printerAvailability.service');
 
 const jwt = require('jsonwebtoken');
 
@@ -55,6 +56,19 @@ const setupSockets = (io) => {
       // Notify the printer it successfully registered
       socket.emit('printer_registered_success', { machineId: socket.machineId, name: socket.machineName });
 
+      // Broadcast fresh availability to customer sessions and admins
+      (async () => {
+        try {
+          const availability = await getMachineAvailability(socket.machineId, prisma);
+          if (availability) {
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', availability);
+            io.to('admins').emit('printer_status_update', availability);
+          }
+        } catch (err) {
+          logger.error('Error broadcasting machine availability on connect:', err);
+        }
+      })();
+
       // P4: Recovery System for dropped socket messages.
       // Reconcile active PRINTING jobs safely via agent journal rather than blindly re-emitting physical_print_job!
       (async () => {
@@ -78,6 +92,18 @@ const setupSockets = (io) => {
       })();
     } else if (socket.userType === 'session' && socket.machineId) {
       socket.join(`machine_${socket.machineId}`);
+
+      // Push current authoritative machine availability to newly joined customer session
+      (async () => {
+        try {
+          const availability = await getMachineAvailability(socket.machineId, prisma);
+          if (availability) {
+            socket.emit('printer_status_update', availability);
+          }
+        } catch (err) {
+          logger.error('Error sending availability to customer session socket:', err);
+        }
+      })();
     }
 
     // Admin users join the 'admins' room for receiving printer status updates
@@ -189,14 +215,33 @@ const setupSockets = (io) => {
               jamStatus: status.errorMessage === 'Paper Jam'
             }
           });
-          
-          // Telemetry would go here if we create a Telemetry model in the future
+
+          const availability = await getMachineAvailability(socket.machineId, prisma);
+          if (availability) {
+            // Broadcast authoritative availability to customer sessions AND admin sockets
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', availability);
+            io.to('admins').emit('printer_status_update', { ...status, ...availability });
+          } else {
+            io.to('admins').emit('printer_status_update', status);
+          }
         } catch(err) {
           logger.error('Error saving printer status', err);
         }
+      } else {
+        io.to('admins').emit('printer_status_update', status);
       }
-      // Send printer status ONLY to admin sockets, not to customer phones
-      io.to('admins').emit('printer_status_update', status);
+    });
+
+    socket.on('job_reconciliation_report', async ({ jobId, status }) => {
+      if (socket.userType !== 'printer') return;
+      logger.info(`Agent reported reconciliation for job ${jobId}: ${status}`);
+      if (status === 'NOT_DISPATCHED') {
+        const queueService = require('./services/queueService');
+        if (queueService && queueService.startPrintingProcess) {
+          logger.info(`Re-dispatching undispatched job ${jobId} to reconnected printer agent`);
+          queueService.startPrintingProcess(jobId, io);
+        }
+      }
     });
 
     socket.on('print_spooler_success', async ({ jobId }) => {
@@ -341,8 +386,27 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('disconnect', () => {
-      logger.info(`User disconnected: ${socket.id}`);
+    socket.on('disconnect', async () => {
+      logger.info(`User disconnected: ${socket.id} (Type: ${socket.userType})`);
+      if (socket.userType === 'printer' && socket.machineId) {
+        try {
+          const machine = await prisma.machine.findUnique({ where: { id: socket.machineId } });
+          if (machine) {
+            const offlineState = computePrinterAvailability({ ...machine, lastOnline: null }, null);
+            const payload = {
+              machineId: socket.machineId,
+              name: machine.name,
+              location: machine.location,
+              printerModel: machine.printerModel || 'EPSON L6460 Series',
+              ...offlineState
+            };
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', payload);
+            io.to('admins').emit('printer_status_update', payload);
+          }
+        } catch (err) {
+          logger.error('Error broadcasting printer disconnect:', err);
+        }
+      }
     });
   });
 };

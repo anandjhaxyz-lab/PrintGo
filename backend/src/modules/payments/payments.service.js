@@ -4,6 +4,7 @@ const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
 const { isValidPaymentTransition, isValidJobTransition } = require('../../utils/stateMachine');
 const refundService = require('../../services/refund.service');
+const { computePrinterAvailability } = require('../../services/printerAvailability.service');
 const {
   getCashfreeConfig,
   getPublicAppUrl,
@@ -121,12 +122,37 @@ const createOrder = async (jobId, options = {}) => {
 
   const job = await prisma.printJob.findUnique({
     where: { shortId: jobId },
-    include: { payment: true, customer: true }
+    include: {
+      payment: true,
+      customer: true,
+      machine: {
+        include: {
+          printerStatuses: {
+            take: 1,
+            orderBy: { timestamp: 'desc' }
+          }
+        }
+      }
+    }
   });
 
   if (!job) throw new AppError('Job not found', 404);
   if (job.status !== 'PENDING_PAYMENT') {
     throw new AppError(`Job cannot be paid. Current status: ${job.status}`, 400);
+  }
+
+  // Authoritative Hardware Availability Guard: Never accept payment for an unserviceable job
+  if (!job.machineId || !job.machine) {
+    throw new AppError('Job is not assigned to a registered printer', 400);
+  }
+
+  const availability = computePrinterAvailability(job.machine, job.machine.printerStatuses?.[0] || null);
+  if (!availability.isReady || availability.status !== 'ONLINE') {
+    logger.warn(`Rejected payment order creation for job ${job.shortId}: Printer '${job.machine.name}' is ${availability.status} (${availability.statusMessage})`);
+    throw new AppError(
+      `Printer is currently unavailable (${availability.statusMessage}). Cannot accept payment until printer is online.`,
+      409
+    );
   }
 
   // Block creating a duplicate payment order if any payment for this job already succeeded

@@ -1,8 +1,10 @@
 const prisma = require('../../utils/prisma');
 const crypto = require('crypto');
 const AppError = require('../../utils/AppError');
-
-const ONLINE_HEARTBEAT_WINDOW_MS = 90 * 1000; // 90 seconds
+const {
+  ONLINE_HEARTBEAT_WINDOW_MS,
+  computePrinterAvailability
+} = require('../../services/printerAvailability.service');
 
 /**
  * Computes whether a machine is ONLINE.
@@ -44,10 +46,16 @@ const getMachines = async (user) => {
     include: { company: true, printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } } }
   });
 
-  return machines.map(m => ({
-    ...m,
-    isOnline: computeIsOnline(m)
-  }));
+  return machines.map(m => {
+    const availability = computePrinterAvailability(m, m.printerStatuses?.[0]);
+    return {
+      ...m,
+      isOnline: availability.isReady,
+      agentOnline: availability.agentOnline,
+      hardwareStatus: availability.status,
+      statusMessage: availability.statusMessage,
+    };
+  });
 };
 
 const getMachineById = async (id, user) => {
@@ -61,9 +69,13 @@ const getMachineById = async (id, user) => {
     throw new AppError('Access denied: Machine belongs to another company', 403);
   }
   
+  const availability = computePrinterAvailability(machine, machine.printerStatuses?.[0]);
   return {
     ...machine,
-    isOnline: computeIsOnline(machine)
+    isOnline: availability.isReady,
+    agentOnline: availability.agentOnline,
+    hardwareStatus: availability.status,
+    statusMessage: availability.statusMessage,
   };
 };
 
@@ -118,10 +130,16 @@ const getMachinesByCompany = async (companyId) => {
     }
   });
 
-  return machines.map(m => ({
-    ...m,
-    isOnline: computeIsOnline(m)
-  }));
+  return machines.map(m => {
+    const availability = computePrinterAvailability(m, m.printerStatuses?.[0]);
+    return {
+      ...m,
+      isOnline: availability.isReady,
+      agentOnline: availability.agentOnline,
+      hardwareStatus: availability.status,
+      statusMessage: availability.statusMessage,
+    };
+  });
 };
 
 module.exports = {

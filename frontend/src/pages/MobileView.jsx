@@ -87,6 +87,54 @@ const MobileView = () => {
   const [pricingProfile, setPricingProfile] = useState(DEFAULT_PRICING_PROFILE);
   const [cashfreeEnv, setCashfreeEnv] = useState('sandbox');
   const [qrError, setQrError] = useState(null);
+  const [isRefreshingStatus, setIsRefreshingStatus] = useState(false);
+
+  const hardwareStatus = printerInfo?.hardwareStatus || (printerInfo?.isOnline ? 'ONLINE' : (printerInfo ? 'AGENT_OFFLINE' : 'UNKNOWN'));
+  const isPrinterReady = hardwareStatus === 'ONLINE';
+  const isAgentOffline = hardwareStatus === 'AGENT_OFFLINE';
+  const isPrinterDisconnected = hardwareStatus === 'PRINTER_DISCONNECTED';
+
+  const customerStatusText = useMemo(() => {
+    if (printerInfo?.statusMessage) return printerInfo.statusMessage;
+    switch (hardwareStatus) {
+      case 'ONLINE':
+        return 'Printer Ready';
+      case 'AGENT_OFFLINE':
+        return 'Printer Temporarily Offline';
+      case 'PRINTER_DISCONNECTED':
+        return 'Printer Disconnected';
+      case 'PAPER_OUT':
+        return 'Out of Paper';
+      case 'JAMMED':
+        return 'Paper Jam';
+      case 'UNKNOWN':
+      default:
+        return 'Printer Status Unavailable';
+    }
+  }, [hardwareStatus, printerInfo?.statusMessage]);
+
+  const handleRefreshPrinterStatus = async () => {
+    setIsRefreshingStatus(true);
+    try {
+      if (publicCode) {
+        const res = await axios.get(`${API_URL}/api/auth/printer-qr/${publicCode}`);
+        if (res.data?.printer) {
+          setPrinterInfo(res.data.printer);
+        }
+      } else if (activeSessionId || sessionId) {
+        const res = await axios.get(`${API_URL}/api/auth/pricing`, {
+          params: publicCode ? { publicCode } : {},
+        });
+        if (res.data?.printer) {
+          setPrinterInfo(res.data.printer);
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to refresh printer status:', err);
+    } finally {
+      setIsRefreshingStatus(false);
+    }
+  };
 
   const [socket, setSocket] = useState(null);
   const [isConnected, setIsConnected] = useState(true);
@@ -447,10 +495,36 @@ const MobileView = () => {
           setIsConnected(true);
           newSocket.emit('join_session', effectiveCode);
           newSocket.emit('mobile_connected', effectiveCode);
+          // Re-fetch authoritative status after reconnection
+          if (publicCode) {
+            axios
+              .get(`${API_URL}/api/auth/printer-qr/${publicCode}`)
+              .then((pRes) => {
+                if (!cancelled && pRes.data?.printer) setPrinterInfo(pRes.data.printer);
+              })
+              .catch(() => {});
+          }
         });
 
         newSocket.on('disconnect', () => setIsConnected(false));
         newSocket.on('connect_error', () => setIsConnected(false));
+
+        newSocket.on('printer_status_update', (statusData) => {
+          if (!cancelled && statusData && typeof statusData === 'object') {
+            setPrinterInfo((prev) => ({
+              ...(prev || {}),
+              name: statusData.name || prev?.name || 'Counter Printer',
+              location: statusData.location || prev?.location || 'Front Desk',
+              model: statusData.printerModel || prev?.model || 'EPSON L6460 Series',
+              isOnline: statusData.isReady ?? statusData.isOnline ?? false,
+              hardwareStatus: statusData.hardwareStatus || statusData.status || (statusData.isOnline ? 'ONLINE' : 'AGENT_OFFLINE'),
+              statusMessage: statusData.statusMessage,
+              paperStatus: statusData.paperStatus,
+              tonerStatus: statusData.tonerStatus,
+              jamStatus: statusData.jamStatus,
+            }));
+          }
+        });
 
         // Security rule: socket payment notifications MUST verify server-side rather than trusting event alone
         newSocket.on('kiosk_payment_success', async ({ jobId: eventJobId } = {}) => {
@@ -1150,9 +1224,23 @@ const MobileView = () => {
       </div>
 
       <div className="flex items-center gap-2">
-        <div className="s3k-status-pill" title={printerInfo?.name || 'Main Shop Printer'}>
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-          <span>Kiosk Online</span>
+        <div
+          className="s3k-status-pill"
+          title={printerInfo?.name ? `${printerInfo.name} (${customerStatusText})` : customerStatusText}
+          style={{
+            borderColor: isPrinterReady
+              ? 'rgba(52, 211, 153, 0.4)'
+              : (isAgentOffline ? 'rgba(251, 191, 36, 0.4)' : 'rgba(239, 68, 68, 0.4)')
+          }}
+        >
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${
+              isPrinterReady
+                ? 'bg-emerald-400 animate-pulse'
+                : (isAgentOffline ? 'bg-amber-400' : (isPrinterDisconnected ? 'bg-red-400' : 'bg-slate-400'))
+            }`}
+          />
+          <span>{customerStatusText}</span>
         </div>
       </div>
     </header>
@@ -1207,12 +1295,12 @@ const MobileView = () => {
                     width: 34,
                     height: 34,
                     borderRadius: 8,
-                    background: 'rgba(30, 64, 175, 0.35)',
-                    border: '1px solid rgba(212, 175, 55, 0.35)',
+                    background: isPrinterReady ? 'rgba(30, 64, 175, 0.35)' : 'rgba(239, 68, 68, 0.15)',
+                    border: isPrinterReady ? '1px solid rgba(212, 175, 55, 0.35)' : '1px solid rgba(239, 68, 68, 0.3)',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    color: '#D4AF37',
+                    color: isPrinterReady ? '#D4AF37' : '#EF4444',
                     flexShrink: 0,
                   }}
                 >
@@ -1220,10 +1308,10 @@ const MobileView = () => {
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="text-xs font-bold text-white truncate leading-tight">
-                    {printerInfo?.name || 'Main Shop Printer'}
+                    {printerInfo?.name || 'Counter Printer'}
                   </p>
                   <p className="text-[10.5px] text-slate-300 truncate mt-0.5 leading-none">
-                    {printerInfo?.location || 'Counter Terminal'} • Ready to print
+                    {printerInfo?.location || 'Counter Terminal'} • {customerStatusText}
                   </p>
                 </div>
               </div>
@@ -1234,22 +1322,62 @@ const MobileView = () => {
                     padding: '0.2rem 0.55rem',
                     fontSize: '0.68rem',
                     fontWeight: 700,
-                    color: '#34D399',
-                    background: 'rgba(16, 185, 129, 0.12)',
-                    border: '1px solid rgba(16, 185, 129, 0.3)',
+                    color: isPrinterReady ? '#34D399' : (isAgentOffline ? '#FBBF24' : '#EF4444'),
+                    background: isPrinterReady ? 'rgba(16, 185, 129, 0.12)' : (isAgentOffline ? 'rgba(245, 158, 11, 0.12)' : 'rgba(239, 68, 68, 0.12)'),
+                    border: `1px solid ${isPrinterReady ? 'rgba(16, 185, 129, 0.3)' : (isAgentOffline ? 'rgba(245, 158, 11, 0.3)' : 'rgba(239, 68, 68, 0.3)')}`,
                     borderRadius: '9999px',
                     display: 'inline-flex',
                     alignItems: 'center',
                     gap: '0.3rem',
                   }}
                 >
-                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#10B981', display: 'inline-block' }} />
-                  Fast Spool
+                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: isPrinterReady ? '#10B981' : (isAgentOffline ? '#F59E0B' : '#EF4444'), display: 'inline-block' }} />
+                  {isPrinterReady ? 'Ready' : (isAgentOffline ? 'Offline' : (isPrinterDisconnected ? 'Disconnected' : 'Unavailable'))}
                 </span>
               </div>
             </div>
 
-            <div className="s3k-upload-dropzone">
+            {!isPrinterReady && (
+              <div
+                className="s3k-card text-center py-3 px-3 animate-fade-in"
+                style={{
+                  background: 'rgba(245, 158, 11, 0.1)',
+                  border: '1px solid rgba(245, 158, 11, 0.35)',
+                  borderRadius: 12,
+                }}
+              >
+                <div className="flex items-center justify-center gap-1.5 mb-1 text-amber-400 font-bold text-xs">
+                  <AlertTriangle size={15} />
+                  <span>{customerStatusText}</span>
+                </div>
+                <p className="text-slate-300 text-[11px] leading-relaxed mb-2.5">
+                  The printer at this counter is currently unavailable. File uploads and payments are temporarily paused.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleRefreshPrinterStatus}
+                  disabled={isRefreshingStatus}
+                  className="btn text-xs py-1 px-3 mx-auto"
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.1)',
+                    border: '1px solid rgba(255, 255, 255, 0.2)',
+                    color: '#FFFFFF',
+                    borderRadius: 8,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                  }}
+                >
+                  <RefreshCw size={12} className={isRefreshingStatus ? 'animate-spin' : ''} />
+                  Refresh Status
+                </button>
+              </div>
+            )}
+
+            <div
+              className="s3k-upload-dropzone"
+              style={!isPrinterReady ? { opacity: 0.55 } : {}}
+            >
               <div
                 style={{
                   width: 62,
@@ -1312,7 +1440,10 @@ const MobileView = () => {
                   </button>
                 </div>
               ) : (
-                <label className="s3k-primary-btn s3k-gold-btn max-w-xs mx-auto cursor-pointer">
+                <label
+                  className={`s3k-primary-btn s3k-gold-btn max-w-xs mx-auto ${!isPrinterReady ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
+                  style={!isPrinterReady ? { pointerEvents: 'none' } : {}}
+                >
                   <Upload size={18} />
                   Choose Files to Print
                   <input
@@ -1321,7 +1452,7 @@ const MobileView = () => {
                     accept=".pdf,image/png,image/jpeg,image/jpg,image/webp"
                     style={{ display: 'none' }}
                     onChange={handleFileUpload}
-                    disabled={uploading}
+                    disabled={uploading || !isPrinterReady}
                   />
                 </label>
               )}
@@ -1790,9 +1921,14 @@ const MobileView = () => {
                 type="button"
                 className="s3k-primary-btn s3k-gold-btn text-base py-3.5 w-full"
                 onClick={handleCashfreeCheckout}
-                disabled={isInitializingPayment || isVerifyingPayment}
+                disabled={isInitializingPayment || isVerifyingPayment || !isPrinterReady}
+                style={!isPrinterReady ? { opacity: 0.6, cursor: 'not-allowed' } : {}}
               >
-                {isInitializingPayment ? (
+                {!isPrinterReady ? (
+                  <>
+                    <AlertTriangle size={18} /> Printer Offline — Payment Paused
+                  </>
+                ) : isInitializingPayment ? (
                   <>
                     <Loader size={20} className="animate-spin" /> Opening Cashfree Checkout...
                   </>
@@ -1805,6 +1941,22 @@ const MobileView = () => {
                   </>
                 )}
               </button>
+
+              {!isPrinterReady && (
+                <div className="mt-2.5 text-center">
+                  <p className="text-[11px] text-amber-400 font-semibold mb-1">
+                    ⚠️ {customerStatusText}. Payment is paused until the printer is online.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleRefreshPrinterStatus}
+                    disabled={isRefreshingStatus}
+                    className="text-[11px] text-slate-300 underline inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    <RefreshCw size={11} className={isRefreshingStatus ? 'animate-spin' : ''} /> Check Printer Status
+                  </button>
+                </div>
+              )}
 
               {orderId && (
                 <button

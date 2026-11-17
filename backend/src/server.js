@@ -189,16 +189,17 @@ app.use(cookieParser());
 // Uploads directory
 const { fileAuth } = require('./middlewares/fileAuth');
 const { serveDocument } = require('./modules/files/file.controller');
+const { getAdsUploadsDir } = require('./utils/storage');
 const uploadsDir = process.env.UPLOADS_DIR || path.join(__dirname, '../uploads');
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir);
 }
 // Public static media hosting for customer-facing promotional advertisements
-const adsUploadsDir = path.join(uploadsDir, 'ads');
-if (!fs.existsSync(adsUploadsDir)) {
-  fs.mkdirSync(adsUploadsDir, { recursive: true });
-}
+const adsUploadsDir = getAdsUploadsDir();
 app.use('/uploads/ads', express.static(adsUploadsDir, { maxAge: '1d', acceptRanges: true }));
+app.use('/uploads/ads', (req, res) => {
+  res.status(404).json({ success: false, error: 'Media file not found' });
+});
 
 app.get('/uploads/:filename', fileAuth, serveDocument);
 
