@@ -89,7 +89,7 @@ const getPageCount = async (fileUrl, mimetype, isEncrypted = false, claimedPages
       const buffer = await getFileBuffer(fileUrl, localPath);
       const result = await withTimeout(mammoth.extractRawText({ buffer }), 5000);
       const text = result.value;
-      const wordCount = text.split(/\\s+/).filter(word => word.length > 0).length;
+      const wordCount = text.split(/\s+/).filter(word => word.length > 0).length;
       const estimatedPages = Math.max(1, Math.ceil(wordCount / 400));
       logger.info(`DOCX page estimation: ${wordCount} words → ${estimatedPages} pages`);
       return estimatedPages;
@@ -97,7 +97,7 @@ const getPageCount = async (fileUrl, mimetype, isEncrypted = false, claimedPages
     else if (mimetype === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') {
       const buffer = await getFileBuffer(fileUrl, localPath);
       const text = await withTimeout(officeParser.parseOfficeAsync(buffer), 5000);
-      const slideBlocks = text.split(/\\n\\n+/).filter(block => block.trim().length > 0);
+      const slideBlocks = text.split(/\n\n+/).filter(block => block.trim().length > 0);
       const slideCount = Math.max(1, slideBlocks.length);
       logger.info(`PPTX slide estimation: ${slideCount} slides detected`);
       return slideCount;
