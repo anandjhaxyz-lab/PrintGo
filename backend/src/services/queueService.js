@@ -3,22 +3,29 @@ const { connection } = require('./redisClient');
 const prisma = require('../utils/prisma');
 const { isValidJobTransition } = require('../utils/stateMachine');
 
-let printQueue = null;
-let useRedis = !!process.env.REDIS_HOST; // Use Redis if configured
+const isProductionRuntime = process.env.NODE_ENV === 'production';
+const isRedisRequired = isProductionRuntime || process.env.QUEUE_REDIS_REQUIRED === 'true';
 
-try {
-  if (useRedis) {
+let printQueue = null;
+let printWorker = null;
+let workerReady = false;
+let useRedis = Boolean(connection);
+
+if (!useRedis) {
+  if (isRedisRequired) {
+    throw new Error('PrintGo production queue requires Redis; refusing to initialize an in-memory print queue.');
+  }
+  console.warn('BullMQ is not configured; using the development/test in-memory fallback.');
+} else {
+  try {
     printQueue = new Queue('printQueue', { connection });
-  } else {
-    throw new Error('REDIS_HOST not configured');
+  } catch (error) {
+    if (isRedisRequired) {
+      throw new Error(`Failed to initialize the durable print queue: ${error.message}`);
+    }
+    console.warn('BullMQ initialization failed, using the development/test in-memory fallback:', error.message);
+    useRedis = false;
   }
-} catch(e) {
-  if (process.env.NODE_ENV === 'production') {
-    console.warn("⚠️ WARNING: BullMQ requires Redis in production for reliable scaling. Falling back to in-memory queue (not recommended for multi-instance deployments).");
-  } else {
-    console.warn("BullMQ initialization failed, using in-memory queue fallback.");
-  }
-  useRedis = false;
 }
 
 let globalIo = null;
@@ -89,52 +96,120 @@ const processJob = async (shortId) => {
       // which will be handled in socket.js to mark the job as COMPLETED or FAILED.
   } catch(e) {
     console.error(`Error processing job ${shortId}:`, e);
+    throw e;
   }
 };
 
-const initWorker = (io) => {
+const initWorker = async (io) => {
   globalIo = io;
-  if (!useRedis) return null;
-  
+  if (!useRedis || !printQueue) return null;
+  if (printWorker && workerReady) return printWorker;
+
   try {
-    const worker = new Worker('printQueue', async (job) => {
+    printWorker = new Worker('printQueue', async (job) => {
       const { shortId } = job.data;
       await processJob(shortId);
     }, { connection, concurrency: 1 });
 
-    worker.on('failed', (job, err) => {
+    printWorker.on('failed', (job, err) => {
       console.error(`Physical Print Job ${job.id} failed without automatic retry: ${err.message}`);
     });
-    return worker;
-  } catch(e) {
+
+    await Promise.all([
+      printQueue.waitUntilReady(),
+      printWorker.waitUntilReady()
+    ]);
+    workerReady = true;
+    return printWorker;
+  } catch (error) {
+    workerReady = false;
+    if (printWorker) {
+      await printWorker.close().catch(() => {});
+      printWorker = null;
+    }
+    if (isRedisRequired) {
+      throw new Error(`Durable print worker failed to become ready: ${error.message}`);
+    }
     useRedis = false;
-    console.warn("Failed to start BullMQ worker, falling back to in-memory.");
+    console.warn('BullMQ worker failed to start; using the development/test in-memory fallback:', error.message);
     return null;
   }
 };
 
 const startPrintingProcess = async (shortId, io) => {
   if (io) globalIo = io;
-  
+
   if (useRedis && printQueue) {
+    let timeoutId;
     try {
-      // Race with a 2.5s timeout so a dead/limited Redis never blocks printing
+      const enqueuePromise = printQueue.add('printJob', { shortId }, {
+        jobId: `print_${shortId}`,
+        attempts: 1, // Preserve the no-automatic-reprint safety policy.
+        removeOnComplete: true,
+        removeOnFail: false
+      });
+
       await Promise.race([
-        printQueue.add('printJob', { shortId }, {
-          attempts: 1, // Single execution guarantee for physical printing (NO AUTOMATIC RETRIES)
-          removeOnComplete: true,
-          removeOnFail: false // Retain failed physical job records for operator inspection
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Redis operation timed out')), 2500))
+        enqueuePromise,
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error('Redis queue operation timed out after 2500ms')),
+            2500
+          );
+        })
       ]);
-    } catch(e) {
-      console.warn(`Redis queue unavailable (${e.message}), executing print job in-memory fallback.`);
-      await processJob(shortId);
+    } catch (error) {
+      if (isRedisRequired) {
+        // Do not dispatch a physical print outside the durable queue in production.
+        throw new Error(`Durable print queue unavailable for job ${shortId}; no in-memory dispatch was attempted: ${error.message}`);
+      }
+      console.warn(`Redis queue unavailable (${error.message}), using the development/test in-memory fallback.`);
+      try {
+        await processJob(shortId);
+      } catch (processingError) {
+        // Preserve the existing non-production fallback contract. BullMQ Worker
+        // executions still receive the rethrow from processJob above.
+        console.error(`Development/test in-memory fallback failed for job ${shortId}:`, processingError);
+      }
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
+  } else if (isRedisRequired) {
+    throw new Error('Durable print queue is not ready; refusing an in-memory physical print dispatch.');
   } else {
-    // In-memory fallback: process and await dispatch completion
-    await processJob(shortId);
+    try {
+      await processJob(shortId);
+    } catch (processingError) {
+      // Keep development/test callers non-throwing on local direct dispatch.
+      // The durable BullMQ Worker path still records thrown processor errors.
+      console.error(`Development/test in-memory fallback failed for job ${shortId}:`, processingError);
+    }
   }
+};
+
+const getQueueHealth = () => {
+  const workerRunning = Boolean(
+    printWorker &&
+    typeof printWorker.isRunning === 'function' &&
+    printWorker.isRunning()
+  );
+  return {
+    configured: Boolean(connection && printQueue),
+    redisReady: Boolean(connection && connection.status === 'ready'),
+    workerReady: workerReady && workerRunning,
+    ready: Boolean(useRedis && connection && connection.status === 'ready' && printQueue && workerReady && workerRunning)
+  };
+};
+
+const closeQueueService = async () => {
+  clearInterval(cleanupTimer);
+  workerReady = false;
+  const worker = printWorker;
+  const queue = printQueue;
+  printWorker = null;
+  printQueue = null;
+  if (worker) await worker.close();
+  if (queue) await queue.close();
 };
 
 const calculateEstimatedWaitTime = async (shortId) => {
@@ -493,5 +568,7 @@ module.exports = {
   cleanupAbandonedJobs,
   cleanupExpiredJobFiles,
   buildAbandonedJobWhere,
-  hasProtectedJobReferences
+  hasProtectedJobReferences,
+  getQueueHealth,
+  closeQueueService
 };

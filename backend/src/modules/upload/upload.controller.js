@@ -1,6 +1,6 @@
 const path = require('path');
 const fs = require('fs');
-const { Queue } = require('bullmq');
+const { Queue, QueueEvents } = require('bullmq');
 const { connection } = require('../../services/redisClient');
 const uploadService = require('./upload.service');
 const { deleteFile, getUploadsDir } = require('../../utils/storage');
@@ -8,9 +8,39 @@ const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
 
 let uploadQueue = null;
+let uploadQueueEvents = null;
+let uploadQueueReady = false;
+
 if (connection) {
   uploadQueue = new Queue('uploadQueue', { connection });
+  // Reuse one QueueEvents consumer instead of leaking one Redis connection per upload.
+  uploadQueueEvents = new QueueEvents('uploadQueue', { connection });
 }
+
+const waitForUploadQueueReady = async () => {
+  if (!connection) return false;
+  await Promise.all([
+    uploadQueue.waitUntilReady(),
+    uploadQueueEvents.waitUntilReady()
+  ]);
+  uploadQueueReady = true;
+  return true;
+};
+
+const getUploadQueueHealth = () => ({
+  configured: Boolean(connection && uploadQueue && uploadQueueEvents),
+  ready: Boolean(connection && connection.status === 'ready' && uploadQueueReady)
+});
+
+const closeUploadQueue = async () => {
+  uploadQueueReady = false;
+  const events = uploadQueueEvents;
+  const queue = uploadQueue;
+  uploadQueueEvents = null;
+  uploadQueue = null;
+  if (events) await events.close();
+  if (queue) await queue.close();
+};
 
 const handleUpload = async (req, res, next) => {
   try {
@@ -27,7 +57,7 @@ const handleUpload = async (req, res, next) => {
 
     if (uploadQueue && !isEncrypted) {
       const job = await uploadQueue.add('countPages', { fileUrl, mimetype: req.file.mimetype });
-      pages = await job.waitUntilFinished(new (require('bullmq').QueueEvents)('uploadQueue', { connection }));
+      pages = await job.waitUntilFinished(uploadQueueEvents);
     } else {
       // Fallback or Encrypted bypass
       pages = await uploadService.getPageCount(fileUrl, req.file.mimetype, isEncrypted, claimedPages, req.file.path);
@@ -138,4 +168,10 @@ const handlePreview = async (req, res, next) => {
   }
 };
 
-module.exports = { handleUpload, handlePreview };
+module.exports = {
+  handleUpload,
+  handlePreview,
+  waitForUploadQueueReady,
+  getUploadQueueHealth,
+  closeUploadQueue
+};
