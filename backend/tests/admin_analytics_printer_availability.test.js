@@ -304,4 +304,62 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
     expect(res.hardware).toHaveProperty('offlinePrinters');
     expect(Object.keys(res.hardware).sort()).toEqual(['activePrinters', 'offlinePrinters', 'totalMachines'].sort());
   });
+  test('11. Completed Service Value contributes to print value but never to actual collections', async () => {
+    mockPrisma.machine.findMany.mockResolvedValue([]);
+    mockPrisma.printJob.findMany.mockResolvedValue([
+      {
+        id: 'job-service-value',
+        status: 'COMPLETED',
+        cost: 2,
+        isTest: false,
+        payment: {
+          id: 'payment-service-value',
+          status: 'SUCCESS',
+          amount: 2,
+          paymentMethod: 'demo',
+          paymentGroup: 'simulated',
+          gatewayOrderId: 'demo_order_service_1'
+        }
+      },
+      {
+        id: 'job-cash',
+        status: 'COMPLETED',
+        cost: 3,
+        isTest: false,
+        payment: {
+          id: 'payment-cash',
+          status: 'SUCCESS',
+          amount: 3,
+          paymentMethod: 'cash',
+          paymentGroup: 'cash',
+          gatewayOrderId: 'cash_order_cash_1'
+        }
+      },
+      {
+        id: 'job-failed-service',
+        status: 'FAILED',
+        cost: 5,
+        isTest: false,
+        payment: {
+          id: 'payment-failed-service',
+          status: 'SUCCESS',
+          amount: 5,
+          paymentMethod: 'demo',
+          paymentGroup: 'simulated',
+          gatewayOrderId: 'demo_order_failed_1'
+        }
+      }
+    ]);
+    mockPrisma.refund.findMany.mockResolvedValue([]);
+
+    const res = await getOverviewStats(superadminUser, { period: 'today' });
+
+    expect(res.financials.completedPrintValue).toBe(5);
+    expect(res.financials.serviceValue).toBe(2);
+    expect(res.financials.demoCollections).toBe(2);
+    expect(res.financials.grossCollections).toBe(3);
+    expect(res.financials.netCollections).toBe(3);
+    expect(res.financials.successfulPayments).toBe(1);
+    expect(res.financials.serviceValueOrders).toBe(1);
+  });
 });
