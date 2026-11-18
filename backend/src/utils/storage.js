@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('./logger');
+const { getUploadsDir } = require('./uploadPaths');
 
 // Only use S3 if the bucket is explicitly configured, regardless of environment
 const useS3 = !!process.env.AWS_S3_BUCKET;
@@ -37,8 +38,6 @@ const getSafeExtension = (mimetype) => {
   };
   return map[mimetype] || '.bin';
 };
-
-const getUploadsDir = () => process.env.UPLOADS_DIR || path.join(__dirname, '..', '..', 'uploads');
 
 /**
  * Resolves the durable persistent advertisement upload directory.
