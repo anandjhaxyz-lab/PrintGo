@@ -348,6 +348,24 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
         machine: { name: 'Main Shop Printer' }
       },
       {
+        id: 'chart-upi',
+        status: 'COMPLETED',
+        cost: 4,
+        color: 'bw',
+        duplex: 'single',
+        paperSize: 'A4',
+        createdAt: chartTime,
+        payment: {
+          id: 'chart-payment-upi',
+          status: 'SUCCESS',
+          amount: 4,
+          paymentMethod: '{"upi":{"channel":"link","upi_id":"testsuccess@gocash"}}',
+          paymentGroup: 'upi',
+          gatewayOrderId: 'order_chart_upi'
+        },
+        machine: { name: 'Main Shop Printer' }
+      },
+      {
         id: 'chart-failed-service',
         status: 'FAILED',
         paymentMode: 'DEMO_SIMULATION',
@@ -370,13 +388,14 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
 
     const result = await getSalesChartsData(superadminUser, { period: 'today' });
     expect(result.dailyTrend).toHaveLength(1);
-    expect(result.dailyTrend[0].grossRevenue).toBe(3);
+    expect(result.dailyTrend[0].grossRevenue).toBe(7);
     expect(result.dailyTrend[0].serviceValue).toBe(2);
     expect(result.dailyTrend[0].demoRevenue).toBe(2);
-    expect(result.dailyTrend[0].completedPrintValue).toBe(5);
+    expect(result.dailyTrend[0].completedPrintValue).toBe(9);
     expect(result.paymentMethods).toEqual(expect.arrayContaining([
       { name: 'Service Value', count: 1 },
-      { name: 'cash', count: 1 }
+      { name: 'Cash', count: 1 },
+      { name: 'UPI', count: 1 }
     ]));
   });
 
