@@ -42,9 +42,10 @@ if (process.env.DATABASE_URL) {
     $isMock: true,
     $queryRawUnsafe: async (sql, ...params) => {
       if (sql.includes('current_database()')) {
+        const isCi = process.env.GITHUB_ACTIONS === 'true';
         return [{
           current_database: 'printgo_disposable_target',
-          inet_server_port: 5433,
+          inet_server_port: isCi ? 5432 : 5433,
           version: 'PostgreSQL 17.4 (Mocked In-Memory Isolated Target)'
         }];
       }
@@ -456,11 +457,21 @@ async function setupDatabase() {
   const dbName = meta[0].current_database;
   const dbPort = meta[0].inet_server_port;
 
+  if (process.env.DATABASE_URL) {
+    const parsed = new URL(process.env.DATABASE_URL);
+    if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      throw new Error(`FATAL SAFETY VIOLATION: Database host '${parsed.hostname}' is not localhost or 127.0.0.1! Aborting immediately.`);
+    }
+  }
+
   if (dbName !== 'printgo_disposable_target') {
     throw new Error('FATAL SAFETY VIOLATION: Database is not printgo_disposable_target! Aborting immediately.');
   }
-  if (dbPort !== 5433) {
-    throw new Error('FATAL SAFETY VIOLATION: Port is not 5433! Aborting immediately.');
+
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+  if (Number(dbPort) !== expectedPort) {
+    throw new Error(`FATAL SAFETY VIOLATION: Port is not ${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting immediately.`);
   }
 
   companyA = await prisma.company.upsert({

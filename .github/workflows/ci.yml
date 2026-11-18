@@ -29,7 +29,7 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: printgo_test
+          POSTGRES_DB: printgo_disposable_target
         ports:
           - 5432:5432
         options: >-
@@ -62,14 +62,14 @@ jobs:
       - name: Deploy Prisma Schema to Disposable PostgreSQL
         run: npx prisma migrate deploy
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_test?schema=public
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
 
       - name: Run Backend Jest Test Suites (6 Suites, 165 Tests)
         run: npx jest tests/phase2_printer_qr_services_and_api.test.js tests/printer_status_and_safety.test.js tests/advertisement_repair_and_safety.test.js tests/ad_suppression_phase2.test.js tests/admin_analytics_printer_availability.test.js tests/readOnlyGuard_advertisement_scoping.test.js --forceExit
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_test?schema=public
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
 
       - name: Run Phase 3T Supervised Demo Payment Access Lock Suite (12 Tests)
         run: node tests/phase3t_demo_access_lock.test.js
@@ -88,14 +88,14 @@ jobs:
         run: node tests/phase3_admin_dashboard_qr_integration.test.js
         env:
           NODE_ENV: test
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_test?schema=public
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
           JWT_SECRET: test_jwt_secret_ci_2026
 
       - name: Run Phase 1 & 2 Payment Readiness Integration Suite (9 Tests)
         run: node tests/phase1_and_2_payment_readiness.test.js
         env:
           NODE_ENV: test
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_test?schema=public
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
           JWT_SECRET: test_jwt_secret_ci_2026
           APP_ENV: staging
           ENABLE_DEMO_PAYMENT: "true"
@@ -109,7 +109,7 @@ jobs:
         run: node tests/phase4_customer_mobile_qr_flow.test.js
         env:
           NODE_ENV: test
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_test?schema=public
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
           JWT_SECRET: test_jwt_secret_ci_2026
           APP_ENV: staging
           ENABLE_DEMO_PAYMENT: "true"
@@ -134,10 +134,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20.x
+      - name: Setup Node.js 24.x
         uses: actions/setup-node@v4
         with:
-          node-version: 20.x
+          node-version: 24.x
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 

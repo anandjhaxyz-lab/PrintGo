@@ -133,7 +133,10 @@ const createMockReqRes = (reqData = {}, mockIo = null) => {
 async function runTestSuite() {
   console.log('======================================================================');
   console.log('PRINTGO — PHASE 4 CUSTOMER MOBILE FLOW & QR INTEGRATION TEST SUITE');
-  console.log('Target: printgo_disposable_target on port 5433 (PostgreSQL 17.4)');
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+
+  console.log(`Target: printgo_disposable_target on port ${expectedPort} (GITHUB_ACTIONS=${isCi})`);
   console.log('======================================================================\n');
 
   // Pre-flight safety check
@@ -141,9 +144,17 @@ async function runTestSuite() {
   const dbName = meta[0].current_database;
   const dbPort = meta[0].inet_server_port;
 
+  if (targetUrl) {
+    const parsed = new URL(targetUrl);
+    if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      console.error(`FATAL SAFETY VIOLATION: Database host '${parsed.hostname}' is not localhost or 127.0.0.1! Aborting.`);
+      process.exit(1);
+    }
+  }
+
   console.log(`Pre-flight Database Check: ${dbName} on port ${dbPort}`);
-  if (dbName !== 'printgo_disposable_target' || Number(dbPort) !== 5433) {
-    console.error('FATAL SAFETY VIOLATION: Database is NOT printgo_disposable_target:5433! Aborting.');
+  if (dbName !== 'printgo_disposable_target' || Number(dbPort) !== expectedPort) {
+    console.error(`FATAL SAFETY VIOLATION: Database is NOT printgo_disposable_target:${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting.`);
     process.exit(1);
   }
   console.log('Pre-flight Safety Check PASSED: Strictly isolated to printgo_disposable_target.\n');
