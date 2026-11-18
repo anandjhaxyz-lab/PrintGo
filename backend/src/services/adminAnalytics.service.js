@@ -334,6 +334,8 @@ const getSalesChartsData = async (user, query = {}) => {
     ...d,
     grossRevenue: Math.round(d.grossRevenue * 100) / 100,
     serviceValue: Math.round(d.serviceValue * 100) / 100,
+    // Backward-compatible alias for clients still reading the former demoRevenue field.
+    demoRevenue: Math.round(d.serviceValue * 100) / 100,
     completedPrintValue: Math.round(d.completedPrintValue * 100) / 100
   })).sort((a, b) => a.date.localeCompare(b.date));
 
