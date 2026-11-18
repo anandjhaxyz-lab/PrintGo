@@ -6,7 +6,7 @@ const mammoth = require('mammoth');
 const officeParser = require('officeparser');
 const logger = require('../../utils/logger');
 const AppError = require('../../utils/AppError');
-const { getUploadsDir } = require('../../utils/storage');
+const { getUploadsDir } = require('../../utils/uploadPaths');
 
 const withTimeout = (promise, ms) => {
   let timeout;
