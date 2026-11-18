@@ -227,7 +227,16 @@ const AdminDashboard = () => {
     socket.on('job_status_changed', (updatedJob) => {
       setJobs(prev => {
         const exists = prev.find(j => j.id === updatedJob.id);
-        if (exists) return prev.map(j => j.id === updatedJob.id ? { ...j, ...updatedJob } : j);
+        if (exists) return prev.map(j => {
+          if (j.id !== updatedJob.id) return j;
+          const merged = { ...j, ...updatedJob };
+          // Status-only Prisma updates may omit relations. Preserve the previously
+          // loaded payment relation so a recorded Service Value is not shown as Unpaid.
+          if (!Object.prototype.hasOwnProperty.call(updatedJob, 'payment')) {
+            merged.payment = j.payment;
+          }
+          return merged;
+        });
         return [updatedJob, ...prev];
       });
       // Refresh KPIs softly

@@ -119,6 +119,7 @@ const getOverviewStats = async (user, query = {}) => {
       pagesToPrint: true,
       createdAt: true,
       paymentId: true,
+      paymentMode: true,
       isTest: true,
       payment: {
         select: {
@@ -138,6 +139,7 @@ const getOverviewStats = async (user, query = {}) => {
   const printingJobs = jobs.filter(j => j.status === 'PRINTING').length;
   const failedJobs = jobs.filter(j => j.status === 'FAILED' || j.status === 'CANCELLED').length;
   const pendingPaymentJobs = jobs.filter(j => j.status === 'PENDING_PAYMENT').length;
+  const completedPrintValue = jobs.reduce((sum, job) => sum + (job.status === 'COMPLETED' ? (Number(job.cost) || 0) : 0), 0);
 
   // Refunds filter
   const refundWhere = {
@@ -157,42 +159,51 @@ const getOverviewStats = async (user, query = {}) => {
 
   const totalRefundAmount = successfulRefunds.reduce((sum, r) => sum + (Number(r.amount) || 0), 0);
 
-  // Separate real vs demo revenue from verified payments
+  // Actual collections are kept separate from non-cash Service Value records.
+  // Service Value is counted only after the associated physical print is COMPLETED.
   let grossRevenue = 0;
-  let demoRevenue = 0;
+  let serviceValue = 0;
+  let serviceValueOrders = 0;
   let successfulPaymentsCount = 0;
   let pendingPaymentsCount = 0;
 
   const countedPaymentIds = new Set();
 
   for (const job of jobs) {
+    const isServiceValue = job.paymentMode === 'DEMO_SIMULATION' ||
+                           job.isTest ||
+                           job.payment?.paymentMethod === 'demo' ||
+                           job.payment?.paymentGroup === 'simulated' ||
+                           Boolean(job.payment?.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
+
+    // A completed Service Value print is operational work, not money collected.
+    if (isServiceValue) {
+      if (job.status === 'COMPLETED') {
+        serviceValue += Number(job.cost) || Number(job.payment?.amount) || 0;
+        serviceValueOrders++;
+      }
+      continue;
+    }
+
     if (!job.payment || countedPaymentIds.has(job.payment.id)) continue;
     countedPaymentIds.add(job.payment.id);
 
-    const isDemo = job.isTest ||
-                   job.payment.paymentMethod === 'demo' ||
-                   job.payment.paymentGroup === 'simulated' ||
-                   (job.payment.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
-
     if (job.payment.status === 'SUCCESS') {
+      grossRevenue += Number(job.payment.amount) || 0;
       successfulPaymentsCount++;
-      if (isDemo) {
-        demoRevenue += Number(job.payment.amount) || 0;
-      } else {
-        grossRevenue += Number(job.payment.amount) || 0;
-      }
     } else if (job.payment.status === 'PENDING') {
       pendingPaymentsCount++;
     }
   }
 
-  // Round amounts to 2 decimals
+  // Round amounts to 2 decimals.
   grossRevenue = Math.round(grossRevenue * 100) / 100;
-  demoRevenue = Math.round(demoRevenue * 100) / 100;
+  serviceValue = Math.round(serviceValue * 100) / 100;
+  const roundedCompletedPrintValue = Math.round(completedPrintValue * 100) / 100;
   const roundedRefunds = Math.round(totalRefundAmount * 100) / 100;
   const netRevenue = Math.round((grossRevenue - roundedRefunds) * 100) / 100;
-  const aov = successfulPaymentsCount > 0 
-    ? Math.round((grossRevenue / successfulPaymentsCount) * 100) / 100 
+  const aov = successfulPaymentsCount > 0
+    ? Math.round((grossRevenue / successfulPaymentsCount) * 100) / 100
     : 0;
 
   return {
@@ -207,7 +218,10 @@ const getOverviewStats = async (user, query = {}) => {
     },
     financials: {
       grossCollections: grossRevenue,
-      demoCollections: demoRevenue,
+      serviceValue,
+      demoCollections: serviceValue,
+      completedPrintValue: roundedCompletedPrintValue,
+      serviceValueOrders,
       totalRefunds: roundedRefunds,
       netCollections: netRevenue,
       successfulPayments: successfulPaymentsCount,
@@ -273,31 +287,36 @@ const getSalesChartsData = async (user, query = {}) => {
   for (const job of jobs) {
     const dayKey = job.createdAt.toISOString().slice(0, 10);
     if (!dailyMap[dayKey]) {
-      dailyMap[dayKey] = { date: dayKey, grossRevenue: 0, demoRevenue: 0, orders: 0, completed: 0 };
+      dailyMap[dayKey] = { date: dayKey, grossRevenue: 0, serviceValue: 0, completedPrintValue: 0, orders: 0, completed: 0 };
     }
     dailyMap[dayKey].orders += 1;
-    if (job.status === 'COMPLETED') dailyMap[dayKey].completed += 1;
+    if (job.status === 'COMPLETED') {
+      dailyMap[dayKey].completed += 1;
+      dailyMap[dayKey].completedPrintValue += Number(job.cost) || 0;
+    }
 
-    // Financial check
-    if (job.payment && job.payment.status === 'SUCCESS') {
-      const isDemo = job.isTest ||
-                     job.payment.paymentMethod === 'demo' ||
-                     job.payment.paymentGroup === 'simulated' ||
-                     (job.payment.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
+    // Financial classification is server-snapshotted on the job. A Service Value
+    // record counts only after physical printing is COMPLETED; it never enters cash totals.
+    const isServiceValue = job.paymentMode === 'DEMO_SIMULATION' ||
+                           job.isTest ||
+                           job.payment?.paymentMethod === 'demo' ||
+                           job.payment?.paymentGroup === 'simulated' ||
+                           Boolean(job.payment?.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
 
-      const amount = Number(job.payment.amount) || 0;
-      if (isDemo) {
-        dailyMap[dayKey].demoRevenue += amount;
-      } else {
-        dailyMap[dayKey].grossRevenue += amount;
-
-        // Machine breakdown for real revenue
-        const mName = job.machine?.name || 'Unassigned Kiosk';
-        machineRevenueMap[mName] = (machineRevenueMap[mName] || 0) + amount;
+    if (isServiceValue) {
+      if (job.status === 'COMPLETED') {
+        dailyMap[dayKey].serviceValue += Number(job.cost) || Number(job.payment?.amount) || 0;
+        paymentMethodsMap['Service Value'] = (paymentMethodsMap['Service Value'] || 0) + 1;
       }
+    } else if (job.payment && job.payment.status === 'SUCCESS') {
+      const amount = Number(job.payment.amount) || 0;
+      dailyMap[dayKey].grossRevenue += amount;
 
-      // Payment method
-      const method = isDemo ? 'Demo Mode' : (job.payment.paymentMethod || 'UPI');
+      // Machine breakdown for actual collections only.
+      const mName = job.machine?.name || 'Unassigned Kiosk';
+      machineRevenueMap[mName] = (machineRevenueMap[mName] || 0) + amount;
+
+      const method = job.payment.paymentMethod || 'UPI';
       paymentMethodsMap[method] = (paymentMethodsMap[method] || 0) + 1;
     }
 
@@ -318,7 +337,10 @@ const getSalesChartsData = async (user, query = {}) => {
   const dailyTrend = Object.values(dailyMap).map(d => ({
     ...d,
     grossRevenue: Math.round(d.grossRevenue * 100) / 100,
-    demoRevenue: Math.round(d.demoRevenue * 100) / 100
+    serviceValue: Math.round(d.serviceValue * 100) / 100,
+    // Backward-compatible alias for clients still reading the former demoRevenue field.
+    demoRevenue: Math.round(d.serviceValue * 100) / 100,
+    completedPrintValue: Math.round(d.completedPrintValue * 100) / 100
   })).sort((a, b) => a.date.localeCompare(b.date));
 
   // Payment methods chart data
@@ -704,9 +726,9 @@ const exportReportCsv = async (user, reportType, query = {}) => {
   switch (reportType) {
     case 'sales': {
       const { dailyTrend } = await getSalesChartsData(user, { period, startDate: cStart, endDate: cEnd });
-      csvContent = 'Date,Gross Collections (INR),Demo Collections (INR),Total Orders,Completed Orders\n';
+      csvContent = 'Date,Actual Collections (INR),Service Value (INR),Completed Print Value (INR),Total Orders,Completed Orders\n';
       dailyTrend.forEach(row => {
-        csvContent += `"${row.date}",${row.grossRevenue},${row.demoRevenue},${row.orders},${row.completed}\n`;
+        csvContent += `"${row.date}",${row.grossRevenue},${row.serviceValue},${row.completedPrintValue},${row.orders},${row.completed}\n`;
       });
       break;
     }
@@ -720,9 +742,19 @@ const exportReportCsv = async (user, reportType, query = {}) => {
         include: { machine: true, document: true, payment: true },
         orderBy: { createdAt: 'desc' }
       });
-      csvContent = 'Job ID,Document Name,Machine,Pages,Color,Duplex,Cost (INR),Print Status,Payment Status,Is Test,Date\n';
+      csvContent = 'Job ID,Document Name,Machine,Pages,Color,Duplex,Job Price (INR),Completed Print Value (INR),Actual Collected (INR),Record Type,Print Status,Date\n';
       jobs.forEach(j => {
-        csvContent += `"${j.shortId}","${(j.document?.originalName || '').replace(/"/g, '""')}","${j.machine?.name || 'N/A'}",${j.pagesToPrint},"${j.color}","${j.duplex}",${j.cost},"${j.status}","${j.payment?.status || 'UNPAID'}",${Boolean(j.isTest)},"${j.createdAt.toISOString()}"\n`;
+        const isServiceValue = j.paymentMode === 'DEMO_SIMULATION' ||
+                               j.isTest ||
+                               j.payment?.paymentMethod === 'demo' ||
+                               j.payment?.paymentGroup === 'simulated' ||
+                               (j.payment?.gatewayOrderId && j.payment.gatewayOrderId.startsWith('demo_order_'));
+        const actualCollected = j.payment?.status === 'SUCCESS' && !isServiceValue ? (Number(j.payment.amount) || 0) : 0;
+        const completedValue = j.status === 'COMPLETED' ? (Number(j.cost) || 0) : 0;
+        const recordType = isServiceValue
+          ? (j.status === 'COMPLETED' ? 'SERVICE VALUE RECORDED (NON-CASH)' : 'SERVICE VALUE PENDING PRINT')
+          : (actualCollected > 0 ? `ACTUAL COLLECTION (${j.payment?.paymentMethod || 'PAYMENT'})` : (j.payment?.status || 'UNPAID'));
+        csvContent += `"${j.shortId}","${(j.document?.originalName || '').replace(/"/g, '""')}","${j.machine?.name || 'N/A'}",${j.pagesToPrint},"${j.color}","${j.duplex}",${Number(j.cost) || 0},${completedValue},${actualCollected},"${recordType}","${j.status}","${j.createdAt.toISOString()}"\n`;
       });
       break;
     }
@@ -735,10 +767,12 @@ const exportReportCsv = async (user, reportType, query = {}) => {
         where: payWhere,
         orderBy: { createdAt: 'desc' }
       });
-      csvContent = 'Payment ID,Gateway Order ID,Amount (INR),Status,Method,Is Demo,Date\n';
+      csvContent = 'Payment ID,Gateway Order ID,Amount (INR),Status,Record Type,Actual Collected (INR),Date\n';
       payments.forEach(p => {
-        const isDemo = p.paymentMethod === 'demo' || p.paymentGroup === 'simulated' || (p.gatewayOrderId && p.gatewayOrderId.startsWith('demo_order_'));
-        csvContent += `"${p.id}","${p.gatewayOrderId || 'N/A'}",${p.amount},"${p.status}","${p.paymentMethod || 'N/A'}",${Boolean(isDemo)},"${p.createdAt.toISOString()}"\n`;
+        const isServiceValue = p.paymentMethod === 'demo' || p.paymentGroup === 'simulated' || (p.gatewayOrderId && p.gatewayOrderId.startsWith('demo_order_'));
+        const actualCollected = p.status === 'SUCCESS' && !isServiceValue ? (Number(p.amount) || 0) : 0;
+        const recordType = isServiceValue ? 'SERVICE VALUE (NON-CASH)' : (p.paymentMethod || 'PAYMENT');
+        csvContent += `"${p.id}","${p.gatewayOrderId || 'N/A'}",${Number(p.amount) || 0},"${p.status}","${recordType}",${actualCollected},"${p.createdAt.toISOString()}"\n`;
       });
       break;
     }

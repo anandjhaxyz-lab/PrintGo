@@ -50,7 +50,7 @@ export const PaymentsView = ({ payments, isLoading, onRefresh }) => {
           <option value="">All Payment Types</option>
           <option value="upi">UPI (Cashfree)</option>
           <option value="card">Card (Cashfree)</option>
-          <option value="demo">Simulated Demo</option>
+          <option value="demo">Service Value</option>
         </select>
       </div>
 
@@ -103,7 +103,7 @@ export const PaymentsView = ({ payments, isLoading, onRefresh }) => {
                           color: '#d97706',
                           border: '1px solid #fde68a'
                         }}>
-                          ⚡ SIMULATED DEMO
+                          SERVICE VALUE
                         </span>
                       ) : (
                         <span style={{
@@ -111,24 +111,26 @@ export const PaymentsView = ({ payments, isLoading, onRefresh }) => {
                           borderRadius: '4px',
                           fontSize: '0.6875rem',
                           fontWeight: 600,
-                          background: '#ecfdf5',
-                          color: '#059669',
-                          border: '1px solid #a7f3d0'
+                          background: p.paymentMethod === 'cash' ? '#ecfdf5' : '#f0f9ff',
+                          color: p.paymentMethod === 'cash' ? '#059669' : '#0284c7',
+                          border: p.paymentMethod === 'cash' ? '1px solid #a7f3d0' : '1px solid #bae6fd'
                         }}>
-                          🛡️ CASHFREE ({p.paymentMethod || 'UPI'})
+                          {p.paymentMethod === 'cash' ? 'CASH AT COUNTER' : `CASHFREE (${p.paymentMethod || 'UPI'})`}
                         </span>
                       )}
                     </td>
                     <td>
-                      <span style={{
-                        padding: '2px 8px',
-                        borderRadius: '9999px',
-                        fontSize: '0.75rem',
-                        fontWeight: 600,
-                        background: p.status === 'SUCCESS' ? '#ecfdf5' : (p.status === 'REFUNDED' ? '#f5f3ff' : '#f1f5f9'),
-                        color: p.status === 'SUCCESS' ? '#059669' : (p.status === 'REFUNDED' ? '#7c3aed' : '#475569')
-                      }}>
-                        {p.status}
+                      <span
+                        title={p.isDemo ? 'Service Value is a non-cash print-value record, not actual money collected.' : undefined}
+                        style={{
+                          padding: '2px 8px',
+                          borderRadius: '9999px',
+                          fontSize: '0.75rem',
+                          fontWeight: 600,
+                          background: p.isDemo && p.status === 'SUCCESS' ? '#eef2ff' : (p.status === 'SUCCESS' ? '#ecfdf5' : (p.status === 'REFUNDED' ? '#f5f3ff' : '#f1f5f9')),
+                          color: p.isDemo && p.status === 'SUCCESS' ? '#4338ca' : (p.status === 'SUCCESS' ? '#059669' : (p.status === 'REFUNDED' ? '#7c3aed' : '#475569'))
+                        }}>
+                        {p.isDemo && p.status === 'SUCCESS' ? 'RECORDED' : p.status}
                       </span>
                     </td>
                     <td>

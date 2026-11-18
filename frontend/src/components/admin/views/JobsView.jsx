@@ -102,24 +102,50 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
     }
   };
 
-  const getPaymentBadge = (payment) => {
+  const getPaymentBadge = (payment, job) => {
+    const isServiceValue = payment?.paymentMethod === 'demo' ||
+      payment?.paymentGroup === 'simulated' ||
+      Boolean(payment?.gatewayOrderId && payment.gatewayOrderId.startsWith('demo_order_')) ||
+      Boolean(job?.paymentMode === 'DEMO_SIMULATION' && job.status !== 'PENDING_PAYMENT');
+
+    // A simulation records the server-priced print value, not real collections.
+    if (isServiceValue && (!payment || payment.status === 'SUCCESS')) {
+      return (
+        <span
+          title="Server-priced print value recorded. This is a non-cash service-value record, not an actual collection."
+          style={{
+            padding: '2px 7px',
+            borderRadius: '5px',
+            fontSize: '0.6875rem',
+            fontWeight: 700,
+            background: '#eef2ff',
+            color: '#4338ca',
+            border: '1px solid #c7d2fe',
+            whiteSpace: 'nowrap'
+          }}
+        >
+          SERVICE VALUE
+        </span>
+      );
+    }
+
     if (!payment) {
       return <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Unpaid</span>;
     }
-    const isDemo = payment.paymentMethod === 'demo' || (payment.gatewayOrderId && payment.gatewayOrderId.startsWith('demo_order_'));
+
     const isCash = payment.paymentMethod === 'cash' || (payment.gatewayOrderId && payment.gatewayOrderId.startsWith('cash_order_'));
     if (payment.status === 'SUCCESS') {
       return (
-        <span style={{ 
-          padding: '2px 6px', 
-          borderRadius: '4px', 
-          fontSize: '0.6875rem', 
-          fontWeight: 600, 
-          background: isCash ? '#ecfdf5' : isDemo ? '#fffbeb' : '#f0f9ff',
-          color: isCash ? '#059669' : isDemo ? '#d97706' : '#0284c7',
-          border: `1px solid ${isCash ? '#a7f3d0' : isDemo ? '#fde68a' : '#bae6fd'}`
+        <span style={{
+          padding: '2px 6px',
+          borderRadius: '4px',
+          fontSize: '0.6875rem',
+          fontWeight: 600,
+          background: isCash ? '#ecfdf5' : '#f0f9ff',
+          color: isCash ? '#059669' : '#0284c7',
+          border: `1px solid ${isCash ? '#a7f3d0' : '#bae6fd'}`
         }}>
-          {isCash ? '💵 CASH PAID' : isDemo ? '🧪 DEMO PAID' : '💳 PAID (Cashfree)'}
+          {isCash ? '💵 CASH PAID' : '💳 PAID (Cashfree)'}
         </span>
       );
     }
@@ -319,7 +345,7 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
                       <span style={{ fontWeight: 700, color: '#0f172a' }}>₹{job.cost || 0}</span>
                     </td>
                     <td>
-                      {getPaymentBadge(job.payment)}
+                      {getPaymentBadge(job.payment, job)}
                     </td>
                     <td>
                       {getStatusBadge(job.status)}
@@ -424,11 +450,22 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
               </div>
 
               <div style={{ background: '#f8fafc', padding: '0.75rem', borderRadius: '8px' }}>
-                <span style={{ fontSize: '0.6875rem', color: '#64748b', textTransform: 'uppercase', fontWeight: 600 }}>Commercial Cost & Payment</span>
+                <span style={{ fontSize: '0.6875rem', color: '#64748b', textTransform: 'uppercase', fontWeight: 600 }}>Print Value & Collection</span>
                 <p style={{ margin: '4px 0 0', fontWeight: 700, fontSize: '1rem', color: '#059669' }}>₹{selectedJob.cost}</p>
-                <p style={{ margin: 0, fontSize: '0.75rem', color: '#64748b' }}>
-                  Status: {selectedJob.payment?.status || 'UNPAID'} {selectedJob.payment?.paymentMethod ? `(${selectedJob.payment.paymentMethod})` : ''}
-                </p>
+                {(
+                  selectedJob.payment?.paymentMethod === 'demo' ||
+                  selectedJob.payment?.paymentGroup === 'simulated' ||
+                  Boolean(selectedJob.payment?.gatewayOrderId?.startsWith('demo_order_')) ||
+                  (selectedJob.paymentMode === 'DEMO_SIMULATION' && selectedJob.status !== 'PENDING_PAYMENT')
+                ) ? (
+                  <p style={{ margin: 0, fontSize: '0.75rem', color: '#4338ca' }}>
+                    Service Value Recorded · Non-cash record (not collected)
+                  </p>
+                ) : (
+                  <p style={{ margin: 0, fontSize: '0.75rem', color: '#64748b' }}>
+                    Collection Status: {selectedJob.payment?.status || 'UNPAID'} {selectedJob.payment?.paymentMethod ? `(${selectedJob.payment.paymentMethod})` : ''}
+                  </p>
+                )}
               </div>
             </div>
 
