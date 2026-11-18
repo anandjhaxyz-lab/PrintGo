@@ -119,6 +119,7 @@ const getOverviewStats = async (user, query = {}) => {
       pagesToPrint: true,
       createdAt: true,
       paymentId: true,
+      paymentMode: true,
       isTest: true,
       payment: {
         select: {
@@ -169,24 +170,27 @@ const getOverviewStats = async (user, query = {}) => {
   const countedPaymentIds = new Set();
 
   for (const job of jobs) {
+    const isServiceValue = job.paymentMode === 'DEMO_SIMULATION' ||
+                           job.isTest ||
+                           job.payment?.paymentMethod === 'demo' ||
+                           job.payment?.paymentGroup === 'simulated' ||
+                           Boolean(job.payment?.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
+
+    // A completed Service Value print is operational work, not money collected.
+    if (isServiceValue) {
+      if (job.status === 'COMPLETED') {
+        serviceValue += Number(job.cost) || Number(job.payment?.amount) || 0;
+        serviceValueOrders++;
+      }
+      continue;
+    }
+
     if (!job.payment || countedPaymentIds.has(job.payment.id)) continue;
     countedPaymentIds.add(job.payment.id);
 
-    const isServiceValue = job.isTest ||
-                           job.payment.paymentMethod === 'demo' ||
-                           job.payment.paymentGroup === 'simulated' ||
-                           (job.payment.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
-
     if (job.payment.status === 'SUCCESS') {
-      if (isServiceValue) {
-        if (job.status === 'COMPLETED') {
-          serviceValue += Number(job.cost) || Number(job.payment.amount) || 0;
-          serviceValueOrders++;
-        }
-      } else {
-        grossRevenue += Number(job.payment.amount) || 0;
-        successfulPaymentsCount++;
-      }
+      grossRevenue += Number(job.payment.amount) || 0;
+      successfulPaymentsCount++;
     } else if (job.payment.status === 'PENDING') {
       pendingPaymentsCount++;
     }
@@ -291,28 +295,28 @@ const getSalesChartsData = async (user, query = {}) => {
       dailyMap[dayKey].completedPrintValue += Number(job.cost) || 0;
     }
 
-    // Financial check
-    if (job.payment && job.payment.status === 'SUCCESS') {
-      const isDemo = job.isTest ||
-                     job.payment.paymentMethod === 'demo' ||
-                     job.payment.paymentGroup === 'simulated' ||
-                     (job.payment.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
+    // Financial classification is server-snapshotted on the job. A Service Value
+    // record counts only after physical printing is COMPLETED; it never enters cash totals.
+    const isServiceValue = job.paymentMode === 'DEMO_SIMULATION' ||
+                           job.isTest ||
+                           job.payment?.paymentMethod === 'demo' ||
+                           job.payment?.paymentGroup === 'simulated' ||
+                           Boolean(job.payment?.gatewayOrderId && job.payment.gatewayOrderId.startsWith('demo_order_'));
 
-      const amount = Number(job.payment.amount) || 0;
-      if (isDemo) {
-        if (job.status === 'COMPLETED') {
-          dailyMap[dayKey].serviceValue += Number(job.cost) || amount;
-        }
-      } else {
-        dailyMap[dayKey].grossRevenue += amount;
-
-        // Machine breakdown for real revenue
-        const mName = job.machine?.name || 'Unassigned Kiosk';
-        machineRevenueMap[mName] = (machineRevenueMap[mName] || 0) + amount;
+    if (isServiceValue) {
+      if (job.status === 'COMPLETED') {
+        dailyMap[dayKey].serviceValue += Number(job.cost) || Number(job.payment?.amount) || 0;
+        paymentMethodsMap['Service Value'] = (paymentMethodsMap['Service Value'] || 0) + 1;
       }
+    } else if (job.payment && job.payment.status === 'SUCCESS') {
+      const amount = Number(job.payment.amount) || 0;
+      dailyMap[dayKey].grossRevenue += amount;
 
-      // Payment method
-      const method = isDemo ? 'Service Value' : (job.payment.paymentMethod || 'UPI');
+      // Machine breakdown for actual collections only.
+      const mName = job.machine?.name || 'Unassigned Kiosk';
+      machineRevenueMap[mName] = (machineRevenueMap[mName] || 0) + amount;
+
+      const method = job.payment.paymentMethod || 'UPI';
       paymentMethodsMap[method] = (paymentMethodsMap[method] || 0) + 1;
     }
 
@@ -740,7 +744,9 @@ const exportReportCsv = async (user, reportType, query = {}) => {
       });
       csvContent = 'Job ID,Document Name,Machine,Pages,Color,Duplex,Job Price (INR),Completed Print Value (INR),Actual Collected (INR),Record Type,Print Status,Date\n';
       jobs.forEach(j => {
-        const isServiceValue = j.payment?.paymentMethod === 'demo' ||
+        const isServiceValue = j.paymentMode === 'DEMO_SIMULATION' ||
+                               j.isTest ||
+                               j.payment?.paymentMethod === 'demo' ||
                                j.payment?.paymentGroup === 'simulated' ||
                                (j.payment?.gatewayOrderId && j.payment.gatewayOrderId.startsWith('demo_order_'));
         const actualCollected = j.payment?.status === 'SUCCESS' && !isServiceValue ? (Number(j.payment.amount) || 0) : 0;
