@@ -180,7 +180,7 @@ describe('PrintGo production print queue fail-closed behavior', () => {
     jest.doMock('../src/utils/prisma', () => queuePrisma);
 
     expect(() => require('../src/services/queueService')).toThrow(
-      'PrintGo production queue requires Redis.'
+      'PrintGo production queue requires Redis;'
     );
   });
 
