@@ -43,11 +43,19 @@ describe('readOnlyGuard — Cash Payment Scoping & Security Suite', () => {
     delete process.env.ALLOW_ADVERTISEMENT_MUTATIONS;
   });
 
+  const restoreEnv = (key, value) => {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  };
+
   afterEach(() => {
-    process.env.ADMIN_READ_ONLY = origAdminReadOnly;
-    process.env.APP_ENV = origAppEnv;
-    process.env.ALLOW_CASH_PAYMENT_MUTATIONS = origAllowCashMutations;
-    process.env.ALLOW_ADVERTISEMENT_MUTATIONS = origAllowAdMutations;
+    restoreEnv('ADMIN_READ_ONLY', origAdminReadOnly);
+    restoreEnv('APP_ENV', origAppEnv);
+    restoreEnv('ALLOW_CASH_PAYMENT_MUTATIONS', origAllowCashMutations);
+    restoreEnv('ALLOW_ADVERTISEMENT_MUTATIONS', origAllowAdMutations);
   });
 
   const createMockReqRes = (method, url, extra = {}) => {
