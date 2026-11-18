@@ -10,7 +10,8 @@ const {
   verifyDemoAccessCode,
   isDemoAccessRateLimited,
   recordDemoAccessFailure,
-  clearDemoAccessFailures
+  clearDemoAccessFailures,
+  isDemoAccessCodeRequired
 } = require('../../utils/demoPaymentGuard');
 
 /**
@@ -458,42 +459,50 @@ const demoPayment = async (req, res, next) => {
       return res.status(accessErr.status).json({ success: false, error: accessErr.error });
     }
 
-    // Rate-limit failed access attempts per session and IP
-    const sessionIdentifier = req.session?.sessionId || req.session?.code || req.headers['x-session-id'] || 'session_unknown';
-    const ipIdentifier = ipAddress || 'ip_unknown';
-    const rateLimitKey = `${sessionIdentifier}:${ipIdentifier}`;
+    const accessCodeRequired = isDemoAccessCodeRequired();
 
-    if (isDemoAccessRateLimited(rateLimitKey)) {
-      logger.warn(`Demo payment rate limit exceeded for ${rateLimitKey}`);
-      return res.status(429).json({
-        success: false,
-        error: 'Too many failed demo access code attempts. Rate limit exceeded. Please wait before retrying.'
-      });
+    if (accessCodeRequired) {
+      // Rate-limit failed access attempts per session and IP only when code protection is enabled.
+      const sessionIdentifier = req.session?.sessionId || req.session?.code || req.headers['x-session-id'] || 'session_unknown';
+      const ipIdentifier = ipAddress || 'ip_unknown';
+      const rateLimitKey = `${sessionIdentifier}:${ipIdentifier}`;
+
+      if (isDemoAccessRateLimited(rateLimitKey)) {
+        logger.warn(`Demo payment rate limit exceeded for ${rateLimitKey}`);
+        return res.status(429).json({
+          success: false,
+          error: 'Too many failed demo access code attempts. Rate limit exceeded. Please wait before retrying.'
+        });
+      }
+
+      // Require and validate demo access code using constant-time timingSafeEqual.
+      const providedCode = req.body?.accessCode || req.body?.demoAccessCode || req.headers['x-demo-access-code'];
+
+      if (!providedCode || typeof providedCode !== 'string' || !providedCode.trim()) {
+        recordDemoAccessFailure(rateLimitKey);
+        logger.warn(`Demo payment rejected: missing access code from ${rateLimitKey}`);
+        return res.status(400).json({
+          success: false,
+          error: 'Demo payment access code is required'
+        });
+      }
+
+      if (!verifyDemoAccessCode(providedCode)) {
+        recordDemoAccessFailure(rateLimitKey);
+        logger.warn(`Demo payment rejected: invalid access code from ${rateLimitKey}`);
+        return res.status(403).json({
+          success: false,
+          error: 'Invalid demo payment access code'
+        });
+      }
+
+      // Clear failed attempt record on successful authentication.
+      clearDemoAccessFailures(rateLimitKey);
+    } else {
+      // This optional-code mode is controlled only by the Staging backend environment.
+      // The Staging-only demo guard and session/job ownership checks above still apply.
+      logger.info(`Demo access-code prompt disabled by Staging configuration for job ${id}`);
     }
-
-    // Require and validate demo access code using constant-time timingSafeEqual
-    const providedCode = req.body?.accessCode || req.body?.demoAccessCode || req.headers['x-demo-access-code'];
-
-    if (!providedCode || typeof providedCode !== 'string' || !providedCode.trim()) {
-      recordDemoAccessFailure(rateLimitKey);
-      logger.warn(`Demo payment rejected: missing access code from ${rateLimitKey}`);
-      return res.status(400).json({
-        success: false,
-        error: 'Demo payment access code is required'
-      });
-    }
-
-    if (!verifyDemoAccessCode(providedCode)) {
-      recordDemoAccessFailure(rateLimitKey);
-      logger.warn(`Demo payment rejected: invalid access code from ${rateLimitKey}`);
-      return res.status(403).json({
-        success: false,
-        error: 'Invalid demo payment access code'
-      });
-    }
-
-    // Clear failed attempt record on successful authentication
-    clearDemoAccessFailures(rateLimitKey);
 
     // Idempotency: If already paid/waiting/printing/completed, return existing without re-dispatching
     if (job.status !== 'PENDING_PAYMENT') {
