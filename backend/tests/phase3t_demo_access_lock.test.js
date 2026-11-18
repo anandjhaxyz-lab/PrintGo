@@ -28,6 +28,7 @@ process.env.DEMO_PAYMENT_ACCESS_CODE = TEST_ACCESS_CODE;
 
 const {
   isDemoPaymentPermitted,
+  isDemoAccessCodeRequired,
   verifyDemoAccessCode,
   isDemoAccessRateLimited,
   recordDemoAccessFailure,
@@ -206,6 +207,7 @@ const setStagingEnv = () => {
   process.env.RENDER_SERVICE_NAME = STAGING_SERVICE_NAME;
   process.env.RENDER_GIT_BRANCH = STAGING_GIT_BRANCH;
   process.env.DEMO_PAYMENT_ACCESS_CODE = TEST_ACCESS_CODE;
+  process.env.DEMO_PAYMENT_REQUIRE_ACCESS_CODE = 'true';
 };
 
 const setProductionEnv = () => {
@@ -216,6 +218,7 @@ const setProductionEnv = () => {
   process.env.RENDER_SERVICE_NAME = 'printgo-backend';
   process.env.RENDER_GIT_BRANCH = 'main';
   process.env.DEMO_PAYMENT_ACCESS_CODE = TEST_ACCESS_CODE;
+  process.env.DEMO_PAYMENT_REQUIRE_ACCESS_CODE = 'false';
 };
 
 async function runPhase3TTests() {
@@ -248,6 +251,11 @@ async function runPhase3TTests() {
     assert.strictEqual(verifyDemoAccessCode('correct_code', undefined), false);
     // Length differences do not throw RangeError due to SHA-256 pre-hashing
     assert.strictEqual(verifyDemoAccessCode('a', 'much_longer_string_than_a'), false);
+    assert.strictEqual(isDemoAccessCodeRequired({}), true, 'Code requirement defaults to enabled');
+    assert.strictEqual(isDemoAccessCodeRequired({ DEMO_PAYMENT_REQUIRE_ACCESS_CODE: 'true' }), true);
+    assert.strictEqual(isDemoAccessCodeRequired({ DEMO_PAYMENT_REQUIRE_ACCESS_CODE: 'false' }), false);
+    assert.strictEqual(isDemoAccessCodeRequired({ DEMO_PAYMENT_REQUIRE_ACCESS_CODE: 'FALSE' }), false);
+    assert.strictEqual(isDemoAccessCodeRequired({ DEMO_PAYMENT_REQUIRE_ACCESS_CODE: '0' }), true, 'Only explicit false disables the requirement');
   });
 
   // Test 2: Missing access code rejected with 400 Bad Request
@@ -446,6 +454,45 @@ async function runPhase3TTests() {
     assert.strictEqual(printDispatchCalls[0].shortId, job.shortId);
   });
 
+  // Test 6B: Explicitly configured no-code demo remains session-authorized and dispatches exactly one print.
+  await test('6B. DEMO_PAYMENT_REQUIRE_ACCESS_CODE=false allows one-click simulation without a code', async () => {
+    setStagingEnv();
+    process.env.DEMO_PAYMENT_REQUIRE_ACCESS_CODE = 'false';
+    resetAllDemoRateLimits();
+    printDispatchCalls = [];
+    const sess = 'sess_demo_no_code';
+    const machineId = 'mach_staging_1';
+    addMockSession(sess);
+
+    const job = {
+      id: 'job_test_no_code',
+      shortId: 'job_no_code_1',
+      cost: 5.0,
+      machineId,
+      status: 'PENDING_PAYMENT',
+      pagesToPrint: 1,
+      color: 'bw',
+      duplex: 'single',
+      document: { filename: '/uploads/demo_no_code.pdf', originalName: 'demo_no_code.pdf' },
+      pricingSnapshot: JSON.stringify({ sessionId: sess })
+    };
+    mockJobs.set(job.id, job);
+
+    const token = makeSessionToken(sess, machineId);
+    const res = await request(app)
+      .post(`/api/payments/demo-pay/${job.shortId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send();
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.success, true);
+    assert.strictEqual(res.body.dispatched, true);
+    assert.strictEqual(res.body.payment.paymentMethod, 'demo');
+    assert.strictEqual(res.body.job.status, 'WAITING');
+    assert.strictEqual(printDispatchCalls.length, 1);
+    assert.strictEqual(printDispatchCalls[0].shortId, job.shortId);
+  });
+
   // Test 7: Idempotency (Duplicate request cannot produce duplicate print)
   await test('7. Duplicate demo request cannot produce duplicate payment or duplicate print', async () => {
     setStagingEnv();
@@ -512,12 +559,13 @@ async function runPhase3TTests() {
     const res = await request(app)
       .post(`/api/payments/demo-pay/${job.shortId}`)
       .set('Authorization', `Bearer ${token}`)
-      .send({ accessCode: TEST_ACCESS_CODE });
+      .send();
 
     assert.strictEqual(res.status, 403);
     assert.strictEqual(res.body.success, false);
     assert.strictEqual(res.body.error, 'Demo payment endpoint is disabled');
     assert.strictEqual(isDemoPaymentPermitted(), false);
+    assert.strictEqual(process.env.DEMO_PAYMENT_REQUIRE_ACCESS_CODE, 'false', 'Production remains blocked even with the optional-code setting disabled');
   });
 
   // Test 9: Zero access code leakage in responses, errors, or audit records
