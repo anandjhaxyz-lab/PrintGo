@@ -764,7 +764,7 @@ const exportReportCsv = async (user, reportType, query = {}) => {
         const isServiceValue = p.paymentMethod === 'demo' || p.paymentGroup === 'simulated' || (p.gatewayOrderId && p.gatewayOrderId.startsWith('demo_order_'));
         const actualCollected = p.status === 'SUCCESS' && !isServiceValue ? (Number(p.amount) || 0) : 0;
         const recordType = isServiceValue ? 'SERVICE VALUE (NON-CASH)' : (p.paymentMethod || 'PAYMENT');
-        csvContent += `"${p.id}","${p.gatewayOrderId || 'N/A'}","${p.status}","${recordType}",${actualCollected},"${p.createdAt.toISOString()}"\n`;
+        csvContent += `"${p.id}","${p.gatewayOrderId || 'N/A'}",${Number(p.amount) || 0},"${p.status}","${recordType}",${actualCollected},"${p.createdAt.toISOString()}"\n`;
       });
       break;
     }
