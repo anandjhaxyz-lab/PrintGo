@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import axios from 'axios';
 import {
-  Upload, CheckCircle, Loader, CreditCard,
+  Upload, CheckCircle, Loader, CreditCard, Banknote,
   WifiOff, Printer, AlertTriangle, RefreshCw, FileText,
   ShieldCheck, ChevronRight, ChevronLeft, Check, Eye,
   Download, Receipt, RotateCcw, Zap, Sparkles, Lock
@@ -148,6 +148,7 @@ const MobileView = () => {
   const [isInitializingPayment, setIsInitializingPayment] = useState(false);
   const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
   const [paymentOutcome, setPaymentOutcome] = useState(null); // { type: 'FAILED'|'CANCELLED'|'DROPPED'|'PENDING'|'MISMATCH', message }
+  const [paymentMode, setPaymentMode] = useState('CASH_AT_COUNTER'); // 'CASH_AT_COUNTER' | 'DEMO_SIMULATION' | 'CASHFREE_ONLINE'
   const [enableDemoPayment, setEnableDemoPayment] = useState(false);
   const [demoAccessCode, setDemoAccessCode] = useState('');
   const [isExecutingDemoPay, setIsExecutingDemoPay] = useState(false);
@@ -339,6 +340,8 @@ const MobileView = () => {
           if (recovered.printerInfo) setPrinterInfo(recovered.printerInfo);
           if (recovered.pricingProfile) setPricingProfile(recovered.pricingProfile);
           if (recovered.cashfreeEnv) setCashfreeEnv(normalizeCashfreeMode(recovered.cashfreeEnv));
+          const recoveredMode = recovered.paymentMode || (recovered.enableDemoPayment ? 'DEMO_SIMULATION' : (recovered.cashfreeEnv || recovered.orderId ? 'CASHFREE_ONLINE' : 'CASH_AT_COUNTER'));
+          setPaymentMode(recoveredMode);
           if (recovered.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(recovered.enableDemoPayment));
           if (recovered.fileData) setFileData(recovered.fileData);
           if (recovered.settings) setSettings(recovered.settings);
@@ -422,6 +425,8 @@ const MobileView = () => {
               if (!cancelled && pRes.data?.success) {
                 if (pRes.data.pricingProfile) setPricingProfile(pRes.data.pricingProfile);
                 if (pRes.data.cashfreeEnv) setCashfreeEnv(normalizeCashfreeMode(pRes.data.cashfreeEnv));
+                const modeFromPricing = pRes.data.paymentMode || (pRes.data.enableDemoPayment ? 'DEMO_SIMULATION' : (pRes.data.cashfreeEnv ? 'CASHFREE_ONLINE' : null));
+                if (modeFromPricing) setPaymentMode(modeFromPricing);
                 if (pRes.data.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(pRes.data.enableDemoPayment));
               }
             })
@@ -437,6 +442,8 @@ const MobileView = () => {
             if (res.data.pricingProfile) setPricingProfile(res.data.pricingProfile);
             const envMode = normalizeCashfreeMode(res.data.cashfreeEnv);
             setCashfreeEnv(envMode);
+            const resolvedPaymentMode = res.data.paymentMode || (res.data.enableDemoPayment ? 'DEMO_SIMULATION' : (res.data.cashfreeEnv ? 'CASHFREE_ONLINE' : 'CASH_AT_COUNTER'));
+            setPaymentMode(resolvedPaymentMode);
             const demoAllowed = Boolean(res.data.enableDemoPayment);
             setEnableDemoPayment(demoAllowed);
 
@@ -447,6 +454,7 @@ const MobileView = () => {
               printerInfo: res.data.printer || null,
               pricingProfile: res.data.pricingProfile || DEFAULT_PRICING_PROFILE,
               cashfreeEnv: envMode,
+              paymentMode: resolvedPaymentMode,
               enableDemoPayment: demoAllowed,
               expiresAt: res.data.expiresAt || null,
             });
@@ -462,6 +470,8 @@ const MobileView = () => {
             if (res.data.pricingProfile) setPricingProfile(res.data.pricingProfile);
             const envMode = normalizeCashfreeMode(res.data.cashfreeEnv);
             setCashfreeEnv(envMode);
+            const resolvedPaymentMode = res.data.paymentMode || (res.data.enableDemoPayment ? 'DEMO_SIMULATION' : (res.data.cashfreeEnv ? 'CASHFREE_ONLINE' : 'CASH_AT_COUNTER'));
+            setPaymentMode(resolvedPaymentMode);
             const demoAllowed = Boolean(res.data.enableDemoPayment);
             setEnableDemoPayment(demoAllowed);
 
@@ -471,6 +481,7 @@ const MobileView = () => {
               machineId: res.data.machineId || null,
               pricingProfile: res.data.pricingProfile || DEFAULT_PRICING_PROFILE,
               cashfreeEnv: envMode,
+              paymentMode: resolvedPaymentMode,
               enableDemoPayment: demoAllowed,
               expiresAt: res.data.expiresAt || null,
             });
@@ -515,7 +526,7 @@ const MobileView = () => {
               ...(prev || {}),
               name: statusData.name || prev?.name || 'Counter Printer',
               location: statusData.location || prev?.location || 'Front Desk',
-              model: statusData.printerModel || prev?.model || 'EPSON L6460 Series',
+              model: statusData.printerModel || prev?.model || 'Unknown',
               isOnline: statusData.isReady ?? statusData.isOnline ?? false,
               hardwareStatus: statusData.hardwareStatus || statusData.status || (statusData.isOnline ? 'ONLINE' : 'AGENT_OFFLINE'),
               statusMessage: statusData.statusMessage,
@@ -598,6 +609,9 @@ const MobileView = () => {
               const restoredJob = jobRes.data.job;
               setPrice(restoredJob.cost);
               setJobStatus(restoredJob.status);
+              if (restoredJob.paymentMode) {
+                setPaymentMode(restoredJob.paymentMode);
+              }
               if (['WAITING', 'PRINTING', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(restoredJob.status)) {
                 setStep(4);
               }
@@ -988,6 +1002,10 @@ const MobileView = () => {
           // ignore snapshot parse issues; liveBreakdown remains accurate fallback
         }
 
+        if (createdJob.paymentMode) {
+          setPaymentMode(createdJob.paymentMode);
+        }
+
         saveRecoveredSession(scopeParams, {
           jobId: createdJob.shortId,
           orderId: null,
@@ -995,6 +1013,7 @@ const MobileView = () => {
           pricingBreakdown: parsedBreakdown,
           fileData,
           settings,
+          paymentMode: createdJob.paymentMode || paymentMode,
           paymentState: 'READY',
         });
 
@@ -1815,6 +1834,113 @@ const MobileView = () => {
           );
         }
 
+        // CASH AT COUNTER MODE: Simplified 1-screen customer experience
+        if (paymentMode === 'CASH_AT_COUNTER') {
+          return (
+            <div className="flex flex-col justify-center animate-scale-in" style={{ gap: '0.65rem' }}>
+              <div className="s3k-card s3k-card-gold text-center py-5 px-4 flex flex-col items-center justify-center">
+                <div
+                  style={{
+                    width: 58,
+                    height: 58,
+                    borderRadius: '50%',
+                    background: 'linear-gradient(135deg, rgba(16,185,129,0.3) 0%, rgba(15,23,42,0.8) 100%)',
+                    border: '1.5px solid rgba(16, 185, 129, 0.5)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    boxShadow: '0 0 16px rgba(16, 185, 129, 0.25)',
+                    marginBottom: '0.75rem',
+                  }}
+                >
+                  <Banknote size={32} style={{ color: '#10B981' }} />
+                </div>
+
+                <h2 className="text-xl font-black text-white mb-1">Pay at Counter</h2>
+
+                <div className="w-full bg-slate-900/90 border border-emerald-500/30 rounded-xl p-3.5 text-left mb-3">
+                  <p className="text-xs text-slate-200 leading-relaxed font-medium">
+                    Your print order is ready.<br />
+                    Show your Order ID to the cashier and pay the exact amount in cash.<br />
+                    Printing will start after the cashier confirms payment.
+                  </p>
+                </div>
+
+                {/* Prominent Order ID Box */}
+                <div className="w-full bg-slate-950/80 border border-amber-400/40 rounded-xl p-3 text-center mb-3">
+                  <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block mb-1">
+                    Order ID
+                  </span>
+                  <div className="text-2xl font-black text-amber-400 tracking-wider">
+                    #{jobId}
+                  </div>
+                </div>
+
+                {/* Authoritative Order Summary */}
+                <div className="w-full bg-slate-900/70 border border-slate-700/80 rounded-xl p-3 text-left mb-3">
+                  <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                    <span>Document</span>
+                    <span className="font-bold text-white truncate max-w-[170px]">{fileData?.originalName || 'Document'}</span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                    <span>Pages & Copies</span>
+                    <span className="font-bold text-white">
+                      {settings.pagesToPrint} {settings.pagesToPrint === 1 ? 'Page' : 'Pages'} × {settings.copies}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                    <span>Print Mode</span>
+                    <span className="font-bold text-white">
+                      {settings.color === 'color' ? 'Full Color' : 'Black & White'} •{' '}
+                      {settings.duplex === 'double' ? 'Double Sided' : 'Single Sided'}
+                    </span>
+                  </div>
+                  {displayedBreakdown?.convenienceFee > 0 && (
+                    <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                      <span>Convenience Fee</span>
+                      <span>₹{Number(displayedBreakdown.convenienceFee).toFixed(2)}</span>
+                    </div>
+                  )}
+                  {displayedBreakdown?.gstEnabled && displayedBreakdown?.totalTax > 0 && (
+                    <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                      <span>GST ({displayedBreakdown.gstRatePercent}%)</span>
+                      <span>₹{Number(displayedBreakdown.totalTax).toFixed(2)}</span>
+                    </div>
+                  )}
+                  <div className="border-t border-slate-700/80 pt-2 flex justify-between items-center">
+                    <span className="text-xs font-bold text-amber-400">Total Payable in Cash</span>
+                    <span className="text-xl font-black text-emerald-400">₹{Number(displayedTotal).toFixed(2)}</span>
+                  </div>
+                </div>
+
+                {/* Live Real-time Status Notice */}
+                <div className="w-full bg-emerald-950/30 border border-emerald-500/30 rounded-xl px-3 py-2.5 text-center mb-2 flex items-center justify-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
+                  <span className="text-xs font-bold text-emerald-300">
+                    Awaiting Cashier Confirmation...
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-slate-400 text-center mb-1">
+                  Please show this screen to the counter staff. Printing starts automatically once confirmed.
+                </p>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPaymentOutcome(null);
+                    setStep(2);
+                  }}
+                  className="s3k-back-btn mt-2"
+                >
+                  <ChevronLeft size={13} className="text-amber-400" />
+                  <span>Modify Print Settings</span>
+                </button>
+              </div>
+            </div>
+          );
+        }
+
         return (
           <div className="flex flex-col justify-center animate-scale-in" style={{ gap: '0.65rem' }}>
             <div className="s3k-card s3k-card-gold text-center py-4 px-4 flex flex-col items-center justify-center">
@@ -2039,6 +2165,7 @@ const MobileView = () => {
         const isCompleted = jobStatus === 'COMPLETED';
         const isPrinting = jobStatus === 'PRINTING';
         const isFailed = jobStatus === 'FAILED' || jobStatus === 'CANCELLED';
+        const isCashMode = paymentMode === 'CASH_AT_COUNTER';
 
         return (
           <div className="flex flex-col justify-center animate-scale-in" style={{ gap: '0.65rem' }}>
@@ -2087,10 +2214,17 @@ const MobileView = () => {
                     ? 'Printing Your Document...'
                     : isFailed
                       ? 'Printing Halted'
-                      : 'Payment Verified & Queued'}
+                      : isCashMode
+                        ? 'Cash Received — Printing Started'
+                        : 'Payment Verified & Queued'}
               </h2>
 
               <p className="text-xs text-slate-300 mb-3">
+                {isCashMode && !isCompleted && !isFailed ? (
+                  <span className="text-emerald-300 font-semibold block mb-1">
+                    Your payment is confirmed. Your print job is processing.
+                  </span>
+                ) : null}
                 Job ID: <strong className="text-amber-400">{jobId}</strong>
               </p>
 
@@ -2109,7 +2243,9 @@ const MobileView = () => {
                 }}
               >
                 <span className="w-2 h-2 rounded-full animate-ping" style={{ background: 'currentColor' }} />
-                Status: {jobStatus}
+                Status: {isCashMode
+                  ? (isCompleted ? 'Completed' : isPrinting ? 'Printing' : isFailed ? 'Failed' : 'Processing')
+                  : jobStatus}
               </div>
 
               {/* Operator attention notice when payment succeeded but dispatch failed */}

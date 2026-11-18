@@ -50,6 +50,9 @@ const getMachines = async (user) => {
     const availability = computePrinterAvailability(m, m.printerStatuses?.[0]);
     return {
       ...m,
+      printerModel: m.printerModel?.trim() || 'Unknown',
+      connectionType: m.connectionType?.trim() || 'Unknown',
+      paymentMode: m.paymentMode || 'CASHFREE_ONLINE',
       isOnline: availability.isReady,
       agentOnline: availability.agentOnline,
       hardwareStatus: availability.status,
@@ -72,6 +75,9 @@ const getMachineById = async (id, user) => {
   const availability = computePrinterAvailability(machine, machine.printerStatuses?.[0]);
   return {
     ...machine,
+    printerModel: machine.printerModel?.trim() || 'Unknown',
+    connectionType: machine.connectionType?.trim() || 'Unknown',
+    paymentMode: machine.paymentMode || 'CASHFREE_ONLINE',
     isOnline: availability.isReady,
     agentOnline: availability.agentOnline,
     hardwareStatus: availability.status,
@@ -80,7 +86,7 @@ const getMachineById = async (id, user) => {
 };
 
 const createMachine = async (data) => {
-  const { name, location, companyId } = data;
+  const { name, location, companyId, paymentMode } = data;
   const machineKey = crypto.randomBytes(32).toString('hex');
   
   const machine = await prisma.machine.create({
@@ -89,7 +95,8 @@ const createMachine = async (data) => {
       location,
       machineKey,
       companyId,
-      status: 'INACTIVE'
+      status: 'INACTIVE',
+      paymentMode: paymentMode || 'CASH_AT_COUNTER'
     },
     include: { company: true }
   });
@@ -134,12 +141,118 @@ const getMachinesByCompany = async (companyId) => {
     const availability = computePrinterAvailability(m, m.printerStatuses?.[0]);
     return {
       ...m,
+      printerModel: m.printerModel?.trim() || 'Unknown',
+      connectionType: m.connectionType?.trim() || 'Unknown',
+      paymentMode: m.paymentMode || 'CASHFREE_ONLINE',
       isOnline: availability.isReady,
       agentOnline: availability.agentOnline,
       hardwareStatus: availability.status,
       statusMessage: availability.statusMessage,
     };
   });
+};
+
+const updateMachinePaymentMode = async (id, paymentMode, user, io) => {
+  const machine = await getMachineById(id, user);
+
+  const validModes = ['CASH_AT_COUNTER', 'DEMO_SIMULATION', 'CASHFREE_ONLINE'];
+  if (!validModes.includes(paymentMode)) {
+    throw new AppError(`Invalid payment mode. Must be one of: ${validModes.join(', ')}`, 400);
+  }
+
+  // Mandatory Correction 5: Payment mode availability guards
+  if (paymentMode === 'CASHFREE_ONLINE') {
+    const { validateCashfreeConfig, isCashfreeKycApproved } = require('../../config/cashfree.config');
+    const validation = validateCashfreeConfig();
+    if (!validation.isValid) {
+      throw new AppError(`Cashfree Online is unavailable: ${validation.reason || 'Required gateway credentials are not configured.'}`, 400);
+    }
+    if (!isCashfreeKycApproved()) {
+      throw new AppError('Cashfree Online is unavailable: Merchant KYC verification is pending approval with Cashfree.', 400);
+    }
+  }
+
+  if (paymentMode === 'DEMO_SIMULATION') {
+    const { isDemoPaymentPermitted } = require('../../utils/demoPaymentGuard');
+    if (!isDemoPaymentPermitted()) {
+      throw new AppError('Demo Simulation is disabled: Only permitted in the authorized Staging environment with DEMO_PAYMENT_ACCESS_CODE.', 400);
+    }
+  }
+
+  const oldMode = machine.paymentMode || 'CASHFREE_ONLINE';
+  const updatedMachine = await prisma.machine.update({
+    where: { id },
+    data: { paymentMode },
+    include: { company: true }
+  });
+
+  // Audit log
+  if (prisma.auditLog && typeof prisma.auditLog.create === 'function') {
+    try {
+      await prisma.auditLog.create({
+        data: {
+          entity: 'Machine',
+          entityId: id,
+          action: 'UPDATE_PAYMENT_MODE',
+          performedBy: user.email || user.id,
+          changes: JSON.stringify({
+            previousMode: oldMode,
+            newMode: paymentMode,
+            machineId: id,
+            companyId: machine.companyId,
+            timestamp: new Date().toISOString()
+          })
+        }
+      });
+    } catch (auditErr) {
+      console.warn('Failed to record audit log for payment mode update:', auditErr.message);
+    }
+  }
+
+  if (io) {
+    io.to('admins').emit('printer_status_update', {
+      machineId: id,
+      paymentMode,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  return {
+    ...updatedMachine,
+    paymentMode: updatedMachine.paymentMode
+  };
+};
+
+const getPaymentModeCapabilities = () => {
+  const { validateCashfreeConfig, isCashfreeKycApproved } = require('../../config/cashfree.config');
+  const { isDemoPaymentPermitted } = require('../../utils/demoPaymentGuard');
+  const cfValidation = validateCashfreeConfig();
+  const kycApproved = isCashfreeKycApproved();
+  const demoPermitted = isDemoPaymentPermitted();
+
+  return {
+    CASH_AT_COUNTER: {
+      available: true,
+      label: 'Cash at Counter',
+      description: 'Customer pays cashier at the counter; printing starts after cash confirmation.'
+    },
+    DEMO_SIMULATION: {
+      available: demoPermitted,
+      label: 'Demo Simulation',
+      description: demoPermitted
+        ? 'Supervised simulation on authorized Staging with DEMO_PAYMENT_ACCESS_CODE.'
+        : 'Disabled in Production / Unauthorized environments.'
+    },
+    CASHFREE_ONLINE: {
+      available: cfValidation.isValid && kycApproved,
+      label: 'Cashfree Online',
+      description: (cfValidation.isValid && kycApproved)
+        ? 'Live UPI, Cards, and NetBanking via Cashfree Payment Gateway.'
+        : (!cfValidation.isValid
+            ? `Unavailable: ${cfValidation.reason || 'Missing gateway credentials'}`
+            : 'Unavailable: Merchant KYC verification is pending approval with Cashfree.')
+    }
+  };
 };
 
 module.exports = {
@@ -149,5 +262,7 @@ module.exports = {
   getMachineById,
   createMachine,
   updateMachineStatus,
-  getMachinesByCompany
+  getMachinesByCompany,
+  updateMachinePaymentMode,
+  getPaymentModeCapabilities
 };

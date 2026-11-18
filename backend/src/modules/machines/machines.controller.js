@@ -111,6 +111,36 @@ const getAdSuppressionStatus = async (req, res, next) => {
   }
 };
 
+const updatePaymentMode = async (req, res, next) => {
+  try {
+    const { paymentMode } = req.body;
+    const machine = await machinesService.updateMachinePaymentMode(
+      req.params.id,
+      paymentMode,
+      req.user,
+      req.app.get('io')
+    );
+    res.json({ success: true, machine, paymentMode: machine.paymentMode });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getPaymentMode = async (req, res, next) => {
+  try {
+    const machine = await machinesService.getMachineById(req.params.id, req.user);
+    const capabilities = machinesService.getPaymentModeCapabilities();
+    res.json({
+      success: true,
+      machineId: machine.id,
+      paymentMode: machine.paymentMode || 'CASH_AT_COUNTER',
+      capabilities
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getMachines,
   createMachine,
@@ -120,5 +150,7 @@ module.exports = {
   getPublicKey,
   setAdSuppression,
   cancelAdSuppression,
-  getAdSuppressionStatus
+  getAdSuppressionStatus,
+  updatePaymentMode,
+  getPaymentMode
 };

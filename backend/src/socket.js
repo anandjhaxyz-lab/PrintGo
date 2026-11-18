@@ -4,6 +4,7 @@ const { isValidJobTransition } = require('./utils/stateMachine');
 const { getMachineAvailability, computePrinterAvailability } = require('./services/printerAvailability.service');
 
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const setupSockets = (io) => {
   // WebSocket Authentication Middleware
@@ -83,8 +84,14 @@ const setupSockets = (io) => {
           
           if (stuckJobs.length > 0) {
             const jobIds = stuckJobs.map(j => j.shortId);
-            logger.info(`Requesting reconciliation for ${jobIds.length} active PRINTING job(s) from machine ${socket.machineId}: ${jobIds.join(', ')}`);
-            socket.emit('reconcile_active_jobs', { jobIds });
+            const requestId = `rec_${socket.machineId}_${Date.now()}_${crypto.randomUUID()}`;
+            socket.activeReconciliation = {
+              requestId,
+              jobIds: new Set(jobIds),
+              createdAt: Date.now()
+            };
+            logger.info(`Requesting reconciliation [ReqID: ${requestId}] for ${jobIds.length} active PRINTING job(s) from machine ${socket.machineId}: ${jobIds.join(', ')}`);
+            socket.emit('reconcile_active_jobs', { requestId, jobIds });
           }
         } catch (e) {
           logger.error('Error recovering stuck jobs for printer:', e);
@@ -202,9 +209,20 @@ const setupSockets = (io) => {
     socket.on('printer_status_update', async (status) => {
       if (socket.machineId) {
         try {
+          const printerModel = (status?.printerModel || status?.printerName || status?.model || '').trim();
+          const connectionType = (status?.connectionType || status?.telemetry?.connectionType || '').trim();
+
+          const machineUpdateData = { lastOnline: new Date() };
+          if (printerModel) {
+            machineUpdateData.printerModel = printerModel;
+          }
+          if (connectionType) {
+            machineUpdateData.connectionType = connectionType;
+          }
+
           await prisma.machine.update({
             where: { id: socket.machineId },
-            data: { lastOnline: new Date() }
+            data: machineUpdateData
           });
 
           await prisma.printerStatus.create({
@@ -212,17 +230,26 @@ const setupSockets = (io) => {
               machineId: socket.machineId,
               isOnline: !status.isError,
               paperStatus: status.errorMessage === 'Out of Paper' ? 'OUT' : 'OK',
-              jamStatus: status.errorMessage === 'Paper Jam'
+              jamStatus: status.errorMessage === 'Paper Jam',
+              connectionType: connectionType || undefined
             }
           });
 
           const availability = await getMachineAvailability(socket.machineId, prisma);
+          const broadcastPayload = {
+            ...status,
+            ...(availability || {}),
+            printerModel: printerModel || availability?.printerModel || 'Unknown',
+            connectionType: connectionType || availability?.connectionType || 'Unknown',
+            machineId: socket.machineId,
+          };
+
           if (availability) {
             // Broadcast authoritative availability to customer sessions AND admin sockets
-            io.to(`machine_${socket.machineId}`).emit('printer_status_update', availability);
-            io.to('admins').emit('printer_status_update', { ...status, ...availability });
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', broadcastPayload);
+            io.to('admins').emit('printer_status_update', broadcastPayload);
           } else {
-            io.to('admins').emit('printer_status_update', status);
+            io.to('admins').emit('printer_status_update', broadcastPayload);
           }
         } catch(err) {
           logger.error('Error saving printer status', err);
@@ -232,14 +259,97 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('job_reconciliation_report', async ({ jobId, status }) => {
-      if (socket.userType !== 'printer') return;
-      logger.info(`Agent reported reconciliation for job ${jobId}: ${status}`);
-      if (status === 'NOT_DISPATCHED') {
+    socket.on('job_reconciliation_report', async ({ requestId, jobId, status }) => {
+      // 1. Verify authenticated Agent identity and printer type
+      if (socket.userType !== 'printer' || !socket.machineId) {
+        logger.warn(`Unauthorized or non-printer socket attempted reconciliation report`);
+        return;
+      }
+
+      logger.info(`Agent on machine ${socket.machineId} reported reconciliation for job ${jobId}: ${status} [ReqID: ${requestId || 'none'}]`);
+
+      // 2. Correlation verification: verify report matches active reconciliation request
+      const active = socket.activeReconciliation;
+      if (!active) {
+        logger.warn(`Rejected reconciliation report for job ${jobId}: No active reconciliation request on socket`);
+        return;
+      }
+
+      // Check request ID matching and timeout (60 seconds)
+      const isExpired = (Date.now() - active.createdAt) > 60000;
+      if (isExpired || active.requestId !== requestId || !active.jobIds || !active.jobIds.has(jobId)) {
+        logger.warn(`Rejected stale/uncorrelated reconciliation report for job ${jobId} (ReqID match: ${active.requestId === requestId}, Expired: ${isExpired})`);
+        return;
+      }
+
+      // Consume this jobId from active request to prevent replay attacks
+      active.jobIds.delete(jobId);
+
+      // Never automatically reset jobs when Agent reports anything other than NOT_DISPATCHED
+      if (status !== 'NOT_DISPATCHED') {
+        logger.info(`Job ${jobId} reported status "${status}". Not eligible for automatic NOT_DISPATCHED re-dispatch.`);
+        return;
+      }
+
+      // 3, 4, 5. Database-level verification & atomic transition from PRINTING -> WAITING
+      let transitionSuccess = false;
+      try {
+        await prisma.$transaction(async (tx) => {
+          const job = await tx.printJob.findUnique({
+            where: { shortId: jobId },
+            include: { payment: true }
+          });
+
+          if (!job) {
+            logger.warn(`Reconciliation failed: Job ${jobId} not found`);
+            return;
+          }
+
+          // 3. Verify exact machine ownership
+          if (job.machineId !== socket.machineId) {
+            logger.warn(`Reconciliation security rejection: Job ${jobId} belongs to machine ${job.machineId}, but reported by ${socket.machineId}`);
+            return;
+          }
+
+          // Must be currently in PRINTING status
+          if (job.status !== 'PRINTING') {
+            logger.warn(`Reconciliation skipped: Job ${jobId} status is ${job.status}, expected PRINTING`);
+            return;
+          }
+
+          // 4. Verify payment was successfully confirmed
+          if (!job.payment || job.payment.status !== 'SUCCESS') {
+            logger.warn(`Reconciliation rejected: Job ${jobId} payment is not SUCCESS (payment status: ${job.payment?.status})`);
+            return;
+          }
+
+          // 5. Atomic conditional update: PRINTING -> WAITING
+          const resetCount = await tx.printJob.updateMany({
+            where: {
+              id: job.id,
+              shortId: jobId,
+              machineId: socket.machineId,
+              status: 'PRINTING'
+            },
+            data: { status: 'WAITING' }
+          });
+
+          if (resetCount.count === 1) {
+            transitionSuccess = true;
+            logger.info(`Job ${jobId} safely restored from PRINTING to WAITING for re-dispatch after verified NOT_DISPATCHED report`);
+          }
+        }, { maxWait: 5000, timeout: 10000 });
+      } catch (txErr) {
+        logger.error(`Transaction error during reconciliation reset for job ${jobId}:`, txErr);
+        return;
+      }
+
+      // 6 & 7. Invoke queueService.startPrintingProcess() reusing the WAITING -> PRINTING atomic claim
+      if (transitionSuccess) {
         const queueService = require('./services/queueService');
-        if (queueService && queueService.startPrintingProcess) {
-          logger.info(`Re-dispatching undispatched job ${jobId} to reconnected printer agent`);
-          queueService.startPrintingProcess(jobId, io);
+        if (queueService && typeof queueService.startPrintingProcess === 'function') {
+          logger.info(`Re-dispatching recovered job ${jobId} to printer agent`);
+          await queueService.startPrintingProcess(jobId, io);
         }
       }
     });
@@ -295,7 +405,7 @@ const setupSockets = (io) => {
               : (payload?.wasSeenInQueue ? 'Verified via Windows spooler polling' : 'Verified via driver dispatch confirmation'),
             completedAt: new Date()
           }
-        });
+        }, { maxWait: 5000, timeout: 10000 });
 
         // Acknowledge receipt to the agent
         socket.emit('ack_job_completed', { jobId });
@@ -306,11 +416,16 @@ const setupSockets = (io) => {
     });
 
     socket.on('print_physical_ambiguous', async ({ jobId, reason, wasSeenInQueue }) => {
-      if (socket.userType !== 'printer') return;
+      if (socket.userType !== 'printer' || !socket.machineId) return;
       logger.warn(`Job ${jobId} physical outcome ambiguous: ${reason}. Keeping status as PRINTING for operator reconciliation.`);
       try {
         const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
         if (currentJob) {
+          // Machine ownership guard
+          if (currentJob.machineId !== socket.machineId) {
+            logger.warn(`Machine ${socket.machineId} attempted to report ambiguous outcome for job ${jobId} belonging to ${currentJob.machineId}`);
+            return;
+          }
           await prisma.printHistory.create({
             data: {
               printJobId: currentJob.id,

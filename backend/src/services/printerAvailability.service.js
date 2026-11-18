@@ -241,7 +241,9 @@ const getMachineAvailability = async (machineId, dbClient = prisma, now = new Da
     machineId: machine.id,
     name: machine.name,
     location: machine.location,
-    printerModel: machine.printerModel || 'EPSON L6460 Series',
+    printerModel: machine.printerModel || 'Unknown',
+    connectionType: machine.connectionType || latestStatus?.connectionType || 'Unknown',
+    paymentMode: machine.paymentMode || 'CASHFREE_ONLINE',
     ...availability,
   };
 };

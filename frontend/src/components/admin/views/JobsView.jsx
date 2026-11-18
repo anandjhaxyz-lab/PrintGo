@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import axios from 'axios';
 import { 
   Search, 
   Filter, 
@@ -11,7 +12,10 @@ import {
   X, 
   AlertCircle,
   CheckCircle,
-  FileCheck
+  CheckCircle2,
+  FileCheck,
+  Banknote,
+  Loader
 } from 'lucide-react';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
@@ -25,6 +29,41 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
   const [machineFilter, setMachineFilter] = useState('');
   const [testFilter, setTestFilter] = useState('');
   const [selectedJob, setSelectedJob] = useState(null);
+  const [cashModalState, setCashModalState] = useState({
+    isOpen: false,
+    job: null,
+    isConfirming: false,
+    error: '',
+    successMsg: ''
+  });
+
+  const handleConfirmCash = async (job) => {
+    if (!job) return;
+    setCashModalState(prev => ({ ...prev, isConfirming: true, error: '' }));
+    try {
+      const res = await axios.post(`${API_URL}/api/admin/jobs/${job.shortId}/confirm-cash`, {
+        amount: job.cost
+      });
+      if (res.data?.success) {
+        setCashModalState({
+          isOpen: false,
+          job: null,
+          isConfirming: false,
+          error: '',
+          successMsg: `Cash payment of ₹${job.cost} confirmed for Job #${job.shortId}. Print job dispatched to queue!`
+        });
+        if (selectedJob && selectedJob.id === job.id) {
+          setSelectedJob(null);
+        }
+        if (onRefresh) onRefresh();
+      } else {
+        throw new Error(res.data?.error || 'Cash confirmation failed');
+      }
+    } catch (err) {
+      const errMsg = err.response?.data?.error || err.message || 'Failed to confirm cash payment';
+      setCashModalState(prev => ({ ...prev, isConfirming: false, error: errMsg }));
+    }
+  };
 
   // Filter jobs
   const filteredJobs = jobs.filter(job => {
@@ -68,6 +107,7 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
       return <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Unpaid</span>;
     }
     const isDemo = payment.paymentMethod === 'demo' || (payment.gatewayOrderId && payment.gatewayOrderId.startsWith('demo_order_'));
+    const isCash = payment.paymentMethod === 'cash' || (payment.gatewayOrderId && payment.gatewayOrderId.startsWith('cash_order_'));
     if (payment.status === 'SUCCESS') {
       return (
         <span style={{ 
@@ -75,11 +115,11 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
           borderRadius: '4px', 
           fontSize: '0.6875rem', 
           fontWeight: 600, 
-          background: isDemo ? '#fffbeb' : '#ecfdf5', 
-          color: isDemo ? '#d97706' : '#059669',
-          border: `1px solid ${isDemo ? '#fde68a' : '#a7f3d0'}`
+          background: isCash ? '#ecfdf5' : isDemo ? '#fffbeb' : '#f0f9ff',
+          color: isCash ? '#059669' : isDemo ? '#d97706' : '#0284c7',
+          border: `1px solid ${isCash ? '#a7f3d0' : isDemo ? '#fde68a' : '#bae6fd'}`
         }}>
-          {isDemo ? 'DEMO PAID' : 'PAID (Cashfree)'}
+          {isCash ? '💵 CASH PAID' : isDemo ? '🧪 DEMO PAID' : '💳 PAID (Cashfree)'}
         </span>
       );
     }
@@ -88,6 +128,33 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
 
   return (
     <div>
+      {/* Cash Confirmation Success Notification */}
+      {cashModalState.successMsg && (
+        <div style={{
+          background: '#ecfdf5',
+          border: '1px solid #a7f3d0',
+          color: '#065f46',
+          borderRadius: '8px',
+          padding: '0.75rem 1rem',
+          marginBottom: '1rem',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          fontSize: '0.8125rem'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <CheckCircle2 size={16} color="#059669" />
+            <span style={{ fontWeight: 600 }}>{cashModalState.successMsg}</span>
+          </div>
+          <button
+            onClick={() => setCashModalState(prev => ({ ...prev, successMsg: '' }))}
+            style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#065f46' }}
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
+
       {/* Filter Toolbar */}
       <div className="admin-filter-bar">
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flex: 1, minWidth: 200 }}>
@@ -261,23 +328,48 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
                       {timeStr}
                     </td>
                     <td>
-                      <button
-                        onClick={() => setSelectedJob(job)}
-                        style={{
-                          background: '#f1f5f9',
-                          border: '1px solid #cbd5e1',
-                          borderRadius: '6px',
-                          padding: '4px 8px',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '4px',
-                          fontSize: '0.75rem',
-                          fontWeight: 500,
-                          cursor: 'pointer'
-                        }}
-                      >
-                        <Eye size={12} /> View
-                      </button>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        {job.status === 'PENDING_PAYMENT' && (
+                          <button
+                            onClick={() => setCashModalState({ isOpen: true, job, isConfirming: false, error: '', successMsg: '' })}
+                            style={{
+                              background: '#10b981',
+                              color: '#ffffff',
+                              border: 'none',
+                              borderRadius: '6px',
+                              padding: '4px 8px',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              fontSize: '0.75rem',
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              boxShadow: '0 1px 2px rgba(16, 185, 129, 0.2)',
+                              whiteSpace: 'nowrap'
+                            }}
+                            title="Confirm cash received from customer and dispatch printing"
+                          >
+                            <Banknote size={12} /> Confirm Cash (₹{job.cost})
+                          </button>
+                        )}
+                        <button
+                          onClick={() => setSelectedJob(job)}
+                          style={{
+                            background: '#f1f5f9',
+                            border: '1px solid #cbd5e1',
+                            borderRadius: '6px',
+                            padding: '4px 8px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            fontSize: '0.75rem',
+                            fontWeight: 500,
+                            cursor: 'pointer'
+                          }}
+                        >
+                          <Eye size={12} /> View
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -392,13 +484,125 @@ export const JobsView = ({ jobs, machines, onRefresh, onReconcileJob }) => {
             )}
 
             {/* Operator Actions */}
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', borderTop: '1px solid #e2e8f0', paddingTop: '0.75rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '0.5rem', borderTop: '1px solid #e2e8f0', paddingTop: '0.75rem' }}>
+              {selectedJob.status === 'PENDING_PAYMENT' && (
+                <button
+                  type="button"
+                  onClick={() => handleConfirmCash(selectedJob)}
+                  disabled={cashModalState.isConfirming}
+                  style={{
+                    background: '#10b981',
+                    color: '#ffffff',
+                    border: 'none',
+                    borderRadius: '6px',
+                    padding: '6px 12px',
+                    fontSize: '0.8125rem',
+                    fontWeight: 600,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  {cashModalState.isConfirming ? (
+                    <><Loader size={14} className="animate-spin" /> Confirming...</>
+                  ) : (
+                    <><Banknote size={14} /> Confirm Cash Received (₹{selectedJob.cost}) & Dispatch Print</>
+                  )}
+                </button>
+              )}
               <button
                 className="btn"
                 onClick={() => setSelectedJob(null)}
                 style={{ fontSize: '0.8125rem' }}
               >
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cash Confirmation Dialog Modal */}
+      {cashModalState.isOpen && cashModalState.job && (
+        <div className="admin-modal-backdrop" onClick={() => !cashModalState.isConfirming && setCashModalState(prev => ({ ...prev, isOpen: false, job: null }))}>
+          <div className="admin-modal-card" style={{ maxWidth: '440px' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem', borderBottom: '1px solid #e2e8f0', paddingBottom: '0.75rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Banknote size={22} color="#10b981" />
+                <h3 style={{ margin: 0, fontSize: '1.125rem', fontWeight: 700 }}>Confirm Cash Received</h3>
+              </div>
+              <button
+                disabled={cashModalState.isConfirming}
+                onClick={() => setCashModalState(prev => ({ ...prev, isOpen: false, job: null }))}
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#64748b' }}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {cashModalState.error && (
+              <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', padding: '0.625rem', marginBottom: '0.75rem', color: '#dc2626', fontSize: '0.8125rem' }}>
+                {cashModalState.error}
+              </div>
+            )}
+
+            <p style={{ fontSize: '0.875rem', color: '#334155', marginBottom: '1rem', lineHeight: 1.5 }}>
+              Are you sure you received the exact cash payment of <strong>₹{cashModalState.job.cost}</strong> from the customer for Job <strong>#{cashModalState.job.shortId}</strong>?
+            </p>
+
+            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '8px', padding: '0.75rem', marginBottom: '1.25rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8125rem', marginBottom: '4px' }}>
+                <span style={{ color: '#64748b' }}>Document:</span>
+                <span style={{ fontWeight: 600, color: '#1e293b' }}>{cashModalState.job.document?.originalName || 'Document'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8125rem', marginBottom: '4px' }}>
+                <span style={{ color: '#64748b' }}>Pages & Copies:</span>
+                <span style={{ fontWeight: 600, color: '#1e293b' }}>{cashModalState.job.pagesToPrint || 1} pages × {cashModalState.job.copies || 1}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.875rem', borderTop: '1px solid #cbd5e1', paddingTop: '6px', marginTop: '4px' }}>
+                <span style={{ fontWeight: 700, color: '#0f172a' }}>Amount Collected:</span>
+                <span style={{ fontWeight: 800, color: '#059669', fontSize: '1rem' }}>₹{cashModalState.job.cost}</span>
+              </div>
+            </div>
+
+            <p style={{ fontSize: '0.75rem', color: '#64748b', marginBottom: '1.25rem' }}>
+              Notice: Confirming cash immediately marks the order as paid, records an auditable transaction, and automatically dispatches the document to the physical printer.
+            </p>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+              <button
+                type="button"
+                className="btn"
+                disabled={cashModalState.isConfirming}
+                onClick={() => setCashModalState(prev => ({ ...prev, isOpen: false, job: null }))}
+                style={{ fontSize: '0.8125rem' }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleConfirmCash(cashModalState.job)}
+                disabled={cashModalState.isConfirming}
+                style={{
+                  background: '#10b981',
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '6px 14px',
+                  fontSize: '0.8125rem',
+                  fontWeight: 600,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  cursor: 'pointer'
+                }}
+              >
+                {cashModalState.isConfirming ? (
+                  <><Loader size={14} className="animate-spin" /> Confirming...</>
+                ) : (
+                  <><Banknote size={14} /> Confirm Cash & Dispatch Print</>
+                )}
               </button>
             </div>
           </div>

@@ -59,9 +59,10 @@ const createJob = async (req, res, next) => {
         const AppError = require('../../utils/AppError');
         return next(new AppError('Session is not bound to a valid printer', 400));
       }
-      // Strictly bind machineId from server-side session token — ignore any client parameter
+      // Strictly bind machineId and session paymentMode from server-side session token — ignore any client parameter
       jobData.machineId = req.session.machineId;
       jobData.sessionId = req.session.sessionId;
+      jobData.paymentMode = req.session.paymentMode;
     }
     const job = await jobsService.createJob(jobData);
     res.json({ success: true, job });

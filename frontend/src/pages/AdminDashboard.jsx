@@ -249,6 +249,21 @@ const AdminDashboard = () => {
         });
       }
       if (status?.machineId) {
+        setMachines(prev => prev.map(m => {
+          if (m.id === status.machineId) {
+            return {
+              ...m,
+              printerModel: status.printerModel || status.printerName || m.printerModel || 'Unknown',
+              connectionType: status.connectionType || m.connectionType || 'Unknown',
+              paymentMode: status.paymentMode || m.paymentMode || 'CASH_AT_COUNTER',
+              isOnline: typeof status.isReady === 'boolean' ? status.isReady : !status.isError,
+              hardwareStatus: status.status || m.hardwareStatus,
+              statusMessage: status.statusMessage || m.statusMessage,
+              lastOnline: new Date().toISOString(),
+            };
+          }
+          return m;
+        }));
         scheduleOverviewRefresh();
       }
     });

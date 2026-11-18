@@ -453,7 +453,8 @@ const resolvePrinterQr = async (publicCode) => {
               m.name as machine_name,
               m."printerModel" as machine_printer_model,
               m.location as machine_location,
-              m.status as machine_status
+              m.status as machine_status,
+              m."paymentMode" as machine_payment_mode
        FROM "PrinterQr" pq
        LEFT JOIN "Machine" m ON pq."machineId" = m.id
        WHERE pq."publicCode" = $1
@@ -490,6 +491,7 @@ const resolvePrinterQr = async (publicCode) => {
     // Create a brand new ephemeral customer session inside transaction
     const sessionCode = crypto.randomBytes(6).toString('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 mins
+    const sessionPaymentMode = lockedQr.machine_payment_mode || 'CASHFREE_ONLINE';
 
     const createdSession = await tx.session.create({
       data: {
@@ -497,6 +499,7 @@ const resolvePrinterQr = async (publicCode) => {
         machineId: lockedQr.machine_id,
         printerQrId: lockedQr.id,
         status: 'WAITING_FOR_MOBILE',
+        paymentMode: sessionPaymentMode,
         expiresAt
       }
     });
@@ -504,11 +507,14 @@ const resolvePrinterQr = async (publicCode) => {
     return { qr: lockedQr, session: createdSession };
   }, { maxWait: 10000, timeout: 10000 });
 
+  const effectivePaymentMode = session.paymentMode || qr.machine_payment_mode || 'CASHFREE_ONLINE';
+
   // Mint signed JWT session token
   const sessionToken = jwt.sign(
     {
       sessionId: session.code,
       machineId: qr.machine_id,
+      paymentMode: effectivePaymentMode,
       type: 'session',
       role: 'mobile'
     },
@@ -525,19 +531,20 @@ const resolvePrinterQr = async (publicCode) => {
   const hardwareStatus = availability ? availability.status : 'UNKNOWN';
   const statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
 
-  logger.info(`Customer scanned QR [${qr.publicCode}]; created fresh session [${session.code}] bound to printer [${qr.machine_id}] (Status: ${hardwareStatus})`);
+  logger.info(`Customer scanned QR [${qr.publicCode}]; created fresh session [${session.code}] bound to printer [${qr.machine_id}] (Status: ${hardwareStatus}, PaymentMode: ${effectivePaymentMode})`);
 
   return {
     success: true,
     sessionCode: session.code,
     sessionToken,
     expiresAt: session.expiresAt,
+    paymentMode: effectivePaymentMode,
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
-    enableDemoPayment: isDemoPaymentPermitted(),
+    enableDemoPayment: effectivePaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted(),
     printer: {
       name: qr.machine_name || availability?.name,
-      model: qr.machine_printer_model || availability?.printerModel || 'EPSON L6460 Series',
+      model: qr.machine_printer_model || availability?.printerModel || 'Unknown',
       location: qr.machine_location || availability?.location || 'Front Desk',
       isOnline: isReady,
       hardwareStatus,
@@ -564,7 +571,7 @@ const getPublicPrinterQrInfo = async (publicCode) => {
     where: { publicCode: publicCode.trim() },
     include: {
       machine: {
-        select: { id: true, name: true, location: true, status: true, printerModel: true }
+        select: { id: true, name: true, location: true, status: true, printerModel: true, paymentMode: true }
       }
     }
   });
@@ -594,11 +601,12 @@ const getPublicPrinterQrInfo = async (publicCode) => {
     success: true,
     status: qr.status,
     label: qr.label,
+    paymentMode: qr.machine.paymentMode || 'CASHFREE_ONLINE',
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
     printer: {
       name: qr.machine.name,
-      model: qr.machine.printerModel || 'EPSON L6460 Series',
+      model: qr.machine.printerModel || 'Unknown',
       location: qr.machine.location,
       isOnline: isReady,
       hardwareStatus,
