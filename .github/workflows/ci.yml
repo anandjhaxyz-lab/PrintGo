@@ -67,8 +67,8 @@ jobs:
       - name: Validate Backend Runtime Syntax
         run: node --check src/server.js && node --check src/services/redisClient.js && node --check src/services/queueService.js && node --check src/services/uploadWorker.js && node --check src/modules/upload/upload.controller.js
 
-      - name: Run Backend Jest Test Suites (9 Suites)
-        run: npx jest tests/phase2_printer_qr_services_and_api.test.js tests/printer_status_and_safety.test.js tests/advertisement_repair_and_safety.test.js tests/ad_suppression_phase2.test.js tests/admin_analytics_printer_availability.test.js tests/readOnlyGuard_advertisement_scoping.test.js tests/readOnlyGuard_cash_payment_scoping.test.js tests/cash_payment_and_mode_switching.test.js tests/redis_infrastructure_safety.test.js --runInBand --forceExit
+      - name: Run Backend Jest Test Suites (11 Suites)
+        run: npx jest tests/phase2_printer_qr_services_and_api.test.js tests/printer_status_and_safety.test.js tests/advertisement_repair_and_safety.test.js tests/ad_suppression_phase2.test.js tests/admin_analytics_printer_availability.test.js tests/readOnlyGuard_advertisement_scoping.test.js tests/readOnlyGuard_cash_payment_scoping.test.js tests/cash_payment_and_mode_switching.test.js tests/redis_infrastructure_safety.test.js tests/readOnlyGuard_staging_payment_mode_config.test.js tests/payment_mode_consistency.test.js --runInBand --forceExit
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
