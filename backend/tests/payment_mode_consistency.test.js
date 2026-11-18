@@ -66,6 +66,15 @@ describe('PrintGo Unified Payment Mode Consistency Suite', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    // Reset DB mocks between tests so prior mock implementations cannot create false positives.
+    prisma.machine.findUnique.mockReset();
+    prisma.machine.findMany.mockReset();
+    prisma.printerQr.findUnique.mockReset();
+    prisma.session.findUnique.mockReset();
+    prisma.document.create.mockReset().mockResolvedValue({ id: 'doc-1', pages: 1 });
+    prisma.printJob.create.mockReset();
+    prisma.printPricingProfile.findFirst.mockReset();
+    prisma.auditLog.create.mockReset();
     process.env = { ...origEnv };
   });
 
@@ -239,7 +248,7 @@ describe('PrintGo Unified Payment Mode Consistency Suite', () => {
       }));
 
       const job = await createJob({
-        jobData: { sessionId: 'sess_abc' },
+        sessionId: 'sess_abc',
         file: { pages: 1 },
         settings: { color: 'bw', duplex: 'single', copies: 1 },
         document: { id: 'doc-1' },
@@ -247,6 +256,11 @@ describe('PrintGo Unified Payment Mode Consistency Suite', () => {
       });
 
       expect(job.paymentMode).toBe('DEMO_SIMULATION');
+      expect(prisma.session.findUnique).toHaveBeenCalledWith({
+        where: { code: 'sess_abc' },
+        select: { paymentMode: true }
+      });
+      expect(prisma.machine.findUnique).not.toHaveBeenCalled();
     });
 
     test('Job falls back to DEFAULT_PAYMENT_MODE when session and machine paymentMode are null', async () => {
@@ -268,7 +282,7 @@ describe('PrintGo Unified Payment Mode Consistency Suite', () => {
       }));
 
       const job = await createJob({
-        jobData: { sessionId: 'sess_abc' },
+        sessionId: 'sess_abc',
         file: { pages: 1 },
         settings: { color: 'bw', duplex: 'single', copies: 1 },
         document: { id: 'doc-1' },
@@ -277,6 +291,14 @@ describe('PrintGo Unified Payment Mode Consistency Suite', () => {
 
       expect(job.paymentMode).toBe('CASH_AT_COUNTER');
       expect(job.paymentMode).toBe(DEFAULT_PAYMENT_MODE);
+      expect(prisma.session.findUnique).toHaveBeenCalledWith({
+        where: { code: 'sess_abc' },
+        select: { paymentMode: true }
+      });
+      expect(prisma.machine.findUnique).toHaveBeenCalledWith({
+        where: { id: 'mach-1' },
+        select: { paymentMode: true }
+      });
     });
   });
 
