@@ -305,6 +305,7 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
     expect(Object.keys(res.hardware).sort()).toEqual(['activePrinters', 'offlinePrinters', 'totalMachines'].sort());
   });
   test('12. Daily charts separate actual collections, Service Value, and completed print value', async () => {
+    const chartTime = new Date(Date.now() - 30 * 60 * 1000);
     mockPrisma.machine.findMany.mockResolvedValue([
       { id: 'machine-1', name: 'Main Shop Printer', location: 'Front Desk' }
     ]);
@@ -312,11 +313,12 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
       {
         id: 'chart-service',
         status: 'COMPLETED',
+        paymentMode: 'DEMO_SIMULATION',
         cost: 2,
         color: 'bw',
         duplex: 'single',
         paperSize: 'A4',
-        createdAt: new Date('2026-11-19T04:00:00.000Z'),
+        createdAt: chartTime,
         payment: {
           id: 'chart-payment-service',
           status: 'SUCCESS',
@@ -334,7 +336,7 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
         color: 'bw',
         duplex: 'single',
         paperSize: 'A4',
-        createdAt: new Date('2026-11-19T04:10:00.000Z'),
+        createdAt: chartTime,
         payment: {
           id: 'chart-payment-cash',
           status: 'SUCCESS',
@@ -348,11 +350,12 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
       {
         id: 'chart-failed-service',
         status: 'FAILED',
+        paymentMode: 'DEMO_SIMULATION',
         cost: 5,
         color: 'bw',
         duplex: 'single',
         paperSize: 'A4',
-        createdAt: new Date('2026-11-19T04:15:00.000Z'),
+        createdAt: chartTime,
         payment: {
           id: 'chart-payment-failed',
           status: 'SUCCESS',
@@ -409,8 +412,17 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
         }
       },
       {
+        id: 'job-service-value-without-payment-relation',
+        status: 'COMPLETED',
+        paymentMode: 'DEMO_SIMULATION',
+        cost: 7,
+        isTest: false,
+        payment: null
+      },
+      {
         id: 'job-failed-service',
         status: 'FAILED',
+        paymentMode: 'DEMO_SIMULATION',
         cost: 5,
         isTest: false,
         payment: {
@@ -427,12 +439,12 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
 
     const res = await getOverviewStats(superadminUser, { period: 'today' });
 
-    expect(res.financials.completedPrintValue).toBe(5);
-    expect(res.financials.serviceValue).toBe(2);
-    expect(res.financials.demoCollections).toBe(2);
+    expect(res.financials.completedPrintValue).toBe(12);
+    expect(res.financials.serviceValue).toBe(9);
+    expect(res.financials.demoCollections).toBe(9);
     expect(res.financials.grossCollections).toBe(3);
     expect(res.financials.netCollections).toBe(3);
     expect(res.financials.successfulPayments).toBe(1);
-    expect(res.financials.serviceValueOrders).toBe(1);
+    expect(res.financials.serviceValueOrders).toBe(2);
   });
 });
