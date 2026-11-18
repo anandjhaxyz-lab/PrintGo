@@ -36,7 +36,7 @@ const mockPrisma = {
 
 jest.mock('../src/utils/prisma', () => mockPrisma);
 
-const { getOverviewStats } = require('../src/services/adminAnalytics.service');
+const { getOverviewStats, getSalesChartsData } = require('../src/services/adminAnalytics.service');
 
 describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview Analytics', () => {
   const superadminUser = { id: 'admin-1', role: 'SUPERADMIN', email: 'admin@printgo.in' };
@@ -304,6 +304,79 @@ describe('Phase 3.12 — Authoritative Printer Availability in Admin Overview An
     expect(res.hardware).toHaveProperty('offlinePrinters');
     expect(Object.keys(res.hardware).sort()).toEqual(['activePrinters', 'offlinePrinters', 'totalMachines'].sort());
   });
+  test('12. Daily charts separate actual collections, Service Value, and completed print value', async () => {
+    mockPrisma.machine.findMany.mockResolvedValue([
+      { id: 'machine-1', name: 'Main Shop Printer', location: 'Front Desk' }
+    ]);
+    mockPrisma.printJob.findMany.mockResolvedValue([
+      {
+        id: 'chart-service',
+        status: 'COMPLETED',
+        cost: 2,
+        color: 'bw',
+        duplex: 'single',
+        paperSize: 'A4',
+        createdAt: new Date('2026-11-19T04:00:00.000Z'),
+        payment: {
+          id: 'chart-payment-service',
+          status: 'SUCCESS',
+          amount: 2,
+          paymentMethod: 'demo',
+          paymentGroup: 'simulated',
+          gatewayOrderId: 'demo_order_chart_service'
+        },
+        machine: { name: 'Main Shop Printer' }
+      },
+      {
+        id: 'chart-cash',
+        status: 'COMPLETED',
+        cost: 3,
+        color: 'bw',
+        duplex: 'single',
+        paperSize: 'A4',
+        createdAt: new Date('2026-11-19T04:10:00.000Z'),
+        payment: {
+          id: 'chart-payment-cash',
+          status: 'SUCCESS',
+          amount: 3,
+          paymentMethod: 'cash',
+          paymentGroup: 'cash',
+          gatewayOrderId: 'cash_order_chart_cash'
+        },
+        machine: { name: 'Main Shop Printer' }
+      },
+      {
+        id: 'chart-failed-service',
+        status: 'FAILED',
+        cost: 5,
+        color: 'bw',
+        duplex: 'single',
+        paperSize: 'A4',
+        createdAt: new Date('2026-11-19T04:15:00.000Z'),
+        payment: {
+          id: 'chart-payment-failed',
+          status: 'SUCCESS',
+          amount: 5,
+          paymentMethod: 'demo',
+          paymentGroup: 'simulated',
+          gatewayOrderId: 'demo_order_chart_failed'
+        },
+        machine: { name: 'Main Shop Printer' }
+      }
+    ]);
+
+    const result = await getSalesChartsData(superadminUser, { period: 'today' });
+    expect(result.dailyTrend).toHaveLength(1);
+    expect(result.dailyTrend[0].grossRevenue).toBe(3);
+    expect(result.dailyTrend[0].serviceValue).toBe(2);
+    expect(result.dailyTrend[0].demoRevenue).toBe(2);
+    expect(result.dailyTrend[0].completedPrintValue).toBe(5);
+    expect(result.paymentMethods).toEqual(expect.arrayContaining([
+      { name: 'Service Value', count: 1 },
+      { name: 'cash', count: 1 }
+    ]));
+  });
+
   test('11. Completed Service Value contributes to print value but never to actual collections', async () => {
     mockPrisma.machine.findMany.mockResolvedValue([]);
     mockPrisma.printJob.findMany.mockResolvedValue([
