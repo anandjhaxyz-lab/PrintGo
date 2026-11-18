@@ -164,14 +164,26 @@ const startPrintingProcess = async (shortId, io) => {
         throw new Error(`Durable print queue unavailable for job ${shortId}; no in-memory dispatch was attempted: ${error.message}`);
       }
       console.warn(`Redis queue unavailable (${error.message}), using the development/test in-memory fallback.`);
-      await processJob(shortId);
+      try {
+        await processJob(shortId);
+      } catch (processingError) {
+        // Preserve the existing non-production fallback contract. BullMQ Worker
+        // executions still receive the rethrow from processJob above.
+        console.error(`Development/test in-memory fallback failed for job ${shortId}:`, processingError);
+      }
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
     }
   } else if (isRedisRequired) {
     throw new Error('Durable print queue is not ready; refusing an in-memory physical print dispatch.');
   } else {
-    await processJob(shortId);
+    try {
+      await processJob(shortId);
+    } catch (processingError) {
+      // Keep development/test callers non-throwing on local direct dispatch.
+      // The durable BullMQ Worker path still records thrown processor errors.
+      console.error(`Development/test in-memory fallback failed for job ${shortId}:`, processingError);
+    }
   }
 };
 
