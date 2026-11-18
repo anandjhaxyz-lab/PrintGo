@@ -8,6 +8,11 @@ const ALLOWED_AD_MUTATION_PATTERNS = [
   { method: 'DELETE', regex: /^\/api\/machines\/[^/]+\/ad-suppression$/ }
 ];
 
+const ALLOWED_CASH_MUTATION_PATTERNS = [
+  { method: 'PUT', regex: /^\/api\/machines\/[^/]+\/payment-mode$/ },
+  { method: 'POST', regex: /^\/api\/admin\/jobs\/[^/]+\/confirm-cash$/ }
+];
+
 const getCleanPath = (req) => {
   let target = '';
   if (req.baseUrl && req.path) {
@@ -49,11 +54,28 @@ const isAllowedAdMutation = (req) => {
   );
 };
 
+const isAllowedCashMutation = (req) => {
+  if (process.env.APP_ENV !== 'staging' || process.env.ALLOW_CASH_PAYMENT_MUTATIONS !== 'true') {
+    return false;
+  }
+
+  const method = (req.method || '').toUpperCase();
+  const cleanPath = getCleanPath(req);
+
+  return ALLOWED_CASH_MUTATION_PATTERNS.some(
+    (pattern) => pattern.method === method && pattern.regex.test(cleanPath)
+  );
+};
+
 const readOnlyGuard = (req, res, next) => {
   if (process.env.ADMIN_READ_ONLY === 'true') {
     const mutationMethods = ['POST', 'PUT', 'DELETE', 'PATCH'];
     if (mutationMethods.includes((req.method || '').toUpperCase())) {
       if (isAllowedAdMutation(req)) {
+        return next();
+      }
+
+      if (isAllowedCashMutation(req)) {
         return next();
       }
 
@@ -69,6 +91,8 @@ const readOnlyGuard = (req, res, next) => {
 module.exports = {
   readOnlyGuard,
   isAllowedAdMutation,
+  isAllowedCashMutation,
   getCleanPath,
-  ALLOWED_AD_MUTATION_PATTERNS
+  ALLOWED_AD_MUTATION_PATTERNS,
+  ALLOWED_CASH_MUTATION_PATTERNS
 };

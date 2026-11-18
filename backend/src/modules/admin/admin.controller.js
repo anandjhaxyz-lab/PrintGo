@@ -466,6 +466,14 @@ exports.confirmCashPayment = async (req, res, next) => {
       }
     }
 
+    // Cash-at-Counter payment mode enforcement
+    if (job.paymentMode !== 'CASH_AT_COUNTER') {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot confirm cash payment: Job payment mode is '${job.paymentMode || 'UNSPECIFIED'}'. Cash confirmation is permitted only for CASH_AT_COUNTER jobs.`
+      });
+    }
+
     // Mandatory Correction 2: Server-authoritative cash amount
     // Never trust a customer or frontend-supplied amount for payment confirmation
     const authoritativeAmount = Number(job.cost);
@@ -496,6 +504,14 @@ exports.confirmCashPayment = async (req, res, next) => {
 
       if (!freshJob) {
         throw new AppError('Print job not found during confirmation', 404);
+      }
+
+      // Revalidate payment mode inside transaction before any state mutation
+      if (freshJob.paymentMode !== 'CASH_AT_COUNTER') {
+        throw new AppError(
+          `Cannot confirm cash payment: Job payment mode is '${freshJob.paymentMode || 'UNSPECIFIED'}'. Cash confirmation is permitted only for CASH_AT_COUNTER jobs.`,
+          400
+        );
       }
 
       // If already paid or moved past PENDING_PAYMENT:

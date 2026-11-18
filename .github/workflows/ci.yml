@@ -20,7 +20,7 @@ jobs:
   # 1. BACKEND: Unit Tests, Prisma Migration & PostgreSQL Integration Tests
   # =========================================================================
   backend-test:
-    name: Backend Tests & PostgreSQL Integration (214 Tests)
+    name: Backend Tests & PostgreSQL Integration (302 Tests)
     runs-on: ubuntu-latest
 
     services:
@@ -64,8 +64,8 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
 
-      - name: Run Backend Jest Test Suites (6 Suites, 165 Tests)
-        run: npx jest tests/phase2_printer_qr_services_and_api.test.js tests/printer_status_and_safety.test.js tests/advertisement_repair_and_safety.test.js tests/ad_suppression_phase2.test.js tests/admin_analytics_printer_availability.test.js tests/readOnlyGuard_advertisement_scoping.test.js --forceExit
+      - name: Run Backend Jest Test Suites (8 Suites, 253 Tests)
+        run: npx jest tests/phase2_printer_qr_services_and_api.test.js tests/printer_status_and_safety.test.js tests/advertisement_repair_and_safety.test.js tests/ad_suppression_phase2.test.js tests/admin_analytics_printer_availability.test.js tests/readOnlyGuard_advertisement_scoping.test.js tests/readOnlyGuard_cash_payment_scoping.test.js tests/cash_payment_and_mode_switching.test.js --forceExit
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026

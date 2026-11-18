@@ -192,6 +192,7 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
         shortId: 'job12345',
         cost: 25.00,
         status: 'PENDING_PAYMENT',
+        paymentMode: 'CASH_AT_COUNTER',
         machine: { id: 'mach-1', companyId: 'company-a' }
       });
 
@@ -218,6 +219,113 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
     });
   });
 
+  describe('2b. Cash-at-Counter Payment Mode Enforcement & Race Condition Guard', () => {
+    test.each([
+      { mode: 'CASHFREE_ONLINE', label: 'CASHFREE_ONLINE' },
+      { mode: 'DEMO_SIMULATION', label: 'DEMO_SIMULATION' },
+      { mode: null, label: 'null legacy payment mode' },
+      { mode: undefined, label: 'undefined / missing payment mode' }
+    ])('rejects cash confirmation for job with paymentMode=$label with HTTP 400', async ({ mode }) => {
+      const adminController = require('../src/modules/admin/admin.controller');
+
+      mockPrisma.printJob.findUnique.mockResolvedValue({
+        id: 'job-uuid-1',
+        shortId: 'job12345',
+        cost: 20.00,
+        status: 'PENDING_PAYMENT',
+        paymentMode: mode,
+        machine: { id: 'mach-1', companyId: 'company-a' }
+      });
+
+      const req = {
+        params: { shortId: 'job12345' },
+        body: { amount: 20.00 },
+        user: { id: 'staff-1', role: 'STAFF', companyId: 'company-a', email: 'cashier@printgo.in' },
+        app: { get: () => mockIo }
+      };
+
+      const res = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn()
+      };
+      const next = jest.fn();
+
+      await adminController.confirmCashPayment(req, res, next);
+
+      // Assert HTTP 400 (or existing controller error-handling equivalent)
+      const rejectedWith400 = (res.status.mock.calls.length > 0 && res.status.mock.calls[0][0] === 400) ||
+                             (next.mock.calls.length > 0 && next.mock.calls[0][0]?.statusCode === 400);
+      expect(rejectedWith400).toBe(true);
+
+      if (res.status.mock.calls.length > 0) {
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+          success: false,
+          error: expect.stringContaining('Cash confirmation is permitted only for CASH_AT_COUNTER jobs')
+        }));
+      }
+
+      // Assert no payment record created, no job update, no queue dispatch, no false success
+      expect(mockPrisma.payment.create).not.toHaveBeenCalled();
+      expect(mockPrisma.printJob.update).not.toHaveBeenCalled();
+      expect(mockQueueService.startPrintingProcess).not.toHaveBeenCalled();
+      expect(res.json).not.toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+
+    test('transaction race condition: rejects confirmation when freshJob paymentMode changed to CASHFREE_ONLINE inside transaction', async () => {
+      const adminController = require('../src/modules/admin/admin.controller');
+
+      // 1. Initial job lookup returns CASH_AT_COUNTER
+      const initialJob = {
+        id: 'job-race-1',
+        shortId: 'job_race_123',
+        cost: 25.00,
+        status: 'PENDING_PAYMENT',
+        paymentMode: 'CASH_AT_COUNTER',
+        machine: { id: 'mach-1', companyId: 'company-a' }
+      };
+
+      // 2. Transaction-level fresh lookup returns CASHFREE_ONLINE
+      const freshJobChanged = {
+        id: 'job-race-1',
+        shortId: 'job_race_123',
+        cost: 25.00,
+        status: 'PENDING_PAYMENT',
+        paymentMode: 'CASHFREE_ONLINE',
+        machine: { id: 'mach-1', companyId: 'company-a' }
+      };
+
+      mockPrisma.printJob.findUnique
+        .mockResolvedValueOnce(initialJob) // Initial read
+        .mockResolvedValueOnce(freshJobChanged); // Inside tx
+
+      const req = {
+        params: { shortId: 'job_race_123' },
+        body: { amount: 25.00 },
+        user: { id: 'staff-1', role: 'STAFF', companyId: 'company-a', email: 'cashier@printgo.in' },
+        app: { get: () => mockIo }
+      };
+
+      const res = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn()
+      };
+      const next = jest.fn();
+
+      await adminController.confirmCashPayment(req, res, next);
+
+      // 3. Confirmation must be rejected with HTTP 400 (or controller error-handling equivalent)
+      const rejectedWith400 = (res.status.mock.calls.length > 0 && res.status.mock.calls[0][0] === 400) ||
+                             (next.mock.calls.length > 0 && next.mock.calls[0][0]?.statusCode === 400);
+      expect(rejectedWith400).toBe(true);
+
+      // 4. No payment creation, job update or queue dispatch may occur
+      expect(mockPrisma.payment.create).not.toHaveBeenCalled();
+      expect(mockPrisma.printJob.update).not.toHaveBeenCalled();
+      expect(mockQueueService.startPrintingProcess).not.toHaveBeenCalled();
+      expect(res.json).not.toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+  });
+
   describe('3. Server-Authoritative Amount Validation', () => {
     test('rejects cash confirmation when passed amount does not match authoritative job cost (400)', async () => {
       const adminController = require('../src/modules/admin/admin.controller');
@@ -227,6 +335,7 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
         shortId: 'job12345',
         cost: 30.00,
         status: 'PENDING_PAYMENT',
+        paymentMode: 'CASH_AT_COUNTER',
         machine: { id: 'mach-1', companyId: 'company-a' }
       });
 
@@ -264,6 +373,7 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
         shortId: 'job12345',
         cost: 15.00,
         status: 'PENDING_PAYMENT',
+        paymentMode: 'CASH_AT_COUNTER',
         pricingSnapshot: JSON.stringify({ sessionId: 'sess-abc-123' }),
         machine: { id: 'mach-1', companyId: 'company-a' }
       };
@@ -346,6 +456,7 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
         shortId: 'job12345',
         cost: 15.00,
         status: 'WAITING',
+        paymentMode: 'CASH_AT_COUNTER',
         payment: { id: 'pay-uuid-1', status: 'SUCCESS', paymentMethod: 'cash' },
         machine: { id: 'mach-1', companyId: 'company-a' }
       };
@@ -390,6 +501,7 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
         shortId: 'job67890',
         cost: 20.00,
         status: 'PENDING_PAYMENT',
+        paymentMode: 'CASH_AT_COUNTER',
         machine: { id: 'mach-1', companyId: 'company-a' }
       };
 
