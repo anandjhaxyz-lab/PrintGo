@@ -22,9 +22,18 @@ const initUploadWorker = async () => {
 
   try {
     uploadWorker = new Worker('uploadQueue', async (job) => {
-      const { fileUrl, mimetype } = job.data;
+      const { fileUrl, mimetype, localPath } = job.data;
       try {
-        const pages = await uploadService.getPageCount(fileUrl, mimetype);
+        // Prefer the exact disk path captured by Multer at upload time. The
+        // worker shares the backend process/container filesystem and must not
+        // HTTP-fetch the protected /uploads URL without a customer/agent token.
+        const pages = await uploadService.getPageCount(
+          fileUrl,
+          mimetype,
+          false,
+          1,
+          localPath || null
+        );
         return pages;
       } catch (error) {
         console.error(`Upload worker failed for job ${job.id}:`, error);
