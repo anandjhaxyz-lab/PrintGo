@@ -3,12 +3,50 @@ const fs = require('fs');
 
 const isWin = os.platform() === 'win32';
 
+/**
+ * Classifies printer connection type based on port name.
+ *
+ * Rules:
+ * - USB019 or USB-prefixed port (e.g. USB001, USB019, USB*, usb://...) -> 'USB'
+ * - Verified TCP/IP or WSD network port (e.g. IP_*, 192.168.*, WSD-*, TCP_*, socket://...) -> 'Network'
+ * - Unrecognized port / missing / empty -> 'Unknown'
+ *
+ * @param {string} portName
+ * @returns {'USB' | 'Network' | 'Unknown'}
+ */
+function classifyConnection(portName) {
+  if (!portName || typeof portName !== 'string') return 'Unknown';
+  const port = portName.trim();
+  if (!port) return 'Unknown';
+
+  // 1. USB detection: USB019, USB001, USB*, usb://
+  if (/^USB/i.test(port) || /^usb:\/\//i.test(port)) {
+    return 'USB';
+  }
+
+  // 2. Network detection: Verified TCP/IP, IP, WSD, socket, ipp, http, https
+  if (
+    /^(IP_|TCP_|WSD[-_]|NET_)/i.test(port) ||
+    /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?::\d+)?$/.test(port) ||
+    /:\d+$/.test(port) ||
+    /^(socket|ipp|ipps|http|https|lpd):\/\//i.test(port) ||
+    /\b(tcp|wsd|raw|lpr)\b/i.test(port)
+  ) {
+    return 'Network';
+  }
+
+  // 3. Unrecognized port
+  return 'Unknown';
+}
+
 class SpoolerMonitor {
   constructor({ execFile, printerName, journal }) {
     this.execFile = execFile;
     this.printerName = printerName;
     this.journal = journal;
     this.isCheckingStatus = false;
+    this.portName = 'Unknown';
+    this.connectionType = 'Unknown';
   }
 
   checkPrinterStatus(socket) {
@@ -21,7 +59,7 @@ class SpoolerMonitor {
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `Get-CimInstance -ClassName Win32_Printer -Filter "Name='${this.printerName}'" | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, WorkOffline`
+        `Get-CimInstance -ClassName Win32_Printer -Filter "Name='${this.printerName}'" | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, WorkOffline, PortName`
       ], { timeout: 8000 }, (error, stdout) => {
         this.isCheckingStatus = false;
         if (error) {
@@ -38,40 +76,58 @@ class SpoolerMonitor {
         } else if (stdout.includes('WorkOffline        : True') || stdout.includes('Offline')) { 
           isError = true;
           errorMessage = 'Printer Offline';
-        } else if (stdout.includes('DetectedErrorState : 5') || stdout.includes('Jam')) {
+        } else if (stdout.includes('DetectedErrorState : 5') || stdout.includes('ErrorState: 5') || stdout.includes('Jam')) {
           isError = true;
           errorMessage = 'Paper Jam';
         }
 
-        this.emitStatus(socket, isError, errorMessage);
+        // Extract PortName and classify connection
+        const portMatch = stdout.match(/PortName\s*:\s*([^\r\n]+)/i);
+        const rawPort = portMatch ? portMatch[1].trim() : '';
+        const connectionType = classifyConnection(rawPort);
+        this.portName = rawPort || 'Unknown';
+        this.connectionType = connectionType;
+
+        this.emitStatus(socket, isError, errorMessage, connectionType);
       });
     } else {
       // Linux CUPS
-      this.execFile('lpstat', ['-p', this.printerName], { timeout: 8000 }, (error, stdout) => {
-        this.isCheckingStatus = false;
-        if (error) return; 
-        
-        let isError = false;
-        let errorMessage = '';
-        const output = (stdout || '').toLowerCase();
-        
-        if (output.includes('paused') || output.includes('disabled') || output.includes('offline') || output.includes('unplugged')) {
-          isError = true;
-          errorMessage = 'Printer Offline or Paused';
-        } else if (output.includes('paper out') || output.includes('media empty')) {
-          isError = true;
-          errorMessage = 'Out of Paper';
-        } else if (output.includes('jam')) {
-          isError = true;
-          errorMessage = 'Paper Jam';
+      this.execFile('lpstat', ['-v', this.printerName], { timeout: 8000 }, (vError, vStdout) => {
+        let rawPort = '';
+        if (!vError && vStdout) {
+          const match = vStdout.match(/device for [^:]+:\s*([^\r\n]+)/i);
+          if (match) rawPort = match[1].trim();
         }
+        const connectionType = classifyConnection(rawPort);
+        this.portName = rawPort || 'Unknown';
+        this.connectionType = connectionType;
 
-        this.emitStatus(socket, isError, errorMessage);
+        this.execFile('lpstat', ['-p', this.printerName], { timeout: 8000 }, (error, stdout) => {
+          this.isCheckingStatus = false;
+          if (error) return;
+
+          let isError = false;
+          let errorMessage = '';
+          const output = (stdout || '').toLowerCase();
+
+          if (output.includes('paused') || output.includes('disabled') || output.includes('offline') || output.includes('unplugged')) {
+            isError = true;
+            errorMessage = 'Printer Offline or Paused';
+          } else if (output.includes('paper out') || output.includes('media empty')) {
+            isError = true;
+            errorMessage = 'Out of Paper';
+          } else if (output.includes('jam')) {
+            isError = true;
+            errorMessage = 'Paper Jam';
+          }
+
+          this.emitStatus(socket, isError, errorMessage, connectionType);
+        });
       });
     }
   }
 
-  emitStatus(socket, isError, errorMessage) {
+  emitStatus(socket, isError, errorMessage, connectionType = this.connectionType || 'Unknown') {
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
     const memoryUsage = ((totalMem - freeMem) / totalMem * 100).toFixed(2);
@@ -81,11 +137,14 @@ class SpoolerMonitor {
       isError,
       errorMessage,
       printerName: this.printerName,
+      connectionType,
       telemetry: {
         memoryUsage: `${memoryUsage}%`,
         uptime: `${uptime}s`,
         platform: os.platform(),
-        arch: os.arch()
+        arch: os.arch(),
+        connectionType,
+        portName: this.portName !== 'Unknown' ? this.portName : undefined
       },
       timestamp: new Date().toISOString()
     });
@@ -234,5 +293,7 @@ class SpoolerMonitor {
     return pollSpooler;
   }
 }
+
+SpoolerMonitor.classifyConnection = classifyConnection;
 
 module.exports = SpoolerMonitor;

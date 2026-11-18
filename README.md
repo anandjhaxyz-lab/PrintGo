@@ -96,9 +96,18 @@ npm run dev
 ### 3. Printer Agent (Windows Only)
 ```bash
 cd printer-agent
+# 1. Install dependencies
 npm install
+
 # Configure .env with BACKEND_URL, PRINTER_NAME, and MACHINE_KEY
+
+# 2. Run dedicated first-time provisioning once
+provision_agent.bat
+
+# 3. Verify marker and journal created in data/
+# 4. Start agent normally with PM2 (or npm start for local testing)
 npm start
+# In production, use PM2: pm2 start index.js --name "PrintGo_Agent"
 ```
 
 ---

@@ -15,6 +15,10 @@ router.get('/agent-version', protectMachine, machinesController.getAgentVersion)
 
 router.get('/:id/public-key', machinesController.getPublicKey);
 
+// Machine Payment Mode Configuration (Cash at Counter / Demo Simulation / Cashfree Online)
+router.get('/:id/payment-mode', protect, restrictTo('SUPERADMIN', 'FRANCHISEE', 'STAFF'), machinesController.getPaymentMode);
+router.put('/:id/payment-mode', protect, restrictTo('SUPERADMIN', 'FRANCHISEE'), readOnlyGuard, machinesController.updatePaymentMode);
+
 // Machine Advertisement Suppression (Silence Ads)
 router.post('/:id/ad-suppression', protect, restrictTo('SUPERADMIN', 'FRANCHISEE'), readOnlyGuard, machinesController.setAdSuppression);
 router.delete('/:id/ad-suppression', protect, restrictTo('SUPERADMIN', 'FRANCHISEE'), readOnlyGuard, machinesController.cancelAdSuppression);

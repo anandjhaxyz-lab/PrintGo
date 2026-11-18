@@ -242,6 +242,14 @@ const validateCashfreeConfig = () => {
 };
 
 /**
+ * Checks whether merchant KYC approval and gateway readiness have been explicitly verified.
+ * Syntactic credentials alone do not imply active gateway settlement status.
+ */
+const isCashfreeKycApproved = () => {
+  return process.env.CASHFREE_KYC_VERIFIED === 'true' || process.env.CASHFREE_MERCHANT_KYC_APPROVED === 'true';
+};
+
+/**
  * Returns Cashfree HTTP headers and base URL.
  */
 const getCashfreeConfig = () => {
@@ -301,6 +309,7 @@ const redactSensitiveData = (data) => {
 module.exports = {
   resolveCashfreeEnv,
   validateCashfreeConfig,
+  isCashfreeKycApproved,
   getCashfreeConfig,
   getPublicAppUrl,
   getAllowedReturnOrigins,

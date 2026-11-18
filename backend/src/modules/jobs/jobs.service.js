@@ -114,6 +114,26 @@ const createJob = async (jobData) => {
     pricingSnapshot.sessionId = jobData.sessionId;
   }
 
+  // Mandatory Correction 1: Session-level payment mode snapshot
+  // Copy paymentMode from that session, NOT from machine's latest setting
+  let resolvedPaymentMode = jobData.paymentMode;
+  if (!resolvedPaymentMode && jobData.sessionId) {
+    const sessionRecord = await prisma.session.findUnique({
+      where: { code: jobData.sessionId },
+      select: { paymentMode: true }
+    });
+    resolvedPaymentMode = sessionRecord?.paymentMode;
+  }
+  if (!resolvedPaymentMode && machineId) {
+    const machineRecord = await prisma.machine.findUnique({
+      where: { id: machineId },
+      select: { paymentMode: true }
+    });
+    resolvedPaymentMode = machineRecord?.paymentMode;
+  }
+  const finalPaymentMode = resolvedPaymentMode || 'CASH_AT_COUNTER';
+  pricingSnapshot.paymentMode = finalPaymentMode;
+
   // Create job
   const newJob = await prisma.printJob.create({
     data: {
@@ -121,6 +141,7 @@ const createJob = async (jobData) => {
       machineId: machineId || null,
       documentId: document.id,
       cost,
+      paymentMode: finalPaymentMode,
       color: settings.color,
       duplex: settings.duplex,
       copies: settings.copies,

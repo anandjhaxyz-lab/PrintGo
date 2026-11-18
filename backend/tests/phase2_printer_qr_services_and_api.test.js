@@ -25,10 +25,54 @@ const mockMachines = new Map();
 const mockPrinterQrs = new Map();
 const mockSessions = new Map();
 
-if (fs.existsSync(credsPath)) {
+function validateDatabaseUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') {
+    throw new Error('FATAL SAFETY VIOLATION: DATABASE_URL is not set or empty! Aborting immediately.');
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(urlStr);
+  } catch (err) {
+    throw new Error(`FATAL SAFETY VIOLATION: Malformed DATABASE_URL: ${err.message}`);
+  }
+
+  // 1. Protocol: must be postgresql:
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
+    throw new Error(`FATAL SAFETY VIOLATION: Protocol '${parsed.protocol}' is invalid. Must be postgresql:`);
+  }
+
+  // 2. Host: strictly localhost or 127.0.0.1
+  if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+    throw new Error(`FATAL SAFETY VIOLATION: Database host '${parsed.hostname}' is not localhost or 127.0.0.1! Remote, Render, Staging and Production databases are strictly prohibited.`);
+  }
+
+  // 3. Database: strictly printgo_disposable_target
+  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (dbName !== 'printgo_disposable_target') {
+    throw new Error(`FATAL SAFETY VIOLATION: Database '${dbName}' is not printgo_disposable_target! Aborting immediately.`);
+  }
+
+  // 4. Port: 5433 for local testing, 5432 only for GitHub Actions
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+  const actualPort = parsed.port ? Number(parsed.port) : 5432;
+  if (actualPort !== expectedPort) {
+    throw new Error(`FATAL SAFETY VIOLATION: Database port is ${actualPort}, must be ${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting immediately.`);
+  }
+
+  return true;
+}
+
+if (process.env.DATABASE_URL) {
+  validateDatabaseUrl(process.env.DATABASE_URL);
+  const { PrismaClient } = require('@prisma/client');
+  prisma = new PrismaClient();
+} else if (fs.existsSync(credsPath)) {
   const creds = fs.readFileSync(credsPath, 'utf8');
   const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
   const targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+  validateDatabaseUrl(targetUrl);
   process.env.DATABASE_URL = targetUrl;
   const { PrismaClient } = require('@prisma/client');
   prisma = new PrismaClient({ datasources: { db: { url: targetUrl } } });
@@ -39,9 +83,10 @@ if (fs.existsSync(credsPath)) {
     $isMock: true,
     $queryRawUnsafe: async (sql, ...params) => {
       if (sql.includes('current_database()')) {
+        const isCi = process.env.GITHUB_ACTIONS === 'true';
         return [{
           current_database: 'printgo_disposable_target',
-          inet_server_port: 5433,
+          inet_server_port: isCi ? 5432 : 5433,
           version: 'PostgreSQL 17.4 (Mocked In-Memory Isolated Target)'
         }];
       }
@@ -338,6 +383,13 @@ if (fs.existsSync(credsPath)) {
       findUnique: async () => null,
     },
 
+    printerStatus: {
+      deleteMany: async () => ({ count: 0 }),
+      create: async ({ data }) => ({ id: crypto.randomUUID(), ...data }),
+      findFirst: async () => null,
+      findMany: async () => []
+    },
+
     session: {
       create: async ({ data }) => {
         const session = {
@@ -349,6 +401,22 @@ if (fs.existsSync(credsPath)) {
         mockSessions.set(session.code, session);
         mockSessions.set(session.id, session);
         return { ...session };
+      },
+      upsert: async ({ where, update, create }) => {
+        let session = null;
+        for (const s of mockSessions.values()) {
+          if (where?.id && s.id === where.id) { session = s; break; }
+          if (where?.code && s.code === where.code) { session = s; break; }
+        }
+        if (session) {
+          Object.assign(session, update, { updatedAt: new Date() });
+          return { ...session };
+        } else {
+          const created = { id: crypto.randomUUID(), ...create, createdAt: new Date(), updatedAt: new Date() };
+          if (created.code) mockSessions.set(created.code, created);
+          if (created.id) mockSessions.set(created.id, created);
+          return { ...created };
+        }
       },
       findUnique: async ({ where }) => {
         for (const s of mockSessions.values()) {
@@ -430,11 +498,21 @@ async function setupDatabase() {
   const dbName = meta[0].current_database;
   const dbPort = meta[0].inet_server_port;
 
+  if (process.env.DATABASE_URL) {
+    const parsed = new URL(process.env.DATABASE_URL);
+    if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      throw new Error(`FATAL SAFETY VIOLATION: Database host '${parsed.hostname}' is not localhost or 127.0.0.1! Aborting immediately.`);
+    }
+  }
+
   if (dbName !== 'printgo_disposable_target') {
     throw new Error('FATAL SAFETY VIOLATION: Database is not printgo_disposable_target! Aborting immediately.');
   }
-  if (dbPort !== 5433) {
-    throw new Error('FATAL SAFETY VIOLATION: Port is not 5433! Aborting immediately.');
+
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+  if (Number(dbPort) !== expectedPort) {
+    throw new Error(`FATAL SAFETY VIOLATION: Port is not ${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting immediately.`);
   }
 
   companyA = await prisma.company.upsert({
@@ -455,14 +533,27 @@ async function setupDatabase() {
 
   machineA = await prisma.machine.upsert({
     where: { machineKey: 'test_machine_key_phase2_a' },
-    update: { companyId: companyA.id, status: 'ACTIVE' },
+    update: { companyId: companyA.id, status: 'ACTIVE', lastOnline: new Date() },
     create: {
       name: 'Printer Alpha Active',
       location: 'Counter 1',
       machineKey: 'test_machine_key_phase2_a',
       status: 'ACTIVE',
+      lastOnline: new Date(),
       printerModel: 'Canon G3010',
       companyId: companyA.id
+    }
+  });
+
+  await prisma.printerStatus.deleteMany({ where: { machineId: machineA.id } });
+  await prisma.printerStatus.create({
+    data: {
+      machineId: machineA.id,
+      isOnline: true,
+      paperStatus: 'OK',
+      tonerStatus: 'OK',
+      jamStatus: false,
+      timestamp: new Date()
     }
   });
 
@@ -535,6 +626,32 @@ async function setupDatabase() {
         timestamp: new Date()
       }
     ]
+  });
+
+  await prisma.machine.upsert({
+    where: { id: legacyMachineId },
+    update: { status: 'ACTIVE', lastOnline: new Date(), companyId: companyA.id },
+    create: {
+      id: legacyMachineId,
+      name: 'Epson L6460 Counter Printer',
+      location: 'Counter 1',
+      machineKey: 'legacy_epson_demo_key',
+      printerModel: 'EPSON L6460 Series',
+      status: 'ACTIVE',
+      lastOnline: new Date(),
+      companyId: companyA.id
+    }
+  });
+
+  await prisma.session.upsert({
+    where: { code: 'EPSON-DEMO-01' },
+    update: { machineId: legacyMachineId, status: 'WAITING_FOR_MOBILE', expiresAt: new Date(Date.now() + 3600000) },
+    create: {
+      code: 'EPSON-DEMO-01',
+      machineId: legacyMachineId,
+      status: 'WAITING_FOR_MOBILE',
+      expiresAt: new Date(Date.now() + 3600000)
+    }
   });
 
   const demoSession = {
@@ -901,11 +1018,11 @@ if (typeof describe === 'function' && typeof it === 'function') {
   describe('PRINTGO — PHASE 2 PERMANENT PRINTER QR TEST SUITE', () => {
     beforeAll(async () => {
       await setupDatabase();
-    });
+    }, 30000);
 
     afterAll(async () => {
       await cleanupDatabase();
-    });
+    }, 30000);
 
     describe('GROUP A: TOKEN SECURITY & PUBLIC URL VALIDATION', () => {
       it('A1: Token format and cryptographic entropy', async () => {

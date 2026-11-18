@@ -141,6 +141,11 @@ const createOrder = async (jobId, options = {}) => {
     throw new AppError(`Job cannot be paid. Current status: ${job.status}`, 400);
   }
 
+  // Cash at counter guard: online checkout is not allowed for cash orders
+  if (job.paymentMode === 'CASH_AT_COUNTER') {
+    throw new AppError('Job is configured for Cash at Counter payment. Online checkout is not enabled.', 400);
+  }
+
   // Authoritative Hardware Availability Guard: Never accept payment for an unserviceable job
   if (!job.machineId || !job.machine) {
     throw new AppError('Job is not assigned to a registered printer', 400);

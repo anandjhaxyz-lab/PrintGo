@@ -1,52 +1,154 @@
-name: PrintGo CI
+name: PrintGo CI & Quality Gate
 
 on:
   push:
-    branches: [ "main", "develop" ]
+    branches:
+      - main
+      - master
+      - develop
+      - feature/printgo-production-readiness
+      - work/printgo-selective-ads-20261117
   pull_request:
-    branches: [ "main", "develop" ]
+    branches:
+      - main
+      - master
+      - develop
+      - feature/printgo-production-readiness
 
 jobs:
-  build-and-test:
+  # =========================================================================
+  # 1. BACKEND: Unit Tests, Prisma Migration & PostgreSQL Integration Tests
+  # =========================================================================
+  backend-test:
+    name: Backend Tests & PostgreSQL Integration (214 Tests)
     runs-on: ubuntu-latest
-    
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: printgo_disposable_target
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     defaults:
       run:
         working-directory: ./backend
 
     steps:
-    - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Use Node.js 20.x
-      uses: actions/setup-node@v3
-      with:
-        node-version: 20.x
-        cache: 'npm'
-        cache-dependency-path: backend/package-lock.json
+      - name: Setup Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
 
-    - name: Install dependencies
-      run: npm install
+      - name: Install backend dependencies
+        run: npm ci
 
-    - name: Generate Prisma Client
-      run: npx prisma generate
+      - name: Generate Prisma Client
+        run: npx prisma generate
 
-    - name: Run Tests
-      run: npm test
-      env:
-        JWT_SECRET: test_secret
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_test?schema=public
-
-    services:
-      postgres:
-        image: postgres:15
+      - name: Deploy Prisma Schema to Disposable PostgreSQL
+        run: npx prisma migrate deploy
         env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: printgo_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+
+      - name: Run Backend Jest Test Suites (6 Suites, 165 Tests)
+        run: npx jest tests/phase2_printer_qr_services_and_api.test.js tests/printer_status_and_safety.test.js tests/advertisement_repair_and_safety.test.js tests/ad_suppression_phase2.test.js tests/admin_analytics_printer_availability.test.js tests/readOnlyGuard_advertisement_scoping.test.js --forceExit
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+
+      - name: Run Phase 3T Supervised Demo Payment Access Lock Suite (12 Tests)
+        run: node tests/phase3t_demo_access_lock.test.js
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
+          APP_ENV: staging
+          ENABLE_DEMO_PAYMENT: "true"
+          RENDER: "true"
+          RENDER_SERVICE_ID: "srv-ci-mock-backend"
+          RENDER_SERVICE_NAME: "printgo-backend-staging"
+          RENDER_GIT_BRANCH: "feature/printgo-production-readiness"
+          DEMO_PAYMENT_ACCESS_CODE: "super_secret_staging_access_code_2026"
+
+      - name: Run Phase 3 Admin Dashboard QR Integration Suite (10 Tests)
+        run: node tests/phase3_admin_dashboard_qr_integration.test.js
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+          JWT_SECRET: test_jwt_secret_ci_2026
+
+      - name: Run Phase 1 & 2 Payment Readiness Integration Suite (9 Tests)
+        run: node tests/phase1_and_2_payment_readiness.test.js
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+          JWT_SECRET: test_jwt_secret_ci_2026
+          APP_ENV: staging
+          ENABLE_DEMO_PAYMENT: "true"
+          RENDER: "true"
+          RENDER_SERVICE_ID: "srv-ci-mock-backend"
+          RENDER_SERVICE_NAME: "printgo-backend-staging"
+          RENDER_GIT_BRANCH: "feature/printgo-production-readiness"
+          DEMO_PAYMENT_ACCESS_CODE: "phase4_test_access_code_2026"
+
+      - name: Run Phase 4 Customer Mobile QR Flow Integration Suite (18 Tests)
+        run: node tests/phase4_customer_mobile_qr_flow.test.js
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+          JWT_SECRET: test_jwt_secret_ci_2026
+          APP_ENV: staging
+          ENABLE_DEMO_PAYMENT: "true"
+          RENDER: "true"
+          RENDER_SERVICE_ID: "srv-ci-mock-backend"
+          RENDER_SERVICE_NAME: "printgo-backend-staging"
+          RENDER_GIT_BRANCH: "feature/printgo-production-readiness"
+          DEMO_PAYMENT_ACCESS_CODE: "phase4_test_access_code_2026"
+
+  # =========================================================================
+  # 2. FRONTEND: Vitest Unit Tests & Vite Production Build (38 Tests + 1 Build)
+  # =========================================================================
+  frontend-test:
+    name: Frontend Tests & Production Build (38 Tests + Build)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run Frontend Vitest Suites (38 Tests)
+        run: npm test
+
+      - name: Validate Frontend Production Build
+        run: npm run build
+        env:
+          VITE_API_URL: "https://printgo-backend-staging.onrender.com"
+          VITE_APP_MODE: "kiosk"

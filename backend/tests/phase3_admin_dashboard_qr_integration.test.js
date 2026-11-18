@@ -17,11 +17,61 @@
 const path = require('path');
 const fs = require('fs');
 
-// Read credentials and set DATABASE_URL strictly to printgo_disposable_target
+// Read credentials or environment and set DATABASE_URL strictly to disposable target
 const credsPath = path.resolve(__dirname, '../../.pg_credentials.local');
-const creds = fs.readFileSync(credsPath, 'utf8');
-const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
-const targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+let targetUrl = process.env.DATABASE_URL;
+
+if (!targetUrl && fs.existsSync(credsPath)) {
+  const creds = fs.readFileSync(credsPath, 'utf8');
+  const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
+  targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+}
+
+function validateDatabaseUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') {
+    throw new Error('FATAL SAFETY VIOLATION: DATABASE_URL is not set or empty! Aborting immediately.');
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(urlStr);
+  } catch (err) {
+    throw new Error(`FATAL SAFETY VIOLATION: Malformed DATABASE_URL: ${err.message}`);
+  }
+
+  // 1. Protocol: must be postgresql:
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
+    throw new Error(`FATAL SAFETY VIOLATION: Protocol '${parsed.protocol}' is invalid. Must be postgresql:`);
+  }
+
+  // 2. Host: strictly localhost or 127.0.0.1
+  if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+    throw new Error(`FATAL SAFETY VIOLATION: Database host '${parsed.hostname}' is not localhost or 127.0.0.1! Remote, Render, Staging and Production databases are strictly prohibited.`);
+  }
+
+  // 3. Database: strictly printgo_disposable_target
+  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (dbName !== 'printgo_disposable_target') {
+    throw new Error(`FATAL SAFETY VIOLATION: Database '${dbName}' is not printgo_disposable_target! Aborting immediately.`);
+  }
+
+  // 4. Port: 5433 for local testing, 5432 only for GitHub Actions
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+  const actualPort = parsed.port ? Number(parsed.port) : 5432;
+  if (actualPort !== expectedPort) {
+    throw new Error(`FATAL SAFETY VIOLATION: Database port is ${actualPort}, must be ${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting immediately.`);
+  }
+
+  return true;
+}
+
+if (!targetUrl) {
+  throw new Error('DATABASE_URL or .pg_credentials.local is required to run phase3_admin_dashboard_qr_integration test suite');
+}
+
+// Validate DATABASE_URL BEFORE constructing PrismaClient or issuing any query
+validateDatabaseUrl(targetUrl);
 
 process.env.DATABASE_URL = targetUrl;
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_phase3_dashboard_integration';
@@ -53,7 +103,10 @@ const test = async (name, fn) => {
 async function runTestSuite() {
   console.log('======================================================================');
   console.log('PRINTGO — PHASE 3 ADMIN DASHBOARD BACKEND INTEGRATION TEST SUITE');
-  console.log('Target: printgo_disposable_target on port 5433 (PostgreSQL 17.4)');
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+
+  console.log(`Target: printgo_disposable_target on port ${expectedPort} (GITHUB_ACTIONS=${isCi})`);
   console.log('======================================================================\n');
 
   // Pre-flight database check
@@ -61,9 +114,17 @@ async function runTestSuite() {
   const dbName = meta[0].current_database;
   const dbPort = meta[0].inet_server_port;
 
+  if (targetUrl) {
+    const parsed = new URL(targetUrl);
+    if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      console.error(`FATAL SAFETY VIOLATION: Database host '${parsed.hostname}' is not localhost or 127.0.0.1! Aborting.`);
+      process.exit(1);
+    }
+  }
+
   console.log(`Pre-flight Database Check: ${dbName} on port ${dbPort}`);
-  if (dbName !== 'printgo_disposable_target' || Number(dbPort) !== 5433) {
-    console.error('FATAL SAFETY VIOLATION: Database is NOT printgo_disposable_target:5433! Aborting.');
+  if (dbName !== 'printgo_disposable_target' || Number(dbPort) !== expectedPort) {
+    console.error(`FATAL SAFETY VIOLATION: Database is NOT printgo_disposable_target:${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting.`);
     process.exit(1);
   }
   console.log('Pre-flight Safety Check PASSED: Strictly isolated to printgo_disposable_target.\n');

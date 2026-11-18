@@ -154,21 +154,73 @@ socket.on('ack_job_completed', ({ jobId }) => {
   journal.recordAcknowledged(jobId);
 });
 
-socket.on('reconcile_active_jobs', ({ jobIds = [] }) => {
-  console.log(`🔍 Received reconciliation request from backend for jobs:`, jobIds);
+socket.on('reconcile_active_jobs', ({ requestId, jobIds = [] }) => {
+  console.log(`🔍 Received reconciliation request [ReqID: ${requestId || 'legacy'}] from backend for jobs:`, jobIds);
+
+  // FAIL-CLOSED GUARD: Corrupted, unreadable, or version-mismatched journal
+  if (journal.isCorrupted) {
+    console.error(`🔥 FAIL-CLOSED GUARD: Local journal is corrupted/unreadable (${journal.corruptionReason}). Refusing to report NOT_DISPATCHED!`);
+    for (const jobId of jobIds) {
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: `Local journal corrupted/unreadable: ${journal.corruptionReason}. Manual verification required.`,
+        wasSeenInQueue: false
+      });
+    }
+    return;
+  }
+
   for (const jobId of jobIds) {
     const entry = journal.getJob(jobId);
-    if (entry && journal.isDispatched(jobId)) {
-      console.log(`📡 Reporting existing dispatch evidence for Job ${jobId} (state: ${entry.state})`);
+    if (!entry) {
+      // Proved never recorded in local journal
+      console.log(`📡 Job ${jobId} was never recorded in local journal.`);
+      socket.emit('job_reconciliation_report', { requestId, jobId, status: 'NOT_DISPATCHED' });
+    } else if (journal.isCorruptedEntry(entry)) {
+      // Incomplete or malformed journal entry -> Fail closed as AMBIGUOUS
+      console.warn(`⚠️ Incomplete/corrupted journal entry for Job ${jobId}. Reporting AMBIGUOUS.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Incomplete or malformed journal entry (missing required state)',
+        wasSeenInQueue: false
+      });
+    } else if (entry.state === 'RECEIVED') {
+      // Proved never dispatched to driver/spooler: safe to request re-dispatch
+      console.log(`📡 Job ${jobId} was received but never dispatched to spooler locally.`);
+      socket.emit('job_reconciliation_report', { requestId, jobId, status: 'NOT_DISPATCHED' });
+    } else if (entry.state === 'DISPATCH_INTENT') {
+      // Crash boundary: recorded intent to call driver, but spooler handoff unconfirmed.
+      // Physical outcome unknown. Must classify as AMBIGUOUS to prevent duplicate physical print.
+      console.warn(`⚠️ AMBIGUOUS DISPATCH: Job ${jobId} crashed during dispatch intent window. Reporting ambiguous.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Agent crashed during driver dispatch intent window (unconfirmed spooler handoff)',
+        wasSeenInQueue: false
+      });
+    } else if (['COMPLETED_LOCALLY', 'ACKNOWLEDGED'].includes(entry.state)) {
+      // Proved completed
+      console.log(`📡 Reporting existing completion evidence for Job ${jobId} (state: ${entry.state})`);
       socket.emit('print_physical_success', {
         jobId,
+        requestId,
         reconciled: true,
-        dispatchedAt: entry.dispatchedAt,
+        dispatchedAt: entry.dispatchedAt || entry.dispatchIntentAt,
         completedAt: entry.completedAt
       });
+    } else if (['SPOOLER_ACCEPTED', 'DISPATCHED_TO_SPOOLER', 'SPOOLING'].includes(entry.state)) {
+      // Spooler accepted before crash, but queue clearance was unverified prior to restart
+      console.log(`📡 Job ${jobId} was accepted by spooler prior to crash. Reporting ambiguous.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Spooler accepted job before agent restart; physical clearance unverified',
+        wasSeenInQueue: true
+      });
     } else {
-      console.log(`📡 Job ${jobId} was never dispatched locally.`);
-      socket.emit('job_reconciliation_report', { jobId, status: 'NOT_DISPATCHED' });
+      socket.emit('job_reconciliation_report', { requestId, jobId, status: entry.state });
     }
   }
 });
@@ -321,8 +373,9 @@ socket.on('physical_print_job', async (jobData) => {
         }
         
         console.log(`⚙️  Windows Print options:`, JSON.stringify(printOptions));
-        journal.recordDispatched(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
+        journal.recordDispatchIntent(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
         await ptp.print(printFilePath, printOptions);
+        journal.recordSpoolerAccepted(jobData.jobId);
       } else {
         // Linux CUPS Support (Raspberry Pi)
         const args = ['-d', PRINTER_NAME, '-t', jobData.jobId];
@@ -343,8 +396,9 @@ socket.on('physical_print_job', async (jobData) => {
         args.push(printFilePath);
         
         console.log(`⚙️  Linux Print command: lp ${args.join(' ')}`);
-        
+        journal.recordDispatchIntent(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
         await execFileAsync('lp', args);
+        journal.recordSpoolerAccepted(jobData.jobId);
       }
       
       console.log(`🖨️  SUCCESS: Job ${jobData.jobId} sent to Print Spooler!`);
@@ -356,6 +410,8 @@ socket.on('physical_print_job', async (jobData) => {
       spoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket);
     } else {
       // Simulation mode bypass (No physical printer)
+      journal.recordDispatchIntent(jobData.jobId, { mode: 'simulation' });
+      journal.recordSpoolerAccepted(jobData.jobId, { mode: 'simulation' });
       spoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket);
     }
 

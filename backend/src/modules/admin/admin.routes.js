@@ -30,6 +30,8 @@ router.get('/reports/:type/export', restrictTo('SUPERADMIN', 'FRANCHISEE'), admi
 // ==============================================
 // PRINT JOB DISPATCH & RECONCILIATION
 // ==============================================
+router.post('/jobs/:shortId/confirm-cash', restrictTo('SUPERADMIN', 'FRANCHISEE', 'STAFF'), adminController.confirmCashPayment);
+
 router.post('/dispatch-job', restrictTo('SUPERADMIN'), async (req, res, next) => {
   try {
     const { shortId } = req.body;

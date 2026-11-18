@@ -73,6 +73,8 @@ model Machine {
   status String @default("INACTIVE")
   healthStatus    String         @default("UNKNOWN") // ONLINE, OFFLINE, PAPER_OUT, ERROR
   printerModel    String?
+  connectionType  String?
+  paymentMode     String?        // CASH_AT_COUNTER, DEMO_SIMULATION, CASHFREE_ONLINE (null indicates legacy/unconfigured)
   softwareVersion String?
   publicKey       String?        @db.Text
   lastOnline      DateTime?
@@ -145,6 +147,7 @@ model Session {
   // Optional link to the permanent physical QR that spawned this session
   printerQrId String?
   printerQr   PrinterQr? @relation(fields: [printerQrId], references: [id], onDelete: SetNull)
+  paymentMode String?    // CASH_AT_COUNTER, DEMO_SIMULATION, CASHFREE_ONLINE (null indicates legacy session)
   
   expiresAt   DateTime   // Session expiration time (60 mins TTL)
   
@@ -213,6 +216,8 @@ model Payment {
   paymentGroup     String?       // upi, credit_card, etc.
   paidAt           DateTime?
   type             String
+  confirmedBy      String?       // Admin / Operator user ID or email for cash confirmation
+  confirmedAt      DateTime?     // Cash confirmation timestamp
 
   transactions     Transaction[]
   refunds          Refund[]
@@ -329,6 +334,7 @@ model PrintJob {
   document      Document      @relation(fields: [documentId], references: [id], onDelete: Restrict)
   paymentId     String?
   payment       Payment?      @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  paymentMode   String?       // CASH_AT_COUNTER, DEMO_SIMULATION, CASHFREE_ONLINE (captured from session; null for legacy)
   
   // Settings
   color         String        @default("bw") // bw, color
@@ -384,6 +390,7 @@ model PrinterStatus {
   paperStatus  String   @default("OK") // OK, LOW, OUT
   tonerStatus  String   @default("OK") // OK, LOW, EMPTY
   jamStatus    Boolean  @default(false)
+  connectionType String?
   timestamp    DateTime @default(now())
 
   createdAt DateTime @default(now())

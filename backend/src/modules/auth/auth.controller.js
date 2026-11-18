@@ -254,15 +254,27 @@ const getPublicPricing = async (req, res, next) => {
       }
     }
 
+    let resolvedPaymentMode = 'CASHFREE_ONLINE';
+    if (resolvedMachineId) {
+      const machine = await prisma.machine.findUnique({
+        where: { id: resolvedMachineId },
+        select: { paymentMode: true }
+      });
+      if (machine?.paymentMode) {
+        resolvedPaymentMode = machine.paymentMode;
+      }
+    }
+
     const rawProfile = await getPricingProfile(resolvedMachineId);
     const pricingProfile = serializePublicPricingProfile(rawProfile);
     const { env: cashfreeEnv } = resolveCashfreeEnv();
 
     res.status(200).json({
       success: true,
+      paymentMode: resolvedPaymentMode,
       cashfreeEnv: cashfreeEnv || 'sandbox',
       pricingProfile,
-      enableDemoPayment: isDemoPaymentPermitted()
+      enableDemoPayment: resolvedPaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted()
     });
   } catch (error) {
     next(error);

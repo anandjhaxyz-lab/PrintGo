@@ -37,14 +37,24 @@ const processJob = async (shortId) => {
       return;
     }
 
-    if (dbJob.status === 'WAITING') {
-      const updatedJob = await prisma.printJob.update({
-        where: { shortId },
-        data: { status: 'PRINTING' },
-        include: { document: true }
-      });
-      
-      if (globalIo) {
+    // Atomic test-and-set: guarantee exactly-once transition from WAITING to PRINTING
+    // Ensures concurrent dispatches, interruptions, and admin retries cannot duplicate physical prints
+    const updateResult = await prisma.printJob.updateMany({
+      where: { shortId, status: 'WAITING' },
+      data: { status: 'PRINTING' }
+    });
+
+    if (updateResult.count === 0) {
+      console.warn(`Job ${shortId}: cannot claim WAITING lock (job is already printing or processed), skipping physical print dispatch`);
+      return;
+    }
+
+    const updatedJob = await prisma.printJob.findUnique({
+      where: { shortId },
+      include: { document: true }
+    });
+
+    if (globalIo) {
         // Emit status change to machine room + admins only
         // Emit status change is now handled universally by Prisma $extends
         
@@ -77,7 +87,6 @@ const processJob = async (shortId) => {
       console.log(`Job ${shortId} is now PRINTING. Waiting for agent feedback...`);
       // The physical printer agent will now respond with 'print_spooler_success' or 'print_spooler_error'
       // which will be handled in socket.js to mark the job as COMPLETED or FAILED.
-    }
   } catch(e) {
     console.error(`Error processing job ${shortId}:`, e);
   }
@@ -105,7 +114,7 @@ const initWorker = (io) => {
 };
 
 const startPrintingProcess = async (shortId, io) => {
-  if (!globalIo && io) globalIo = io;
+  if (io) globalIo = io;
   
   if (useRedis && printQueue) {
     try {
@@ -120,11 +129,11 @@ const startPrintingProcess = async (shortId, io) => {
       ]);
     } catch(e) {
       console.warn(`Redis queue unavailable (${e.message}), executing print job in-memory fallback.`);
-      processJob(shortId);
+      await processJob(shortId);
     }
   } else {
-    // In-memory fallback: just process asynchronously
-    processJob(shortId);
+    // In-memory fallback: process and await dispatch completion
+    await processJob(shortId);
   }
 };
 
