@@ -554,7 +554,7 @@ const demoPayment = async (req, res, next) => {
           status: 'WAITING',
           paymentId: newPayment.id
         },
-        include: { document: true, machine: true }
+        include: { document: true, machine: true, payment: true }
       });
 
       if (tx.transaction && typeof tx.transaction.create === 'function') {
