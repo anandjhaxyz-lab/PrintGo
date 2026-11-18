@@ -29,7 +29,7 @@ const normalizePaymentMethodLabel = (payment) => {
   const toToken = (value) => String(value || '')
     .trim()
     .toLowerCase()
-    .replace(/[\\s_-]+/g, '');
+    .replace(/[\s_-]+/g, '');
 
   const fromValue = (value) => {
     if (typeof value !== 'string' || !value.trim()) return null;
@@ -55,7 +55,7 @@ const normalizePaymentMethodLabel = (payment) => {
     // Humanize safe enum-like identifiers; never surface raw JSON or metadata.
     return value.trim()
       .replace(/[_-]+/g, ' ')
-      .replace(/\\b\\w/g, (letter) => letter.toUpperCase());
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
   };
 
   return fromValue(payment?.paymentGroup) ||
