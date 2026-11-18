@@ -259,28 +259,47 @@ app.get('/api/ready', async (req, res) => {
   }
 
   const redisStatus = getRedisHealth();
-  checks.redis = redisStatus.ready ? 'ready' : 'not_ready';
+  const redisRequired =
+    process.env.NODE_ENV === 'production' ||
+    process.env.QUEUE_REDIS_REQUIRED === 'true';
+  const queueInfrastructureRequired = redisRequired || redisStatus.configured;
+
+  checks.redis = redisStatus.configured
+    ? (redisStatus.ready ? 'ready' : 'not_ready')
+    : (redisRequired ? 'not_ready' : 'not_required');
 
   const printQueueStatus = queueService.getQueueHealth();
-  checks.printQueue = printQueueStatus.ready ? 'ready' : 'not_ready';
+  checks.printQueue = queueInfrastructureRequired
+    ? (printQueueStatus.ready ? 'ready' : 'not_ready')
+    : 'not_required';
 
   const uploadWorkerStatus = uploadWorkerService.getUploadWorkerHealth();
-  checks.uploadWorker = uploadWorkerStatus.ready ? 'ready' : 'not_ready';
+  checks.uploadWorker = queueInfrastructureRequired
+    ? (uploadWorkerStatus.ready ? 'ready' : 'not_ready')
+    : 'not_required';
 
   const uploadQueueStatus = uploadQueueController.getUploadQueueHealth();
-  checks.uploadQueueEvents = uploadQueueStatus.ready ? 'ready' : 'not_ready';
+  checks.uploadQueueEvents = queueInfrastructureRequired
+    ? (uploadQueueStatus.ready ? 'ready' : 'not_ready')
+    : 'not_required';
 
   const adapterEnabled = process.env.ENABLE_REDIS_ADAPTER === 'true';
   checks.socketIoRedisAdapter = adapterEnabled
     ? (redisAdapterReady ? 'ready' : 'not_ready')
     : 'disabled';
 
+  const queueInfrastructureReady =
+    !queueInfrastructureRequired ||
+    (
+      checks.redis === 'ready' &&
+      checks.printQueue === 'ready' &&
+      checks.uploadWorker === 'ready' &&
+      checks.uploadQueueEvents === 'ready'
+    );
+
   const ready =
     checks.database === 'ready' &&
-    checks.redis === 'ready' &&
-    checks.printQueue === 'ready' &&
-    checks.uploadWorker === 'ready' &&
-    checks.uploadQueueEvents === 'ready' &&
+    queueInfrastructureReady &&
     (!adapterEnabled || checks.socketIoRedisAdapter === 'ready');
 
   res.status(ready ? 200 : 503).json({
