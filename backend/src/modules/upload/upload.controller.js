@@ -50,13 +50,20 @@ const handleUpload = async (req, res, next) => {
     }
 
     const fileUrl = req.file.location || `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-    
+
     let pages = 1;
     const isEncrypted = req.body.isEncrypted === 'true';
     const claimedPages = parseInt(req.body.claimedPages) || 1;
 
     if (uploadQueue && !isEncrypted) {
-      const job = await uploadQueue.add('countPages', { fileUrl, mimetype: req.file.mimetype });
+      // A disk-backed upload must be read directly by the worker from the same
+      // storage path. Fetching fileUrl over HTTP would hit the protected
+      // /uploads/:filename route without an auth header and fail with 401.
+      const job = await uploadQueue.add('countPages', {
+        fileUrl,
+        mimetype: req.file.mimetype,
+        localPath: req.file.path || null
+      });
       pages = await job.waitUntilFinished(uploadQueueEvents);
     } else {
       // Fallback or Encrypted bypass
@@ -70,7 +77,7 @@ const handleUpload = async (req, res, next) => {
         originalName: req.file.originalname,
         size: req.file.size,
         mimetype: req.file.mimetype,
-        pages: pages 
+        pages: pages
       }
     });
   } catch (error) {
