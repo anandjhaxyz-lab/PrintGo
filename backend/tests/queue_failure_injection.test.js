@@ -24,10 +24,23 @@ const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres@localhos
 const prisma = new PrismaClient({ datasources: { db: { url: DATABASE_URL } } });
 
 function enforceSafety() {
-  const dbUrl = DATABASE_URL;
-  const isDisposableTarget = dbUrl.includes('printgo_disposable_target') && dbUrl.includes(':5433');
+  let parsed;
+  try {
+    parsed = new URL(DATABASE_URL);
+  } catch (error) {
+    console.error('❌ SAFETY REJECTION: DATABASE_URL is malformed.');
+    process.exit(1);
+  }
+
+  const isGitHubActions = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isGitHubActions ? '5432' : '5433';
+  const isDisposableTarget =
+    ['localhost', '127.0.0.1'].includes(parsed.hostname) &&
+    parsed.pathname.replace(/^\//, '').split('?')[0] === 'printgo_disposable_target' &&
+    (parsed.port || '5432') === expectedPort;
+
   if (!isDisposableTarget) {
-    console.error('❌ SAFETY REJECTION: Tests must run strictly against printgo_disposable_target on port 5433');
+    console.error(`❌ SAFETY REJECTION: Tests require the local disposable printgo_disposable_target database on port ${expectedPort} (GITHUB_ACTIONS=${isGitHubActions}).`);
     process.exit(1);
   }
 }
