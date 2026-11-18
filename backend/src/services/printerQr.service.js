@@ -502,7 +502,7 @@ const resolvePrinterQr = async (publicCode) => {
     });
 
     return { qr: lockedQr, session: createdSession };
-  });
+  }, { maxWait: 10000, timeout: 10000 });
 
   // Mint signed JWT session token
   const sessionToken = jwt.sign(

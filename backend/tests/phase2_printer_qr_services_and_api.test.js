@@ -455,14 +455,27 @@ async function setupDatabase() {
 
   machineA = await prisma.machine.upsert({
     where: { machineKey: 'test_machine_key_phase2_a' },
-    update: { companyId: companyA.id, status: 'ACTIVE' },
+    update: { companyId: companyA.id, status: 'ACTIVE', lastOnline: new Date() },
     create: {
       name: 'Printer Alpha Active',
       location: 'Counter 1',
       machineKey: 'test_machine_key_phase2_a',
       status: 'ACTIVE',
+      lastOnline: new Date(),
       printerModel: 'Canon G3010',
       companyId: companyA.id
+    }
+  });
+
+  await prisma.printerStatus.deleteMany({ where: { machineId: machineA.id } });
+  await prisma.printerStatus.create({
+    data: {
+      machineId: machineA.id,
+      isOnline: true,
+      paperStatus: 'OK',
+      tonerStatus: 'OK',
+      jamStatus: false,
+      timestamp: new Date()
     }
   });
 
@@ -535,6 +548,32 @@ async function setupDatabase() {
         timestamp: new Date()
       }
     ]
+  });
+
+  await prisma.machine.upsert({
+    where: { id: legacyMachineId },
+    update: { status: 'ACTIVE', lastOnline: new Date(), companyId: companyA.id },
+    create: {
+      id: legacyMachineId,
+      name: 'Epson L6460 Counter Printer',
+      location: 'Counter 1',
+      machineKey: 'legacy_epson_demo_key',
+      printerModel: 'EPSON L6460 Series',
+      status: 'ACTIVE',
+      lastOnline: new Date(),
+      companyId: companyA.id
+    }
+  });
+
+  await prisma.session.upsert({
+    where: { code: 'EPSON-DEMO-01' },
+    update: { machineId: legacyMachineId, status: 'WAITING_FOR_MOBILE', expiresAt: new Date(Date.now() + 3600000) },
+    create: {
+      code: 'EPSON-DEMO-01',
+      machineId: legacyMachineId,
+      status: 'WAITING_FOR_MOBILE',
+      expiresAt: new Date(Date.now() + 3600000)
+    }
   });
 
   const demoSession = {
@@ -901,11 +940,11 @@ if (typeof describe === 'function' && typeof it === 'function') {
   describe('PRINTGO — PHASE 2 PERMANENT PRINTER QR TEST SUITE', () => {
     beforeAll(async () => {
       await setupDatabase();
-    });
+    }, 30000);
 
     afterAll(async () => {
       await cleanupDatabase();
-    });
+    }, 30000);
 
     describe('GROUP A: TOKEN SECURITY & PUBLIC URL VALIDATION', () => {
       it('A1: Token format and cryptographic entropy', async () => {

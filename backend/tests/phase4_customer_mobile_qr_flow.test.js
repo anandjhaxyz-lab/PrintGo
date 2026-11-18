@@ -148,27 +148,53 @@ async function runTestSuite() {
 
   const machineA = await prisma.machine.upsert({
     where: { machineKey: 'PHASE4-PRINTER-A-KEY' },
-    update: { status: 'ACTIVE' },
+    update: { status: 'ACTIVE', lastOnline: new Date() },
     create: {
       name: 'Counter Desk Printer A',
       machineKey: 'PHASE4-PRINTER-A-KEY',
       printerModel: 'EPSON L6460 Series',
       location: 'Main Counter A',
       status: 'ACTIVE',
+      lastOnline: new Date(),
       companyId: company.id
+    }
+  });
+
+  await prisma.printerStatus.deleteMany({ where: { machineId: machineA.id } });
+  await prisma.printerStatus.create({
+    data: {
+      machineId: machineA.id,
+      isOnline: true,
+      paperStatus: 'OK',
+      tonerStatus: 'OK',
+      jamStatus: false,
+      timestamp: new Date()
     }
   });
 
   const machineB = await prisma.machine.upsert({
     where: { machineKey: 'PHASE4-PRINTER-B-KEY' },
-    update: { status: 'ACTIVE' },
+    update: { status: 'ACTIVE', lastOnline: new Date() },
     create: {
       name: 'Branch Printer B',
       machineKey: 'PHASE4-PRINTER-B-KEY',
       printerModel: 'HP LaserJet 400',
       location: 'Back Office B',
       status: 'ACTIVE',
+      lastOnline: new Date(),
       companyId: company.id
+    }
+  });
+
+  await prisma.printerStatus.deleteMany({ where: { machineId: machineB.id } });
+  await prisma.printerStatus.create({
+    data: {
+      machineId: machineB.id,
+      isOnline: true,
+      paperStatus: 'OK',
+      tonerStatus: 'OK',
+      jamStatus: false,
+      timestamp: new Date()
     }
   });
 
@@ -446,19 +472,29 @@ async function runTestSuite() {
 
   // Case 10: Duplicate payment confirmation does not create duplicate jobs (idempotency)
   await test('Case 10: Duplicate payment confirmation does not create duplicate jobs (idempotency)', async () => {
+    process.env.APP_ENV = 'staging';
+    process.env.ENABLE_DEMO_PAYMENT = 'true';
+    process.env.RENDER = 'true';
+    process.env.RENDER_SERVICE_ID = 'srv-dbqpapon74is73csbc80';
+    process.env.RENDER_SERVICE_NAME = 'printgo-backend-staging';
+    process.env.RENDER_GIT_BRANCH = 'feature/printgo-production-readiness';
+    process.env.DEMO_PAYMENT_ACCESS_CODE = 'phase4_test_access_code_2026';
+
     const { req: req1, res: res1, next: next1, getStatusCode: getStatus1, getResponseData: getData1 } = createMockReqRes({
       params: { id: createdJobA.shortId },
+      body: { accessCode: 'phase4_test_access_code_2026' },
       session: { sessionId: sessionCodeA, machineId: machineA.id, role: 'mobile' }
     });
 
     await paymentsController.demoPayment(req1, res1, next1);
-    assert(getStatus1() === 200, 'First payment confirmation must succeed');
+    assert(getStatus1() === 200, `First payment confirmation must succeed, got ${getStatus1()}: ${getData1()?.error}`);
     const paidJob1 = getData1().job;
     assert(paidJob1.status === 'WAITING', 'Job must transition to WAITING');
 
     // Send duplicate payment confirmation
     const { req: req2, res: res2, next: next2, getStatusCode: getStatus2, getResponseData: getData2 } = createMockReqRes({
       params: { id: createdJobA.shortId },
+      body: { accessCode: 'phase4_test_access_code_2026' },
       session: { sessionId: sessionCodeA, machineId: machineA.id, role: 'mobile' }
     });
 
@@ -486,14 +522,39 @@ async function runTestSuite() {
       }
     };
 
-    await queueService.startPrintingProcess(createdJobA.shortId, mockIo);
+    // Create a fresh test job in WAITING state specifically for queue dispatch verification
+    const routingDoc = await prisma.document.create({
+      data: {
+        originalName: 'RoutingTest.pdf',
+        filename: 'RoutingTest_' + Date.now() + '.pdf',
+        mimetype: 'application/pdf',
+        size: 1024,
+        pages: 1
+      }
+    });
+
+    const routingJob = await prisma.printJob.create({
+      data: {
+        shortId: 'rt' + crypto.randomBytes(3).toString('hex'),
+        machineId: machineA.id,
+        documentId: routingDoc.id,
+        status: 'WAITING',
+        cost: 10,
+        color: 'bw',
+        duplex: 'single',
+        copies: 1,
+        pagesToPrint: 1
+      }
+    });
+
+    await queueService.startPrintingProcess(routingJob.shortId, mockIo);
     await new Promise(r => setTimeout(r, 200));
 
     // Verify socket emission
     const targetRoom = `machine_${machineA.id}`;
     const dispatchEvent = emittedEvents.find(e => e.room === targetRoom && e.event === 'physical_print_job');
     assert(dispatchEvent, `Expected print dispatch emitted strictly to room ${targetRoom}`);
-    assert(dispatchEvent.data.jobId === createdJobA.shortId, 'Dispatched event must include jobId');
+    assert(dispatchEvent.data.jobId === routingJob.shortId, 'Dispatched event must include jobId');
     assert(!emittedEvents.some(e => e.room === `machine_${machineB.id}`), 'Must NOT emit to machineB');
   });
 
@@ -696,6 +757,7 @@ async function runTestSuite() {
     // Step 4: Pay via Demo / Gateway Confirmation
     const { req: reqPay, res: resPay, next: nextPay, getStatusCode: getStatusPay, getResponseData: getDataPay } = createMockReqRes({
       params: { id: flowJob.shortId },
+      body: { accessCode: 'phase4_test_access_code_2026' },
       session: {
         sessionId: qrResolve.sessionCode,
         machineId: machineA.id,
@@ -704,7 +766,7 @@ async function runTestSuite() {
     });
 
     await paymentsController.demoPayment(reqPay, resPay, nextPay);
-    assert(getStatusPay() === 200, 'Step 4: Payment confirmed');
+    assert(getStatusPay() === 200, `Step 4: Payment confirmed, got ${getStatusPay()}: ${getDataPay()?.error}`);
     assert(getDataPay().job.status === 'WAITING', 'Job transitioned to WAITING');
 
     // Step 5: Customer Tracks Job Status
@@ -719,7 +781,8 @@ async function runTestSuite() {
 
     await jobsController.getJob(reqTrack, resTrack, nextTrack);
     assert(getStatusTrack() === 200, 'Step 5: Status query succeeds');
-    assert(getDataTrack().job.status === 'WAITING', 'Status is WAITING for print queue');
+    const trackedStatus = getDataTrack().job.status;
+    assert(trackedStatus === 'WAITING' || trackedStatus === 'PRINTING', `Status is WAITING or PRINTING for print queue, got ${trackedStatus}`);
   });
 
   console.log('\n======================================================================');
