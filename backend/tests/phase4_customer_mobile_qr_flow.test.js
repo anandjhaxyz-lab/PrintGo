@@ -32,10 +32,19 @@ const os = require('os');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 
-// Load database credentials strictly for printgo_disposable_target
-const creds = fs.readFileSync(path.resolve(__dirname, '../../.pg_credentials.local'), 'utf8');
-const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
-const targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+// Load database credentials strictly for disposable target
+const credsPath = path.resolve(__dirname, '../../.pg_credentials.local');
+let targetUrl = process.env.DATABASE_URL;
+
+if (!targetUrl && fs.existsSync(credsPath)) {
+  const creds = fs.readFileSync(credsPath, 'utf8');
+  const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
+  targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+}
+
+if (!targetUrl) {
+  throw new Error('DATABASE_URL or .pg_credentials.local is required to run phase4_customer_mobile_qr_flow test suite');
+}
 
 process.env.DATABASE_URL = targetUrl;
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_phase4_mobile_flow';

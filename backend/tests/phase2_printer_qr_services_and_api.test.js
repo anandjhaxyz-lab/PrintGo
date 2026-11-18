@@ -25,7 +25,10 @@ const mockMachines = new Map();
 const mockPrinterQrs = new Map();
 const mockSessions = new Map();
 
-if (fs.existsSync(credsPath)) {
+if (process.env.DATABASE_URL) {
+  const { PrismaClient } = require('@prisma/client');
+  prisma = new PrismaClient();
+} else if (fs.existsSync(credsPath)) {
   const creds = fs.readFileSync(credsPath, 'utf8');
   const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
   const targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
@@ -338,6 +341,13 @@ if (fs.existsSync(credsPath)) {
       findUnique: async () => null,
     },
 
+    printerStatus: {
+      deleteMany: async () => ({ count: 0 }),
+      create: async ({ data }) => ({ id: crypto.randomUUID(), ...data }),
+      findFirst: async () => null,
+      findMany: async () => []
+    },
+
     session: {
       create: async ({ data }) => {
         const session = {
@@ -349,6 +359,22 @@ if (fs.existsSync(credsPath)) {
         mockSessions.set(session.code, session);
         mockSessions.set(session.id, session);
         return { ...session };
+      },
+      upsert: async ({ where, update, create }) => {
+        let session = null;
+        for (const s of mockSessions.values()) {
+          if (where?.id && s.id === where.id) { session = s; break; }
+          if (where?.code && s.code === where.code) { session = s; break; }
+        }
+        if (session) {
+          Object.assign(session, update, { updatedAt: new Date() });
+          return { ...session };
+        } else {
+          const created = { id: crypto.randomUUID(), ...create, createdAt: new Date(), updatedAt: new Date() };
+          if (created.code) mockSessions.set(created.code, created);
+          if (created.id) mockSessions.set(created.id, created);
+          return { ...created };
+        }
       },
       findUnique: async ({ where }) => {
         for (const s of mockSessions.values()) {

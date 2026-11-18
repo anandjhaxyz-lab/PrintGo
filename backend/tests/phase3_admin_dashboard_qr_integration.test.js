@@ -17,11 +17,19 @@
 const path = require('path');
 const fs = require('fs');
 
-// Read credentials and set DATABASE_URL strictly to printgo_disposable_target
+// Read credentials or environment and set DATABASE_URL strictly to disposable target
 const credsPath = path.resolve(__dirname, '../../.pg_credentials.local');
-const creds = fs.readFileSync(credsPath, 'utf8');
-const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
-const targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+let targetUrl = process.env.DATABASE_URL;
+
+if (!targetUrl && fs.existsSync(credsPath)) {
+  const creds = fs.readFileSync(credsPath, 'utf8');
+  const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
+  targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+}
+
+if (!targetUrl) {
+  throw new Error('DATABASE_URL or .pg_credentials.local is required to run phase3_admin_dashboard_qr_integration test suite');
+}
 
 process.env.DATABASE_URL = targetUrl;
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret_phase3_dashboard_integration';

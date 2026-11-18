@@ -400,20 +400,20 @@ async function runTestSuite() {
   });
 
   // -------------------------------------------------------------------------
-  // TEST 9: Historical Production Data Integrity Verification
+  // TEST 9: Completed Job and Payment Record Integrity Benchmark
   // -------------------------------------------------------------------------
-  await test('Historical print jobs and database records remain 100% intact', async () => {
+  await test('Completed job benchmark record maintains immutable status and payment linkage', async () => {
     let cded2789 = await prisma.printJob.findUnique({
       where: { shortId: 'cded2789' },
       include: { payment: true }
     });
 
     if (!cded2789) {
-      // In fresh/disposable database, create historical benchmark record
+      // In fresh/disposable test database, seed synthetic benchmark fixture
       const histDoc = await prisma.document.create({
         data: {
-          originalName: 'historical_benchmark.pdf',
-          filename: '/uploads/historical_benchmark.pdf',
+          originalName: 'completed_job_benchmark.pdf',
+          filename: '/uploads/completed_job_benchmark.pdf',
           mimetype: 'application/pdf',
           size: 1024,
           pages: 1
@@ -443,7 +443,7 @@ async function runTestSuite() {
       });
     }
 
-    if (!cded2789) throw new Error('Job cded2789 missing from database!');
+    if (!cded2789) throw new Error('Benchmark job cded2789 missing from database!');
     if (cded2789.status !== 'COMPLETED') {
       throw new Error(`Job cded2789 status modified! Expected COMPLETED, got ${cded2789.status}`);
     }
@@ -454,7 +454,7 @@ async function runTestSuite() {
       throw new Error('Job cded2789 payment record compromised!');
     }
 
-    console.log(`   Historical check: Job ${cded2789.shortId} status=${cded2789.status}, cost=₹${cded2789.cost}, payment=${cded2789.payment.status}`);
+    console.log(`   Benchmark check: Job ${cded2789.shortId} status=${cded2789.status}, cost=₹${cded2789.cost}, payment=${cded2789.payment.status}`);
   });
 
   console.log('\n======================================================================');
