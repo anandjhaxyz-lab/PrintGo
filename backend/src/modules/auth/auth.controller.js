@@ -7,6 +7,7 @@ const logger = require('../../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('../../services/pricing.service');
 const { resolveCashfreeEnv } = require('../../config/cashfree.config');
 const { isDemoPaymentPermitted } = require('../../utils/demoPaymentGuard');
+const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
 const { getMachineAvailability } = require('../../services/printerAvailability.service');
 
 const login = async (req, res, next) => {
@@ -254,7 +255,7 @@ const getPublicPricing = async (req, res, next) => {
       }
     }
 
-    let resolvedPaymentMode = 'CASHFREE_ONLINE';
+    let resolvedPaymentMode = DEFAULT_PAYMENT_MODE;
     if (resolvedMachineId) {
       const machine = await prisma.machine.findUnique({
         where: { id: resolvedMachineId },

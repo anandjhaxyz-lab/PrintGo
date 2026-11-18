@@ -6,6 +6,7 @@ const logger = require('../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('./pricing.service');
 const { resolveCashfreeEnv } = require('../config/cashfree.config');
 const { isDemoPaymentPermitted } = require('../utils/demoPaymentGuard');
+const { DEFAULT_PAYMENT_MODE } = require('../constants/paymentModes');
 const { getMachineAvailability } = require('./printerAvailability.service');
 
 /**
@@ -491,7 +492,7 @@ const resolvePrinterQr = async (publicCode) => {
     // Create a brand new ephemeral customer session inside transaction
     const sessionCode = crypto.randomBytes(6).toString('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 mins
-    const sessionPaymentMode = lockedQr.machine_payment_mode || 'CASHFREE_ONLINE';
+    const sessionPaymentMode = lockedQr.machine_payment_mode || DEFAULT_PAYMENT_MODE;
 
     const createdSession = await tx.session.create({
       data: {
@@ -507,7 +508,7 @@ const resolvePrinterQr = async (publicCode) => {
     return { qr: lockedQr, session: createdSession };
   }, { maxWait: 10000, timeout: 10000 });
 
-  const effectivePaymentMode = session.paymentMode || qr.machine_payment_mode || 'CASHFREE_ONLINE';
+  const effectivePaymentMode = session.paymentMode || qr.machine_payment_mode || DEFAULT_PAYMENT_MODE;
 
   // Mint signed JWT session token
   const sessionToken = jwt.sign(
@@ -601,7 +602,7 @@ const getPublicPrinterQrInfo = async (publicCode) => {
     success: true,
     status: qr.status,
     label: qr.label,
-    paymentMode: qr.machine.paymentMode || 'CASHFREE_ONLINE',
+    paymentMode: qr.machine.paymentMode || DEFAULT_PAYMENT_MODE,
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
     printer: {

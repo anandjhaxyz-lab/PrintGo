@@ -2,6 +2,7 @@ const prisma = require('../../utils/prisma');
 const crypto = require('crypto');
 const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
+const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
 
 const generateShortId = () => crypto.randomBytes(4).toString('hex');
 
@@ -131,7 +132,7 @@ const createJob = async (jobData) => {
     });
     resolvedPaymentMode = machineRecord?.paymentMode;
   }
-  const finalPaymentMode = resolvedPaymentMode || 'CASH_AT_COUNTER';
+  const finalPaymentMode = resolvedPaymentMode || DEFAULT_PAYMENT_MODE;
   pricingSnapshot.paymentMode = finalPaymentMode;
 
   // Create job

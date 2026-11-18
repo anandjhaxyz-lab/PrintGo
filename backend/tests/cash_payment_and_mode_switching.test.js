@@ -679,22 +679,42 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
       }));
     });
 
-    test('legacy machine with null paymentMode preserves previous CASHFREE_ONLINE configuration and is not converted to cash', async () => {
+    test('machine with null paymentMode defaults to DEFAULT_PAYMENT_MODE (CASH_AT_COUNTER)', async () => {
       const machinesService = require('../src/modules/machines/machines.service');
+      const { DEFAULT_PAYMENT_MODE } = require('../src/constants/paymentModes');
 
       mockPrisma.machine.findMany.mockResolvedValue([
         {
           id: 'legacy-mach-1',
           name: 'Legacy Printer',
           companyId: 'company-a',
-          paymentMode: null, // Legacy machine created prior to migration
+          paymentMode: null, // Machine with unconfigured / null paymentMode
           printerStatuses: []
         }
       ]);
 
       const machines = await machinesService.getMachines({ id: 'admin-1', role: 'SUPERADMIN' });
       expect(machines).toHaveLength(1);
-      expect(machines[0].paymentMode).toBe('CASHFREE_ONLINE'); // Retains previous online configuration
+      expect(machines[0].paymentMode).toBe(DEFAULT_PAYMENT_MODE);
+      expect(machines[0].paymentMode).toBe('CASH_AT_COUNTER');
+    });
+
+    test('machine with explicitly configured CASHFREE_ONLINE preserves CASHFREE_ONLINE', async () => {
+      const machinesService = require('../src/modules/machines/machines.service');
+
+      mockPrisma.machine.findMany.mockResolvedValue([
+        {
+          id: 'online-mach-1',
+          name: 'Online Printer',
+          companyId: 'company-a',
+          paymentMode: 'CASHFREE_ONLINE', // Explicitly configured online machine
+          printerStatuses: []
+        }
+      ]);
+
+      const machines = await machinesService.getMachines({ id: 'admin-1', role: 'SUPERADMIN' });
+      expect(machines).toHaveLength(1);
+      expect(machines[0].paymentMode).toBe('CASHFREE_ONLINE');
     });
 
     test('new machine onboarding explicitly assigns paymentMode', async () => {

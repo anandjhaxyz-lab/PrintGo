@@ -1,6 +1,7 @@
 const prisma = require('../../utils/prisma');
 const crypto = require('crypto');
 const AppError = require('../../utils/AppError');
+const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
 const {
   ONLINE_HEARTBEAT_WINDOW_MS,
   computePrinterAvailability
@@ -52,7 +53,7 @@ const getMachines = async (user) => {
       ...m,
       printerModel: m.printerModel?.trim() || 'Unknown',
       connectionType: m.connectionType?.trim() || 'Unknown',
-      paymentMode: m.paymentMode || 'CASHFREE_ONLINE',
+      paymentMode: m.paymentMode || DEFAULT_PAYMENT_MODE,
       isOnline: availability.isReady,
       agentOnline: availability.agentOnline,
       hardwareStatus: availability.status,
@@ -77,7 +78,7 @@ const getMachineById = async (id, user) => {
     ...machine,
     printerModel: machine.printerModel?.trim() || 'Unknown',
     connectionType: machine.connectionType?.trim() || 'Unknown',
-    paymentMode: machine.paymentMode || 'CASHFREE_ONLINE',
+    paymentMode: machine.paymentMode || DEFAULT_PAYMENT_MODE,
     isOnline: availability.isReady,
     agentOnline: availability.agentOnline,
     hardwareStatus: availability.status,
@@ -96,7 +97,7 @@ const createMachine = async (data) => {
       machineKey,
       companyId,
       status: 'INACTIVE',
-      paymentMode: paymentMode || 'CASH_AT_COUNTER'
+      paymentMode: paymentMode || DEFAULT_PAYMENT_MODE
     },
     include: { company: true }
   });
@@ -143,7 +144,7 @@ const getMachinesByCompany = async (companyId) => {
       ...m,
       printerModel: m.printerModel?.trim() || 'Unknown',
       connectionType: m.connectionType?.trim() || 'Unknown',
-      paymentMode: m.paymentMode || 'CASHFREE_ONLINE',
+      paymentMode: m.paymentMode || DEFAULT_PAYMENT_MODE,
       isOnline: availability.isReady,
       agentOnline: availability.agentOnline,
       hardwareStatus: availability.status,
@@ -179,7 +180,7 @@ const updateMachinePaymentMode = async (id, paymentMode, user, io) => {
     }
   }
 
-  const oldMode = machine.paymentMode || 'CASHFREE_ONLINE';
+  const oldMode = machine.paymentMode || DEFAULT_PAYMENT_MODE;
   const updatedMachine = await prisma.machine.update({
     where: { id },
     data: { paymentMode },

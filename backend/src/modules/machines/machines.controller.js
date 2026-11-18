@@ -1,5 +1,6 @@
 const machinesService = require('./machines.service');
 const prisma = require('../../utils/prisma');
+const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
 
 const getMachines = async (req, res, next) => {
   try {
@@ -133,7 +134,7 @@ const getPaymentMode = async (req, res, next) => {
     res.json({
       success: true,
       machineId: machine.id,
-      paymentMode: machine.paymentMode || 'CASH_AT_COUNTER',
+      paymentMode: machine.paymentMode || DEFAULT_PAYMENT_MODE,
       capabilities
     });
   } catch (error) {
