@@ -6,6 +6,7 @@ const mammoth = require('mammoth');
 const officeParser = require('officeparser');
 const logger = require('../../utils/logger');
 const AppError = require('../../utils/AppError');
+const { getUploadsDir } = require('../../utils/storage');
 
 const withTimeout = (promise, ms) => {
   let timeout;
@@ -15,21 +16,41 @@ const withTimeout = (promise, ms) => {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeout));
 };
 
-const getFileBuffer = async (fileUrl, localPath) => {
-  if (localPath && fs.existsSync(localPath)) {
-    return fs.readFileSync(localPath);
+const getFilenameFromUrl = (fileUrl) => {
+  try {
+    return path.basename(new URL(fileUrl).pathname);
+  } catch {
+    return path.basename(fileUrl || '');
   }
-  
-  // Check if fileUrl references a local upload on disk
+};
+
+const getFileBuffer = async (fileUrl, localPath) => {
+  // Disk-backed Multer uploads pass their exact path through BullMQ. Read it
+  // directly instead of calling the protected /uploads/:filename HTTP route.
+  if (localPath) {
+    if (!fs.existsSync(localPath)) {
+      throw new AppError(
+        'Uploaded file is not available at the worker storage path. Confirm that the upload and worker use the same UPLOADS_DIR.',
+        500
+      );
+    }
+    return fs.promises.readFile(localPath);
+  }
+
+  // Backward compatibility for queued jobs created before localPath was added.
+  // Resolve local uploads through the shared storage helper so a custom
+  // UPLOADS_DIR (for example, a Render persistent disk) is respected.
   if (fileUrl && fileUrl.includes('/uploads/')) {
-    const filename = path.basename(fileUrl);
-    const diskPath = path.join(__dirname, '../../../uploads', filename);
-    if (fs.existsSync(diskPath)) {
-      return fs.readFileSync(diskPath);
+    const filename = getFilenameFromUrl(fileUrl);
+    if (filename) {
+      const diskPath = path.join(getUploadsDir(), filename);
+      if (fs.existsSync(diskPath)) {
+        return fs.promises.readFile(diskPath);
+      }
     }
   }
 
-  // External S3 or remote file URL
+  // External S3 or remote file URL (for example, multer-s3's location URL).
   const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
   return response.data;
 };
@@ -39,7 +60,7 @@ const getPageCount = async (fileUrl, mimetype, isEncrypted = false, claimedPages
     logger.info(`E2E Encrypted file detected. Bypassing server-side parse. Claimed pages: ${claimedPages}`);
     return claimedPages;
   }
-  
+
   const isPdf = mimetype === 'application/pdf' || (fileUrl && fileUrl.toLowerCase().endsWith('.pdf'));
 
   if (isPdf) {
@@ -68,7 +89,7 @@ const getPageCount = async (fileUrl, mimetype, isEncrypted = false, claimedPages
       const buffer = await getFileBuffer(fileUrl, localPath);
       const result = await withTimeout(mammoth.extractRawText({ buffer }), 5000);
       const text = result.value;
-      const wordCount = text.split(/\s+/).filter(word => word.length > 0).length;
+      const wordCount = text.split(/\\s+/).filter(word => word.length > 0).length;
       const estimatedPages = Math.max(1, Math.ceil(wordCount / 400));
       logger.info(`DOCX page estimation: ${wordCount} words → ${estimatedPages} pages`);
       return estimatedPages;
@@ -76,7 +97,7 @@ const getPageCount = async (fileUrl, mimetype, isEncrypted = false, claimedPages
     else if (mimetype === 'application/vnd.openxmlformats-officedocument.presentationml.presentation') {
       const buffer = await getFileBuffer(fileUrl, localPath);
       const text = await withTimeout(officeParser.parseOfficeAsync(buffer), 5000);
-      const slideBlocks = text.split(/\n\n+/).filter(block => block.trim().length > 0);
+      const slideBlocks = text.split(/\\n\\n+/).filter(block => block.trim().length > 0);
       const slideCount = Math.max(1, slideBlocks.length);
       logger.info(`PPTX slide estimation: ${slideCount} slides detected`);
       return slideCount;
@@ -89,5 +110,6 @@ const getPageCount = async (fileUrl, mimetype, isEncrypted = false, claimedPages
 };
 
 module.exports = {
-  getPageCount
+  getPageCount,
+  getFileBuffer
 };
