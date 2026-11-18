@@ -5,7 +5,7 @@ const AppError = require('../utils/AppError');
 const logger = require('../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('./pricing.service');
 const { resolveCashfreeEnv } = require('../config/cashfree.config');
-const { isDemoPaymentPermitted } = require('../utils/demoPaymentGuard');
+const { isDemoPaymentPermitted, isDemoAccessCodeRequired } = require('../utils/demoPaymentGuard');
 const { DEFAULT_PAYMENT_MODE } = require('../constants/paymentModes');
 const { getMachineAvailability } = require('./printerAvailability.service');
 
@@ -543,6 +543,7 @@ const resolvePrinterQr = async (publicCode) => {
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
     enableDemoPayment: effectivePaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted(),
+    demoAccessCodeRequired: effectivePaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted() && isDemoAccessCodeRequired(),
     printer: {
       name: qr.machine_name || availability?.name,
       model: qr.machine_printer_model || availability?.printerModel || 'Unknown',

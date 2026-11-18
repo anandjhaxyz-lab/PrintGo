@@ -6,7 +6,7 @@ const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('../../services/pricing.service');
 const { resolveCashfreeEnv } = require('../../config/cashfree.config');
-const { isDemoPaymentPermitted } = require('../../utils/demoPaymentGuard');
+const { isDemoPaymentPermitted, isDemoAccessCodeRequired } = require('../../utils/demoPaymentGuard');
 const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
 const { getMachineAvailability } = require('../../services/printerAvailability.service');
 
@@ -198,6 +198,7 @@ const joinSession = async (req, res, next) => {
       cashfreeEnv: cashfreeEnv || 'sandbox',
       pricingProfile,
       enableDemoPayment: isDemoPaymentPermitted(),
+      demoAccessCodeRequired: isDemoPaymentPermitted() && isDemoAccessCodeRequired(),
       printer,
     });
   } catch (error) {
@@ -275,7 +276,8 @@ const getPublicPricing = async (req, res, next) => {
       paymentMode: resolvedPaymentMode,
       cashfreeEnv: cashfreeEnv || 'sandbox',
       pricingProfile,
-      enableDemoPayment: resolvedPaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted()
+      enableDemoPayment: resolvedPaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted(),
+      demoAccessCodeRequired: resolvedPaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted() && isDemoAccessCodeRequired()
     });
   } catch (error) {
     next(error);

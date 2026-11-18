@@ -151,6 +151,7 @@ const MobileView = () => {
   const [paymentMode, setPaymentMode] = useState('CASH_AT_COUNTER'); // 'CASH_AT_COUNTER' | 'DEMO_SIMULATION' | 'CASHFREE_ONLINE'
   const [enableDemoPayment, setEnableDemoPayment] = useState(false);
   const [demoAccessCode, setDemoAccessCode] = useState('');
+  const [demoAccessCodeRequired, setDemoAccessCodeRequired] = useState(true);
   const [isExecutingDemoPay, setIsExecutingDemoPay] = useState(false);
   const [dispatchWarning, setDispatchWarning] = useState(null);
   const [error, setError] = useState('');
@@ -343,6 +344,7 @@ const MobileView = () => {
           const recoveredMode = recovered.paymentMode || (recovered.enableDemoPayment ? 'DEMO_SIMULATION' : (recovered.cashfreeEnv || recovered.orderId ? 'CASHFREE_ONLINE' : 'CASH_AT_COUNTER'));
           setPaymentMode(recoveredMode);
           if (recovered.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(recovered.enableDemoPayment));
+          if (recovered.demoAccessCodeRequired !== undefined) setDemoAccessCodeRequired(Boolean(recovered.demoAccessCodeRequired));
           if (recovered.fileData) setFileData(recovered.fileData);
           if (recovered.settings) setSettings(recovered.settings);
           if (recovered.price) setPrice(recovered.price);
@@ -428,6 +430,7 @@ const MobileView = () => {
                 const modeFromPricing = pRes.data.paymentMode || (pRes.data.enableDemoPayment ? 'DEMO_SIMULATION' : (pRes.data.cashfreeEnv ? 'CASHFREE_ONLINE' : null));
                 if (modeFromPricing) setPaymentMode(modeFromPricing);
                 if (pRes.data.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(pRes.data.enableDemoPayment));
+                if (pRes.data.demoAccessCodeRequired !== undefined) setDemoAccessCodeRequired(Boolean(pRes.data.demoAccessCodeRequired));
               }
             })
             .catch(() => {});
@@ -446,6 +449,8 @@ const MobileView = () => {
             setPaymentMode(resolvedPaymentMode);
             const demoAllowed = Boolean(res.data.enableDemoPayment);
             setEnableDemoPayment(demoAllowed);
+            const demoCodeRequired = res.data.demoAccessCodeRequired !== false;
+            setDemoAccessCodeRequired(demoCodeRequired);
 
             saveRecoveredSession(scopeParams, {
               publicCode,
@@ -456,6 +461,7 @@ const MobileView = () => {
               cashfreeEnv: envMode,
               paymentMode: resolvedPaymentMode,
               enableDemoPayment: demoAllowed,
+              demoAccessCodeRequired: demoCodeRequired,
               expiresAt: res.data.expiresAt || null,
             });
           }
@@ -474,6 +480,8 @@ const MobileView = () => {
             setPaymentMode(resolvedPaymentMode);
             const demoAllowed = Boolean(res.data.enableDemoPayment);
             setEnableDemoPayment(demoAllowed);
+            const demoCodeRequired = res.data.demoAccessCodeRequired !== false;
+            setDemoAccessCodeRequired(demoCodeRequired);
 
             saveRecoveredSession(scopeParams, {
               sessionCode: effectiveCode,
@@ -483,6 +491,7 @@ const MobileView = () => {
               cashfreeEnv: envMode,
               paymentMode: resolvedPaymentMode,
               enableDemoPayment: demoAllowed,
+              demoAccessCodeRequired: demoCodeRequired,
               expiresAt: res.data.expiresAt || null,
             });
           }
@@ -1137,7 +1146,7 @@ const MobileView = () => {
       return;
     }
     const trimmedCode = (demoAccessCode || '').trim();
-    if (!trimmedCode) {
+    if (demoAccessCodeRequired && !trimmedCode) {
       showError('Demo access code is required for simulated physical printing.');
       return;
     }
@@ -1152,7 +1161,7 @@ const MobileView = () => {
     try {
       const res = await axios.post(
         `${API_URL}/api/payments/demo-pay/${encodeURIComponent(jobId)}`,
-        { accessCode: trimmedCode },
+        demoAccessCodeRequired ? { accessCode: trimmedCode } : {},
         { headers: authHeaders() }
       );
 
@@ -2111,27 +2120,33 @@ const MobileView = () => {
                     </p>
                   </div>
 
-                  <div className="mb-3 text-left">
-                    <label className="block text-xs font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
-                      <Lock size={12} className="text-amber-400" />
-                      <span>Supervised Demo Access Code</span>
-                    </label>
-                    <input
-                      type="password"
-                      value={demoAccessCode}
-                      onChange={(e) => setDemoAccessCode(e.target.value)}
-                      placeholder="Enter demo access code"
-                      autoComplete="off"
-                      disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay}
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 transition-colors"
-                    />
-                  </div>
+                  {demoAccessCodeRequired ? (
+                    <div className="mb-3 text-left">
+                      <label className="block text-xs font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
+                        <Lock size={12} className="text-amber-400" />
+                        <span>Supervised Demo Access Code</span>
+                      </label>
+                      <input
+                        type="password"
+                        value={demoAccessCode}
+                        onChange={(e) => setDemoAccessCode(e.target.value)}
+                        placeholder="Enter demo access code"
+                        autoComplete="off"
+                        disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 transition-colors"
+                      />
+                    </div>
+                  ) : (
+                    <p className="mb-3 text-xs text-emerald-200 text-left">
+                      Access code is disabled for this Staging demo. Press the button below to run the simulation and dispatch the real print.
+                    </p>
+                  )}
 
                   <button
                     type="button"
                     className="s3k-primary-btn bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-black text-sm py-3.5 w-full shadow-lg transition-all flex items-center justify-center gap-2"
                     onClick={handleDemoPayment}
-                    disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay || !demoAccessCode.trim()}
+                    disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay || (demoAccessCodeRequired && !demoAccessCode.trim())}
                   >
                     {isExecutingDemoPay ? (
                       <>
