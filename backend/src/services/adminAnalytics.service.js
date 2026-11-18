@@ -9,6 +9,61 @@ const AppError = require('../utils/AppError');
 const { computePrinterAvailability } = require('./printerAvailability.service');
 
 /**
+ * Convert gateway payment metadata into a compact, stable label for Admin charts.
+ * Cashfree may store a JSON response fragment in paymentMethod; paymentGroup is
+ * the canonical method identifier and must take precedence when available.
+ */
+const normalizePaymentMethodLabel = (payment) => {
+  const aliases = {
+    upi: 'UPI',
+    cash: 'Cash',
+    card: 'Card',
+    creditcard: 'Card',
+    debitcard: 'Card',
+    netbanking: 'Net Banking',
+    internetbanking: 'Net Banking',
+    demo: 'Service Value',
+    simulated: 'Service Value'
+  };
+
+  const toToken = (value) => String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\\s_-]+/g, '');
+
+  const fromValue = (value) => {
+    if (typeof value !== 'string' || !value.trim()) return null;
+    const token = toToken(value);
+    if (aliases[token]) return aliases[token];
+
+    // Some historical Cashfree UPI rows stored a nested response object as JSON.
+    if (value.trim().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(value);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const key of Object.keys(parsed)) {
+            const label = aliases[toToken(key)];
+            if (label) return label;
+          }
+        }
+      } catch {
+        // Do not expose malformed/raw gateway JSON in the chart.
+      }
+      return 'Other Payment';
+    }
+
+    // Humanize safe enum-like identifiers; never surface raw JSON or metadata.
+    return value.trim()
+      .replace(/[_-]+/g, ' ')
+      .replace(/\\b\\w/g, (letter) => letter.toUpperCase());
+  };
+
+  return fromValue(payment?.paymentGroup) ||
+    fromValue(payment?.paymentMethod) ||
+    'Other Payment';
+};
+
+/**
  * Parses date range filter from query parameters.
  */
 const parseDateRange = (period, customStart, customEnd) => {
@@ -316,7 +371,7 @@ const getSalesChartsData = async (user, query = {}) => {
       const mName = job.machine?.name || 'Unassigned Kiosk';
       machineRevenueMap[mName] = (machineRevenueMap[mName] || 0) + amount;
 
-      const method = job.payment.paymentMethod || 'UPI';
+      const method = normalizePaymentMethodLabel(job.payment);
       paymentMethodsMap[method] = (paymentMethodsMap[method] || 0) + 1;
     }
 
