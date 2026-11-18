@@ -1,4 +1,5 @@
 const prisma = require('../utils/prisma');
+const { DEFAULT_PAYMENT_MODE } = require('../constants/paymentModes');
 
 const ONLINE_HEARTBEAT_WINDOW_MS = 90 * 1000; // 90 seconds
 const TELEMETRY_STALE_WINDOW_MS = 180 * 1000; // 180 seconds (3 minutes)
@@ -243,7 +244,7 @@ const getMachineAvailability = async (machineId, dbClient = prisma, now = new Da
     location: machine.location,
     printerModel: machine.printerModel || 'Unknown',
     connectionType: machine.connectionType || latestStatus?.connectionType || 'Unknown',
-    paymentMode: machine.paymentMode || 'CASHFREE_ONLINE',
+    paymentMode: machine.paymentMode || DEFAULT_PAYMENT_MODE,
     ...availability,
   };
 };
