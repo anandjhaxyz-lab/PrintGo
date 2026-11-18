@@ -100,6 +100,22 @@ describe('readOnlyGuard — Staging Payment Mode Narrow Config Guard', () => {
       expect(isNextCalled()).toBe(true);
     });
 
+    test('Permits the actual mounted Express router path using baseUrl + path', () => {
+      const { req, res, next, isNextCalled } = createMockReqRes(
+        'PUT',
+        `/api/machines/${TARGET_MACHINE_ID}/payment-mode`,
+        { paymentMode: 'DEMO_SIMULATION' }
+      );
+      // Express router middleware sees the mount path and the remaining route path separately.
+      req.baseUrl = '/api/machines';
+      req.path = `/${TARGET_MACHINE_ID}/payment-mode`;
+      req.originalUrl = `/api/machines/${TARGET_MACHINE_ID}/payment-mode`;
+
+      expect(isAllowedStagingPaymentModeConfig(req)).toBe(true);
+      readOnlyGuard(req, res, next);
+      expect(isNextCalled()).toBe(true);
+    });
+
     test('Permits with query string on normalized path', () => {
       const { req, res, next, isNextCalled } = createMockReqRes(
         'PUT',
