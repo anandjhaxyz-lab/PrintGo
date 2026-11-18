@@ -1,14 +1,88 @@
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
+
+function validateDatabaseUrl(urlStr) {
+  if (!urlStr || typeof urlStr !== 'string') {
+    throw new Error('FATAL SAFETY VIOLATION: DATABASE_URL is not set or empty! Aborting immediately.');
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(urlStr);
+  } catch (err) {
+    throw new Error(`FATAL SAFETY VIOLATION: Malformed DATABASE_URL: ${err.message}`);
+  }
+
+  // 1. Protocol: must be postgresql:
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
+    throw new Error(`FATAL SAFETY VIOLATION: Protocol '${parsed.protocol}' is invalid. Must be postgresql:`);
+  }
+
+  // 2. Host: strictly localhost or 127.0.0.1
+  if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+    throw new Error(`FATAL SAFETY VIOLATION: Database host '${parsed.hostname}' is not localhost or 127.0.0.1! Remote, Render, Staging and Production databases are strictly prohibited.`);
+  }
+
+  // 3. Database: strictly printgo_disposable_target
+  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (dbName !== 'printgo_disposable_target') {
+    throw new Error(`FATAL SAFETY VIOLATION: Database '${dbName}' is not printgo_disposable_target! Aborting immediately.`);
+  }
+
+  // 4. Port: 5433 for local testing, 5432 only for GitHub Actions
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+  const actualPort = parsed.port ? Number(parsed.port) : 5432;
+  if (actualPort !== expectedPort) {
+    throw new Error(`FATAL SAFETY VIOLATION: Database port is ${actualPort}, must be ${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting immediately.`);
+  }
+
+  return true;
+}
+
+const credsPath = path.resolve(__dirname, '../../.pg_credentials.local');
+let targetUrl = process.env.DATABASE_URL;
+
+if (!targetUrl && fs.existsSync(credsPath)) {
+  const creds = fs.readFileSync(credsPath, 'utf8');
+  const pass = creds.match(/POSTGRES_PASSWORD=(.*)/)[1].trim();
+  targetUrl = `postgresql://postgres:${encodeURIComponent(pass)}@localhost:5433/printgo_disposable_target?schema=public`;
+}
+
+if (!targetUrl) {
+  throw new Error('DATABASE_URL or .pg_credentials.local is required to run phase1_and_2_payment_readiness test suite');
+}
+
+// Validate DATABASE_URL BEFORE requiring/initializing Prisma
+validateDatabaseUrl(targetUrl);
+process.env.DATABASE_URL = targetUrl;
+
 const crypto = require('crypto');
 const prisma = require('../src/utils/prisma');
 const paymentsService = require('../src/modules/payments/payments.service');
 const { validateCashfreeConfig, getCashfreeConfig } = require('../src/config/cashfree.config');
+const { isValidJobTransition } = require('../src/utils/stateMachine');
 
 async function runTestSuite() {
   console.log('======================================================================');
   console.log('PRINTGO — PHASE 1 & PHASE 2 PAYMENT READINESS & FINANCIAL AUDIT TESTS');
   console.log('======================================================================\n');
+
+  // Server-side pre-flight check before creating any test fixtures
+  const meta = await prisma.$queryRawUnsafe('SELECT current_database(), inet_server_port();');
+  const dbName = meta[0].current_database;
+  const dbPort = meta[0].inet_server_port;
+
+  const isCi = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isCi ? 5432 : 5433;
+
+  if (dbName !== 'printgo_disposable_target' || Number(dbPort) !== expectedPort) {
+    console.error(`FATAL SAFETY VIOLATION: Database is NOT printgo_disposable_target:${expectedPort} (GITHUB_ACTIONS=${isCi})! Aborting.`);
+    process.exit(1);
+  }
+  console.log(`Pre-flight Database Check: ${dbName} on port ${dbPort}`);
+  console.log('Pre-flight Safety Check PASSED: Strictly isolated to disposable target.\n');
 
   let passed = 0;
   let failed = 0;
@@ -400,9 +474,9 @@ async function runTestSuite() {
   });
 
   // -------------------------------------------------------------------------
-  // TEST 9: Completed Job and Payment Record Integrity Benchmark
+  // TEST 9: Completed Job and Payment Record Fixture Persistence & Immutability
   // -------------------------------------------------------------------------
-  await test('Completed job benchmark record maintains immutable status and payment linkage', async () => {
+  await test('Completed job fixture verifies relational persistence and state immutability', async () => {
     let cded2789 = await prisma.printJob.findUnique({
       where: { shortId: 'cded2789' },
       include: { payment: true }
@@ -453,8 +527,66 @@ async function runTestSuite() {
     if (!cded2789.payment || cded2789.payment.status !== 'SUCCESS') {
       throw new Error('Job cded2789 payment record compromised!');
     }
+    if (cded2789.payment.amount !== cded2789.cost) {
+      throw new Error(`Payment amount mismatch! Expected ${cded2789.cost}, got ${cded2789.payment.amount}`);
+    }
 
-    console.log(`   Benchmark check: Job ${cded2789.shortId} status=${cded2789.status}, cost=₹${cded2789.cost}, payment=${cded2789.payment.status}`);
+    // Immutability: Verify state machine prohibits transitioning backwards from COMPLETED
+    if (isValidJobTransition('COMPLETED', 'PENDING_PAYMENT')) {
+      throw new Error('State machine violation: COMPLETED must not be able to transition to PENDING_PAYMENT');
+    }
+    if (isValidJobTransition('COMPLETED', 'WAITING')) {
+      throw new Error('State machine violation: COMPLETED must not be able to transition to WAITING');
+    }
+
+    // Non-interference: createOrder must reject creating a payment for an already completed job
+    // Temporarily configure syntactically valid CI-only dummy sandbox credentials so getCashfreeConfig() passes validation
+    const savedAppId = process.env.CASHFREE_APP_ID;
+    const savedSecretKey = process.env.CASHFREE_SECRET_KEY;
+    const savedEnv = process.env.CASHFREE_ENV;
+    const savedEnvironment = process.env.CASHFREE_ENVIRONMENT;
+
+    let orderRejected = false;
+    try {
+      process.env.CASHFREE_APP_ID = 'cf_app_ci_sandbox_mock_12345';
+      process.env.CASHFREE_SECRET_KEY = 'cfsk_ma_test_ci_sandbox_mock_secret_999999999999';
+      process.env.CASHFREE_ENV = 'sandbox';
+      delete process.env.CASHFREE_ENVIRONMENT;
+
+      await paymentsService.createOrder(cded2789.shortId);
+    } catch (err) {
+      orderRejected = true;
+      if (err.message !== 'Job cannot be paid. Current status: COMPLETED') {
+        throw new Error(`Unexpected error during non-interference verification! Expected 'Job cannot be paid. Current status: COMPLETED', got: '${err.message}'`);
+      }
+    } finally {
+      if (savedAppId === undefined) delete process.env.CASHFREE_APP_ID;
+      else process.env.CASHFREE_APP_ID = savedAppId;
+
+      if (savedSecretKey === undefined) delete process.env.CASHFREE_SECRET_KEY;
+      else process.env.CASHFREE_SECRET_KEY = savedSecretKey;
+
+      if (savedEnv === undefined) delete process.env.CASHFREE_ENV;
+      else process.env.CASHFREE_ENV = savedEnv;
+
+      if (savedEnvironment === undefined) delete process.env.CASHFREE_ENVIRONMENT;
+      else process.env.CASHFREE_ENVIRONMENT = savedEnvironment;
+    }
+
+    if (!orderRejected) {
+      throw new Error('Non-interference violation: createOrder should have rejected payment for COMPLETED job!');
+    }
+
+    // Post-operation persistence: re-verify fixture remained completely unmutated
+    const freshJob = await prisma.printJob.findUnique({
+      where: { shortId: 'cded2789' },
+      include: { payment: true }
+    });
+    if (freshJob.status !== 'COMPLETED' || freshJob.cost !== 2 || freshJob.payment?.status !== 'SUCCESS') {
+      throw new Error('Completed job record was mutated by rejected payment attempt!');
+    }
+
+    console.log(`   Persistence & immutability check: Job ${freshJob.shortId} status=${freshJob.status}, cost=₹${freshJob.cost}, payment=${freshJob.payment.status}`);
   });
 
   console.log('\n======================================================================');
