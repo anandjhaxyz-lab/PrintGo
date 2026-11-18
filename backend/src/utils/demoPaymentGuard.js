@@ -59,6 +59,24 @@ const isDemoPaymentPermitted = (env = process.env) => {
  * @param {string} [expectedCode=process.env.DEMO_PAYMENT_ACCESS_CODE]
  * @returns {boolean}
  */
+/**
+ * Controls whether the Staging demo flow asks the operator/customer for an access code.
+ * Defaults to required. Only the exact value "false" disables the prompt/check.
+ * The demo endpoint remains protected by isDemoPaymentPermitted() and session ownership.
+ */
+const isDemoAccessCodeRequired = (env = process.env) => {
+  if (!env || typeof env !== 'object') return true;
+  return String(env.DEMO_PAYMENT_REQUIRE_ACCESS_CODE ?? 'true').trim().toLowerCase() !== 'false';
+};
+
+/**
+ * Validates the demo payment access code using timingSafeEqual.
+ * Never logs or returns the access code.
+ *
+ * @param {string} providedCode
+ * @param {string} [expectedCode=process.env.DEMO_PAYMENT_ACCESS_CODE]
+ * @returns {boolean}
+ */
 const verifyDemoAccessCode = (providedCode, expectedCode = process.env.DEMO_PAYMENT_ACCESS_CODE) => {
   if (typeof providedCode !== 'string' || !providedCode.trim()) {
     return false;
@@ -130,6 +148,7 @@ const resetAllDemoRateLimits = () => {
 
 module.exports = {
   isDemoPaymentPermitted,
+  isDemoAccessCodeRequired,
   verifyDemoAccessCode,
   isDemoAccessRateLimited,
   recordDemoAccessFailure,
