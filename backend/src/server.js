@@ -29,7 +29,19 @@ if (process.env.SENTRY_DSN) {
 }
 
 const { createAdapter } = require('@socket.io/redis-adapter');
-const { connection } = require('./services/redisClient');
+const {
+  connection,
+  waitForRedisReady,
+  getRedisHealth,
+  closeRedisConnection
+} = require('./services/redisClient');
+const prisma = require('./utils/prisma');
+const queueService = require('./services/queueService');
+const uploadWorkerService = require('./services/uploadWorker');
+const uploadQueueController = require('./modules/upload/upload.controller');
+
+let redisAdapterSubClient = null;
+let redisAdapterReady = false;
 
 // --- CORS & Origin Configuration ---
 // Strictly disallow localhost, LAN subnets, wildcards, and legacy origins in production runtime.
@@ -143,18 +155,36 @@ const io = new Server(server, {
   }
 });
 
-if (connection && process.env.ENABLE_REDIS_ADAPTER === 'true') {
-  try {
-    const pubClient = connection;
-    const subClient = pubClient.duplicate();
-    io.adapter(createAdapter(pubClient, subClient));
-    logger.info('Redis adapter attached to Socket.io');
-  } catch (err) {
-    logger.warn('Failed to attach Redis adapter to Socket.io, using default in-memory adapter:', err.message);
+const initializeRedisAdapter = async () => {
+  if (process.env.ENABLE_REDIS_ADAPTER !== 'true') {
+    logger.info('Socket.IO Redis adapter disabled; using the single-instance in-memory adapter.');
+    return false;
   }
-} else {
-  logger.info('Using reliable in-memory Socket.io adapter');
-}
+
+  if (!connection) {
+    throw new Error('ENABLE_REDIS_ADAPTER=true requires REDIS_URL or REDIS_HOST.');
+  }
+
+  redisAdapterSubClient = connection.duplicate();
+  redisAdapterSubClient.on('error', (err) => {
+    logger.error('Socket.IO Redis subscriber connection error:', err.message);
+  });
+
+  try {
+    await redisAdapterSubClient.ping();
+    io.adapter(createAdapter(connection, redisAdapterSubClient));
+    redisAdapterReady = true;
+    logger.info('Redis adapter attached to Socket.IO');
+    return true;
+  } catch (error) {
+    redisAdapterReady = false;
+    if (process.env.NODE_ENV === 'production' || process.env.QUEUE_REDIS_REQUIRED === 'true') {
+      throw new Error(`Socket.IO Redis adapter failed to initialize: ${error.message}`);
+    }
+    logger.warn('Socket.IO Redis adapter failed in development/test:', error.message);
+    return false;
+  }
+};
 
 app.set('io', io);
 global.io = io;
@@ -215,7 +245,49 @@ app.get('/p/:publicCode', (req, res) => {
 
 // Health Check (Keep-Alive for Render Free Tier)
 app.get('/api/health', (req, res) => {
+  // Liveness only: Render can use this to determine whether the process is alive.
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/api/ready', async (req, res) => {
+  const checks = {};
+  try {
+    await prisma.$queryRawUnsafe('SELECT 1');
+    checks.database = 'ready';
+  } catch (error) {
+    checks.database = 'not_ready';
+  }
+
+  const redisStatus = getRedisHealth();
+  checks.redis = redisStatus.ready ? 'ready' : 'not_ready';
+
+  const printQueueStatus = queueService.getQueueHealth();
+  checks.printQueue = printQueueStatus.ready ? 'ready' : 'not_ready';
+
+  const uploadWorkerStatus = uploadWorkerService.getUploadWorkerHealth();
+  checks.uploadWorker = uploadWorkerStatus.ready ? 'ready' : 'not_ready';
+
+  const uploadQueueStatus = uploadQueueController.getUploadQueueHealth();
+  checks.uploadQueueEvents = uploadQueueStatus.ready ? 'ready' : 'not_ready';
+
+  const adapterEnabled = process.env.ENABLE_REDIS_ADAPTER === 'true';
+  checks.socketIoRedisAdapter = adapterEnabled
+    ? (redisAdapterReady ? 'ready' : 'not_ready')
+    : 'disabled';
+
+  const ready =
+    checks.database === 'ready' &&
+    checks.redis === 'ready' &&
+    checks.printQueue === 'ready' &&
+    checks.uploadWorker === 'ready' &&
+    checks.uploadQueueEvents === 'ready' &&
+    (!adapterEnabled || checks.socketIoRedisAdapter === 'ready');
+
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not_ready',
+    checks,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Routes
@@ -244,16 +316,6 @@ if (process.env.SENTRY_DSN) {
   Sentry.setupExpressErrorHandler(app);
 }
 app.use(errorHandler);
-
-// Initialize Queue Worker
-const { initWorker } = require('./services/queueService');
-const { initUploadWorker } = require('./services/uploadWorker');
-try {
-  initWorker(io);
-  initUploadWorker();
-} catch (e) {
-  logger.warn('Failed to initialize queue workers, possibly Redis not running: ' + e.message);
-}
 
 const port = process.env.PORT || 5000;
 
@@ -324,18 +386,73 @@ const verifyDatabaseIdentity = async () => {
   logger.info(`[DATABASE SAFETY GUARD] Verified: Connected to '${currentDb}' on port ${currentPort}.`);
 };
 
-if (require.main === module) {
-  verifyDatabaseIdentity()
-    .then(() => autoSeed())
-    .then(() => {
-      server.listen(port, () => {
-        logger.info(`Enterprise PrintGo backend running at http://localhost:${port}`);
-      });
-    })
-    .catch((err) => {
-      logger.error('Startup failed during database verification or auto-seed: ' + err.message);
-      process.exit(1);
+const startServer = async () => {
+  // Preserve the existing local database identity guard before any seed writes.
+  await verifyDatabaseIdentity();
+  await autoSeed();
+
+  if (connection) {
+    await waitForRedisReady(15000);
+  }
+
+  await initializeRedisAdapter();
+  await queueService.initWorker(io);
+  await uploadWorkerService.initUploadWorker();
+  await uploadQueueController.waitForUploadQueueReady();
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, () => {
+      server.removeListener('error', reject);
+      logger.info(`Enterprise PrintGo backend running at http://localhost:${port}`);
+      resolve();
     });
+  });
+};
+
+let shutdownStarted = false;
+const shutdown = async (signal) => {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  logger.info(`Received ${signal}; beginning graceful PrintGo shutdown.`);
+
+  const forceExitTimer = setTimeout(() => {
+    logger.error('Graceful shutdown exceeded 30 seconds; forcing process exit.');
+    process.exit(1);
+  }, 30000);
+  forceExitTimer.unref();
+
+  try {
+    // Stop accepting sockets before closing workers and their shared Redis resources.
+    await new Promise((resolve) => io.close(resolve));
+    await Promise.all([
+      queueService.closeQueueService(),
+      uploadWorkerService.closeUploadWorker(),
+      uploadQueueController.closeUploadQueue()
+    ]);
+
+    if (redisAdapterSubClient && redisAdapterSubClient.status !== 'end') {
+      await redisAdapterSubClient.quit();
+    }
+    await closeRedisConnection();
+    await prisma.$disconnect();
+    process.exitCode = 0;
+    logger.info('PrintGo graceful shutdown completed.');
+  } catch (error) {
+    process.exitCode = 1;
+    logger.error('PrintGo graceful shutdown failed:', error);
+  } finally {
+    clearTimeout(forceExitTimer);
+  }
+};
+
+if (require.main === module) {
+  startServer().catch((error) => {
+    logger.error('PrintGo startup failed; server will not accept traffic:', error);
+    process.exit(1);
+  });
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 module.exports = {
@@ -347,5 +464,8 @@ module.exports = {
   createCorsOriginValidator,
   parseConfiguredOrigins,
   isLoopbackHostname,
-  verifyDatabaseIdentity
+  verifyDatabaseIdentity,
+  initializeRedisAdapter,
+  startServer,
+  shutdown
 };
