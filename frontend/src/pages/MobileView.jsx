@@ -480,6 +480,8 @@ const MobileView = () => {
             setPaymentMode(resolvedPaymentMode);
             const demoAllowed = Boolean(res.data.enableDemoPayment);
             setEnableDemoPayment(demoAllowed);
+            const demoCodeRequired = res.data.demoAccessCodeRequired !== false;
+            setDemoAccessCodeRequired(demoCodeRequired);
 
             saveRecoveredSession(scopeParams, {
               sessionCode: effectiveCode,
