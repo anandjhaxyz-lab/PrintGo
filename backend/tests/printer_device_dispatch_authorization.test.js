@@ -17,6 +17,7 @@ const makeJob = (overrides = {}) => ({
   machineId: 'machine-a',
   status: 'PRINTING',
   printerDeviceId: request.printerDeviceId,
+  printerWindowsQueueName: request.windowsPrinterName,
   printerDevice: {
     id: request.printerDeviceId,
     machineId: 'machine-a',
