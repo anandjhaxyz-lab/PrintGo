@@ -10,6 +10,7 @@ on:
       - work/printgo-selective-ads-20261117
       - feat/multi-printer-agent-fleet
       - feat/multi-printer-backend-agent-protocol
+      - feat/multi-printer-device-qr-session
   pull_request:
     branches:
       - main
@@ -18,6 +19,7 @@ on:
       - feature/printgo-production-readiness
       - feat/multi-printer-foundation
       - feat/multi-printer-agent-fleet
+      - feat/multi-printer-backend-agent-protocol
 
 jobs:
   # =========================================================================
@@ -92,6 +94,12 @@ jobs:
 
       - name: Run Multi-Printer Agent Protocol Tests
         run: npx jest tests/printer_agent_protocol.test.js --runInBand --forceExit
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
+
+      - name: Run Multi-Printer Admin Device Approval Tests
+        run: npx jest tests/printer_device_admin_service.test.js --runInBand --forceExit
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
