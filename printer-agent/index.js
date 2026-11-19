@@ -20,6 +20,7 @@ try {
 const SpoolerMonitor = require('./src/spooler');
 const JobJournal = require('./src/journal');
 const { PrinterFleetManager } = require('./src/printerFleetManager');
+const PrinterDispatchScheduler = require('./src/printerDispatchScheduler');
 const { discoverWindowsPrinters } = require('./src/windowsPrinterDiscovery');
 const {
   buildAgentHello,
@@ -121,6 +122,13 @@ let statusInterval = null;
 let registeredMachineId = null;
 let fleetProtocolAccepted = false;
 let fleetManager = null;
+const configuredMaxConcurrentPrints = process.env.AGENT_MAX_CONCURRENT_PRINTS === undefined
+  ? 5
+  : Number(process.env.AGENT_MAX_CONCURRENT_PRINTS);
+if (!Number.isInteger(configuredMaxConcurrentPrints) || configuredMaxConcurrentPrints < 1 || configuredMaxConcurrentPrints > 5) {
+  throw new Error('AGENT_MAX_CONCURRENT_PRINTS must be an integer between 1 and 5.');
+}
+const dispatchScheduler = new PrinterDispatchScheduler({ maxConcurrent: configuredMaxConcurrentPrints });
 socket.on('connect', () => {
   console.log(`✅ Connected to cloud backend! (Socket ID: ${socket.id})`);
   fleetProtocolAccepted = false;
@@ -325,12 +333,15 @@ socket.on('reconcile_active_jobs', ({ requestId, jobIds = [] }) => {
 
 // checkPrinterStatus logic has been moved to src/spooler.js
 
-socket.on('physical_print_job', async (jobData) => {
+const handlePhysicalPrintJob = async (jobData, printerTarget = null) => {
   // Command Injection Prevention (P0)
-  if (!jobData.jobId || !/^[a-zA-Z0-9_-]+$/.test(jobData.jobId)) {
+  if (!jobData || !jobData.jobId || !/^[a-zA-Z0-9_-]+$/.test(jobData.jobId)) {
     console.error(`❌ REJECTED Job: Invalid jobId format (potential injection): ${jobData.jobId}`);
     return;
   }
+
+  const selectedPrinterName = printerTarget ? printerTarget.windowsPrinterName : PRINTER_NAME;
+  const selectedSpoolerMonitor = printerTarget ? printerTarget.monitor : spoolerMonitor;
 
   // Idempotency Guard (P0) - Never re-print a previously dispatched job!
   if (journal.isDispatched(jobData.jobId)) {
@@ -339,7 +350,13 @@ socket.on('physical_print_job', async (jobData) => {
     return;
   }
 
-  journal.recordReceived(jobData.jobId, { originalName: jobData.originalName });
+  journal.recordReceived(jobData.jobId, {
+    originalName: jobData.originalName,
+    ...(printerTarget ? {
+      printerDeviceId: printerTarget.printerDeviceId,
+      windowsPrinterName: printerTarget.windowsPrinterName
+    } : {})
+  });
 
   console.log(`\n======================================================`);
   console.log(`📥 NEW PRINT JOB RECEIVED! [Job ID: ${jobData.jobId}]`);
@@ -357,6 +374,7 @@ socket.on('physical_print_job', async (jobData) => {
   const ext = jobData.originalName ? path.extname(jobData.originalName) : '.pdf';
   const localFilePath = path.join(tempDir, `${jobData.jobId}${ext}`);
 
+  let printFilePath = localFilePath;
   try {
     console.log(`⬇️  Downloading PDF from cloud...`);
     const response = await axios({
@@ -423,7 +441,6 @@ socket.on('physical_print_job', async (jobData) => {
     console.log(`✅ File saved to disk. Validating format...`);
 
     const isWin = os.platform() === 'win32';
-    let printFilePath = localFilePath;
 
     // Convert Office formats to PDF if on Linux (Raspberry Pi)
     if (!isWin) {
@@ -450,10 +467,10 @@ socket.on('physical_print_job', async (jobData) => {
       }
     }
 
-    if (PRINTER_NAME) {
+    if (selectedPrinterName) {
       if (isWin) {
         const ptp = require('pdf-to-printer');
-        const printOptions = { printer: PRINTER_NAME };
+        const printOptions = { printer: selectedPrinterName };
         
         if (jobData.settings) {
           if (jobData.settings.copies) printOptions.copies = jobData.settings.copies;
@@ -471,12 +488,19 @@ socket.on('physical_print_job', async (jobData) => {
         }
         
         console.log(`⚙️  Windows Print options:`, JSON.stringify(printOptions));
-        journal.recordDispatchIntent(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
+        journal.recordDispatchIntent(jobData.jobId, {
+          printerName: selectedPrinterName,
+          ...(printerTarget ? {
+            printerDeviceId: printerTarget.printerDeviceId,
+            windowsPrinterName: selectedPrinterName
+          } : {}),
+          settings: jobData.settings
+        });
         await ptp.print(printFilePath, printOptions);
         journal.recordSpoolerAccepted(jobData.jobId);
       } else {
         // Linux CUPS Support (Raspberry Pi)
-        const args = ['-d', PRINTER_NAME, '-t', jobData.jobId];
+        const args = ['-d', selectedPrinterName, '-t', jobData.jobId];
         
         if (jobData.settings) {
           if (jobData.settings.copies) args.push('-n', String(jobData.settings.copies));
@@ -494,7 +518,14 @@ socket.on('physical_print_job', async (jobData) => {
         args.push(printFilePath);
         
         console.log(`⚙️  Linux Print command: lp ${args.join(' ')}`);
-        journal.recordDispatchIntent(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
+        journal.recordDispatchIntent(jobData.jobId, {
+          printerName: selectedPrinterName,
+          ...(printerTarget ? {
+            printerDeviceId: printerTarget.printerDeviceId,
+            windowsPrinterName: selectedPrinterName
+          } : {}),
+          settings: jobData.settings
+        });
         await execFileAsync('lp', args);
         journal.recordSpoolerAccepted(jobData.jobId);
       }
@@ -505,12 +536,12 @@ socket.on('physical_print_job', async (jobData) => {
       socket.emit('print_spooler_success', { jobId: jobData.jobId });
 
       // P3-001: True Print Verification via Spooler Polling
-      spoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket);
+      selectedSpoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket);
     } else {
       // Simulation mode bypass (No physical printer)
       journal.recordDispatchIntent(jobData.jobId, { mode: 'simulation' });
       journal.recordSpoolerAccepted(jobData.jobId, { mode: 'simulation' });
-      spoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket);
+      selectedSpoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket);
     }
 
 
@@ -521,6 +552,50 @@ socket.on('physical_print_job', async (jobData) => {
     if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
     if (printFilePath !== localFilePath && fs.existsSync(printFilePath)) fs.unlinkSync(printFilePath);
   }
+};
+socket.on('physical_print_job', (jobData) => {
+  const hasDeviceBinding = !!jobData && Object.prototype.hasOwnProperty.call(jobData, 'printerDeviceId');
+  if (hasDeviceBinding) {
+    const printerDeviceId = typeof jobData.printerDeviceId === 'string'
+      ? jobData.printerDeviceId.trim()
+      : '';
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(printerDeviceId)) {
+      socket.emit('print_spooler_error', {
+        jobId: jobData?.jobId,
+        error: 'Invalid server-issued PrinterDevice binding. Physical dispatch was refused.'
+      });
+      return;
+    }
+    if (!fleetProtocolAccepted || !fleetManager) {
+      socket.emit('print_spooler_error', {
+        jobId: jobData.jobId,
+        error: 'Multi-printer Agent registry is not synchronized. Physical dispatch was refused.'
+      });
+      return;
+    }
+
+    dispatchScheduler.schedule(printerDeviceId, async () => {
+      // Re-resolve after waiting in the FIFO lane so a stale approval or queue
+      // mapping cannot be used for a later dispatch.
+      if (!fleetProtocolAccepted || !fleetManager) {
+        throw new Error('Multi-printer Agent registry is no longer available.');
+      }
+      const printerTarget = fleetManager.resolveForPrint(printerDeviceId);
+      await handlePhysicalPrintJob(jobData, printerTarget);
+    }).catch((error) => {
+      console.error(`❌ Device-bound dispatch rejected for Job ${jobData.jobId}: ${error.message}`);
+      socket.emit('print_spooler_error', {
+        jobId: jobData.jobId,
+        error: error.message
+      });
+    });
+    return;
+  }
+
+  // Backward compatibility: only jobs without a device binding may use PRINTER_NAME.
+  handlePhysicalPrintJob(jobData).catch((error) => {
+    console.error(`❌ Legacy dispatch failed for Job ${jobData?.jobId}: ${error.message}`);
+  });
 });
 
 // Send heartbeat every 30 seconds to keep machine online status active
