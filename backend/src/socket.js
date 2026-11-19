@@ -13,7 +13,9 @@ const {
 } = require('./services/printerAgentProtocol.service');
 const {
   verifyPrinterDeviceReport,
-  authorizePrinterDeviceDispatch
+  authorizePrinterDeviceDispatch,
+  renewPrinterDeviceDispatchLease,
+  releasePrinterDeviceDispatchLease
 } = require('./services/printerDeviceJobBinding.service');
 
 const setupSockets = (io) => {
@@ -175,6 +177,20 @@ const setupSockets = (io) => {
     // immediately before the device-bound Windows driver submission.
     socket.on('printer_device_dispatch_authorization_request', async (payload = {}) => {
       await authorizePrinterDeviceDispatch({ socket, prisma, request: payload });
+    });
+
+    socket.on('printer_device_dispatch_lease_renewal', async (payload = {}) => {
+      const result = await renewPrinterDeviceDispatchLease({ socket, prisma, request: payload });
+      if (!result.renewed) {
+        logger.warn(`Printer dispatch lease renewal refused for request ${payload?.requestId || 'unknown'}: ${result.code || 'unknown error'}`);
+      }
+    });
+
+    socket.on('printer_device_dispatch_lease_release', async (payload = {}) => {
+      const result = await releasePrinterDeviceDispatchLease({ socket, prisma, request: payload });
+      if (!result.released && result.code !== 'DISPATCH_LEASE_NOT_ACTIVE') {
+        logger.warn(`Printer dispatch lease release failed for request ${payload?.requestId || 'unknown'}: ${result.code || 'unknown error'}`);
+      }
     });
 
     // Discovery is persisted for Admin review only; it never approves a device.
