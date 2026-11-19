@@ -4,6 +4,35 @@ const SpoolerMonitor = require('../src/spooler');
 jest.mock('fs');
 jest.useFakeTimers();
 
+describe('PowerShell command encoding', () => {
+  test('encodes Windows queue names instead of interpolating them into script source', () => {
+    const queueName = "Office Printer 'Primary'; Write-Error injected";
+    const encoded = Buffer.from(queueName, 'utf16le').toString('base64');
+    const script = SpoolerMonitor.buildPrinterStatusCommand(queueName);
+
+    expect(script).toContain(`FromBase64String('${encoded}')`);
+    expect(script).not.toContain(queueName);
+    expect(script).toContain('$printerName');
+  });
+
+  test('encodes both queue and job identifiers for spooler polling and removal', () => {
+    const queueName = "Office Printer 'Primary'";
+    const jobId = 'job-123';
+    const queueEncoded = Buffer.from(queueName, 'utf16le').toString('base64');
+    const jobEncoded = Buffer.from(jobId, 'utf16le').toString('base64');
+
+    const query = SpoolerMonitor.buildPrintJobQueryCommand(queueName);
+    const remove = SpoolerMonitor.buildRemovePrintJobCommand(queueName, jobId);
+
+    expect(query).toContain(`FromBase64String('${queueEncoded}')`);
+    expect(query).not.toContain(queueName);
+    expect(remove).toContain(`FromBase64String('${queueEncoded}')`);
+    expect(remove).toContain(`FromBase64String('${jobEncoded}')`);
+    expect(remove).not.toContain(queueName);
+    expect(remove).not.toContain(jobId);
+  });
+});
+
 describe('SpoolerMonitor', () => {
   let mockExecFile;
   let mockSocket;
