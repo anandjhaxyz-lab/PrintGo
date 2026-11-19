@@ -323,6 +323,33 @@ class JobJournal {
     return !!this.data[jobId];
   }
 
+  /**
+   * Classifies a duplicate delivery without treating spooler handoff as proof
+   * of physical completion. Unknown or malformed states fail closed.
+   *
+   * PROCESS: no prior entry, or RECEIVED before dispatch intent.
+   * COMPLETED: durable local completion evidence exists.
+   * AMBIGUOUS: dispatch may have reached the driver, or evidence is unreliable.
+   */
+  getReplayDisposition(jobId) {
+    if (this.isCorrupted) return 'AMBIGUOUS';
+
+    const entry = this.data[jobId];
+    if (!entry) return 'PROCESS';
+    if (this.isCorruptedEntry(entry)) return 'AMBIGUOUS';
+
+    if (entry.state === 'RECEIVED') return 'PROCESS';
+    if (['COMPLETED_LOCALLY', 'ACKNOWLEDGED'].includes(entry.state)) {
+      return 'COMPLETED';
+    }
+    if (['DISPATCH_INTENT', 'DISPATCHED_TO_SPOOLER', 'SPOOLER_ACCEPTED', 'SPOOLING'].includes(entry.state)) {
+      return 'AMBIGUOUS';
+    }
+
+    // Unrecognized states must never authorize another physical submission.
+    return 'AMBIGUOUS';
+  }
+
   isDispatched(jobId) {
     const entry = this.data[jobId];
     if (!entry) return false;
