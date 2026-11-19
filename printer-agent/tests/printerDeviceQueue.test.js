@@ -111,9 +111,18 @@ describe('PrinterDeviceQueue', () => {
     expect(order).toEqual(['legacy:start', 'device:start', 'device:end', 'legacy:end']);
   });
 
+  test('accepts the maximum supported Windows queue-name lane length', async () => {
+    const queue = new PrinterDeviceQueue();
+    const laneKey = `queue:${'Q'.repeat(256)}`;
+    await expect(queue.enqueue(laneKey, async () => 'ok')).resolves.toBe('ok');
+  });
+
   test('rejects invalid lane keys and non-function tasks', () => {
     const queue = new PrinterDeviceQueue();
     expect(() => queue.enqueue('', () => {})).toThrow(
+      expect.objectContaining({ code: 'INVALID_PRINTER_LANE' })
+    );
+    expect(() => queue.enqueue('Q'.repeat(321), () => {})).toThrow(
       expect.objectContaining({ code: 'INVALID_PRINTER_LANE' })
     );
     expect(() => queue.enqueue('device:a', null)).toThrow(
