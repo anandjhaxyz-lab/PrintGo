@@ -11,7 +11,10 @@ const {
   handlePrinterInventoryReport,
   handlePrinterDeviceTelemetry
 } = require('./services/printerAgentProtocol.service');
-const { verifyPrinterDeviceReport } = require('./services/printerDeviceJobBinding.service');
+const {
+  verifyPrinterDeviceReport,
+  authorizePrinterDeviceDispatch
+} = require('./services/printerDeviceJobBinding.service');
 
 const setupSockets = (io) => {
   // WebSocket Authentication Middleware
@@ -166,6 +169,12 @@ const setupSockets = (io) => {
         logger,
         requestId: payload?.requestId
       });
+    });
+
+    // Final database authorization runs after Agent document preparation and
+    // immediately before the device-bound Windows driver submission.
+    socket.on('printer_device_dispatch_authorization_request', async (payload = {}) => {
+      await authorizePrinterDeviceDispatch({ socket, prisma, request: payload });
     });
 
     // Discovery is persisted for Admin review only; it never approves a device.
