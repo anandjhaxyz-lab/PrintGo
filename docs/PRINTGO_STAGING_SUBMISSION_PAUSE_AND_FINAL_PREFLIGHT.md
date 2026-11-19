@@ -230,3 +230,31 @@ At approximately `2026-11-19T13:29:41Z`:
 - No deploy or migration event was observed after the maintenance enable in the inspected event response.
 
 **Decision remains: NOT AUTHORIZED TO MIGRATE/DEPLOY OR REOPEN.** Keep Staging Maintenance Mode enabled until the operator, payment, PITR and release-path gates have documented proof and a separately approved release window. Production remains untouched.
+
+
+## Operator confirmations and repeat checks — 2026-11-19
+
+The user/operator confirmed in chat that:
+- Cashfree Dashboard shows zero Pending/Processing orders.
+- The client Windows PC print spooler is idle.
+
+These are recorded as operator confirmations, not independently queried through a Cashfree connector or Windows PC management session. The connected app tools do not expose Cashfree merchant orders or the client's local Windows spooler.
+
+A further read-only Render Staging check at `2026-11-19T13:35:14.379208Z` confirmed:
+- `printgo_staging` remains the database target.
+- `PrintJob`: 9 rows, all `COMPLETED`; no other job statuses.
+- `Payment`: 9 rows, all `SUCCESS`.
+- `PaymentEvent`: no rows.
+- `Refund`: no rows.
+- Render service metadata still reports `maintenanceMode.enabled=true`.
+- Auto-deploy is still enabled on `feature/printgo-production-readiness`; pre-deploy remains `npx prisma migrate deploy`.
+
+This closes the operator-confirmation portion of the checklist, subject to the normal release-window recheck. It does not independently prove that an external Cashfree callback cannot arrive later or inspect the client's Windows queue.
+
+### Remaining hard blockers
+1. Capture the exact PITR recovery status / `startsAt` for `printgo-db-staging` from Render Recovery (or its authenticated recovery API). Do not infer the actual window only from the plan.
+2. Resolve the watched-branch auto-deploy risk before any candidate merge. All implementation PRs #9–#15 and documentation/candidate PRs #16–#18 were still Draft and unmerged at the last GitHub inspection. No submitted reviews were returned.
+3. Obtain explicit release approval for the exact integrated candidate SHA and the ordered migration/deploy steps. The exact candidate's `prisma migrate status` against Staging is still not evidenced.
+4. Repeat the final DB/payment checks at the immediate pre-migration point within the approved window.
+
+**Decision:** keep Maintenance Mode enabled. The observed jobs/payments and operator confirmations are clear, but Staging migration/deploy and public reopening are still NOT AUTHORIZED. Production remains untouched.
