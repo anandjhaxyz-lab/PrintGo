@@ -1,6 +1,6 @@
 jest.mock('../src/utils/prisma', () => ({
   machine: { findUnique: jest.fn() },
-  printJob: { findMany: jest.fn() },
+  printJob: { findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
   $transaction: jest.fn()
 }));
 
@@ -29,9 +29,13 @@ jest.mock('../src/services/printerAgentProtocol.service', () => ({
 jest.mock('../src/services/queueService', () => ({
   startPrintingProcess: jest.fn().mockResolvedValue(undefined)
 }));
+jest.mock('../src/modules/payments/payments.service', () => ({
+  refundPayment: jest.fn().mockResolvedValue({ status: 'REFUNDED' })
+}));
 
 const prisma = require('../src/utils/prisma');
 const queueService = require('../src/services/queueService');
+const paymentsService = require('../src/modules/payments/payments.service');
 const setupSockets = require('../src/socket');
 
 const makeHarness = () => {
@@ -77,6 +81,10 @@ describe('Socket reconciliation request consumption', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     prisma.printJob.findMany.mockResolvedValue([]);
+    prisma.printJob.findUnique.mockReset();
+    prisma.printJob.update.mockReset();
+    paymentsService.refundPayment.mockReset();
+    paymentsService.refundPayment.mockResolvedValue({ status: 'REFUNDED' });
   });
 
   test('does not consume a reconciliation slot when PrinterDevice identity is invalid', async () => {
@@ -109,6 +117,60 @@ describe('Socket reconciliation request consumption', () => {
     expect(active.jobIds.has(job.shortId)).toBe(true);
     expect(tx.printJob.updateMany).not.toHaveBeenCalled();
     expect(queueService.startPrintingProcess).not.toHaveBeenCalled();
+  });
+
+  test('does not request a refund for a pending payment after Agent rejects before driver submission', async () => {
+    const { handlers } = makeHarness();
+    const job = {
+      ...makeDeviceJob(),
+      paymentId: 'payment-pending',
+      payment: { status: 'PENDING' }
+    };
+    prisma.printJob.findUnique.mockResolvedValue(job);
+    prisma.printJob.update.mockResolvedValue({ ...job, status: 'FAILED' });
+
+    await handlers.print_spooler_error({
+      jobId: job.shortId,
+      printerDeviceId: job.printerDeviceId,
+      windowsPrinterName: job.printerWindowsQueueName,
+      error: 'DEVICE_NOT_ACTIVE'
+    });
+
+    expect(prisma.printJob.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { shortId: job.shortId },
+      data: { status: 'FAILED' },
+      include: expect.objectContaining({ payment: true })
+    }));
+    expect(paymentsService.refundPayment).not.toHaveBeenCalled();
+  });
+
+  test('requests an idempotent refund when Agent rejects a job with successful payment before driver submission', async () => {
+    const { handlers } = makeHarness();
+    const job = {
+      ...makeDeviceJob(),
+      paymentId: 'payment-success',
+      payment: { status: 'SUCCESS' }
+    };
+    prisma.printJob.findUnique.mockResolvedValue(job);
+    prisma.printJob.update.mockResolvedValue({ ...job, status: 'FAILED' });
+
+    await handlers.print_spooler_error({
+      jobId: job.shortId,
+      printerDeviceId: job.printerDeviceId,
+      windowsPrinterName: job.printerWindowsQueueName,
+      error: 'DEVICE_NOT_ACTIVE'
+    });
+
+    expect(paymentsService.refundPayment).toHaveBeenCalledWith(
+      job.shortId,
+      null,
+      expect.stringContaining('DEVICE_NOT_ACTIVE'),
+      expect.objectContaining({
+        initiatedBy: 'SYSTEM',
+        preserveJobStatus: true,
+        idempotencyKey: expect.stringContaining(job.id)
+      })
+    );
   });
 
   test('consumes the reconciliation slot after exact job/device/Machine validation', async () => {
