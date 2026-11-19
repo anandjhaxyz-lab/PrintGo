@@ -80,12 +80,8 @@ describe('JobJournal multi-printer schema v2 compatibility', () => {
   });
 
   test('prevents a dispatched job from changing its physical printer binding', () => {
-    const journal = new JobJournal(journalPath, {
-      markerPath,
-      keysDir,
-      checkKeys: false,
-      isProvisioning: true
-    });
+    fs.writeFileSync(journalPath, JSON.stringify({ version: 1, jobs: {} }));
+    const journal = new JobJournal(journalPath, { markerPath, keysDir, checkKeys: false });
 
     journal.recordReceived('bound_job', {
       printerDeviceId: 'device-1',
@@ -108,12 +104,8 @@ describe('JobJournal multi-printer schema v2 compatibility', () => {
   });
 
   test('rejects assigning a new device to a legacy job after dispatch has begun', () => {
-    const journal = new JobJournal(journalPath, {
-      markerPath,
-      keysDir,
-      checkKeys: false,
-      isProvisioning: true
-    });
+    fs.writeFileSync(journalPath, JSON.stringify({ version: 1, jobs: {} }));
+    const journal = new JobJournal(journalPath, { markerPath, keysDir, checkKeys: false });
 
     journal.recordReceived('legacy_job', { originalName: 'legacy.pdf' });
     journal.recordDispatchIntent('legacy_job', { printerName: 'Legacy Queue' });
