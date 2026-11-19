@@ -5,6 +5,10 @@ const { getMachineAvailability, computePrinterAvailability } = require('./servic
 
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const {
+  handlePrinterAgentHello,
+  handlePrinterInventoryReport
+} = require('./services/printerAgentProtocol.service');
 
 const setupSockets = (io) => {
   // WebSocket Authentication Middleware
@@ -132,6 +136,18 @@ const setupSockets = (io) => {
       }
     });
 
+    // Backward-compatible Agent protocol negotiation. Older agents never emit
+    // this event and continue using the existing Machine Key + single-printer flow.
+    socket.on('printer_agent_hello', async (payload) => {
+      await handlePrinterAgentHello({ socket, prisma, logger, payload });
+    });
+
+    // Discovery is advisory only. This event never approves, binds, creates or
+    // mutates PrinterDevice records; it is forwarded to Admin sockets for review.
+    socket.on('printer_inventory_report', (payload) => {
+      handlePrinterInventoryReport({ socket, io, logger, payload });
+    });
+
     // Kiosk <-> Mobile Sync
     socket.on('join_session', (sessionId) => {
       // Validate: session tokens can only join their own session room
@@ -207,6 +223,62 @@ const setupSockets = (io) => {
     });
 
     socket.on('printer_status_update', async (status) => {
+      // Per-device telemetry is stored separately from legacy Machine-wide
+      // PrinterStatus. This avoids one child printer's health affecting the
+      // current single-QR customer availability path before Phase 3 routing.
+      if (status?.printerDeviceId) {
+        if (socket.userType !== 'printer' || !socket.machineId || typeof status.printerDeviceId !== 'string') {
+          logger.warn('Rejected device telemetry from a non-printer or unauthenticated socket');
+          return;
+        }
+
+        try {
+          const device = await prisma.printerDevice.findFirst({
+            where: {
+              id: status.printerDeviceId,
+              machineId: socket.machineId
+            },
+            select: { id: true }
+          });
+
+          if (!device) {
+            logger.warn(`Rejected printer telemetry: device ${status.printerDeviceId} does not belong to Machine ${socket.machineId}`);
+            return;
+          }
+
+          const message = String(status.errorMessage || '').toLowerCase();
+          let healthStatus = 'UNKNOWN';
+          if (status.isError === false) {
+            healthStatus = 'ONLINE';
+          } else if (status.isError === true && (message.includes('out of paper') || message.includes('paper out'))) {
+            healthStatus = 'PAPER_OUT';
+          } else if (status.isError === true && (message.includes('paper jam') || message.includes('jam'))) {
+            healthStatus = 'JAMMED';
+          } else if (status.isError === true && (message.includes('offline') || message.includes('unplugged'))) {
+            healthStatus = 'OFFLINE';
+          } else if (status.isError === true) {
+            healthStatus = 'ERROR';
+          }
+
+          const lastTelemetryAt = new Date();
+          await prisma.printerDevice.update({
+            where: { id: device.id },
+            data: { healthStatus, lastTelemetryAt }
+          });
+
+          io.to('admins').emit('printer_device_status_update', {
+            ...status,
+            machineId: socket.machineId,
+            printerDeviceId: device.id,
+            healthStatus,
+            lastTelemetryAt: lastTelemetryAt.toISOString()
+          });
+        } catch (err) {
+          logger.error(`Error saving telemetry for PrinterDevice ${status.printerDeviceId}:`, err);
+        }
+        return;
+      }
+
       if (socket.machineId) {
         try {
           const printerModel = (status?.printerModel || status?.printerName || status?.model || '').trim();
