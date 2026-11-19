@@ -36,7 +36,8 @@ services:
 
   - type: keyvalue
     name: printgo-redis
-    plan: free
+    plan: free # Ephemeral test-only tier; use a persistent paid plan for durable BullMQ queues.
+    ipAllowList: []
 
 databases:
   - name: printgo-db
