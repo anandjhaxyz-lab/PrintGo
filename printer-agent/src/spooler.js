@@ -63,6 +63,8 @@ class SpoolerMonitor {
   constructor({ execFile, printerName, journal }) {
     this.execFile = execFile;
     this.printerName = printerName;
+    this.platform = options.platform || os.platform();
+    this.isWin = this.platform === 'win32';
     this.journal = journal;
     this.isCheckingStatus = false;
     this.portName = 'Unknown';
@@ -74,7 +76,7 @@ class SpoolerMonitor {
     if (this.isCheckingStatus) return; // Prevent overlapping executions
     this.isCheckingStatus = true;
     
-    if (isWin) {
+    if (this.isWin) {
       this.execFile('powershell.exe', [
         '-NoProfile',
         '-NonInteractive',
@@ -215,7 +217,7 @@ class SpoolerMonitor {
         return;
       }
 
-      if (isWin) {
+      if (this.isWin) {
         isPollingExecution = true;
         this.execFile('powershell.exe', [
           '-NoProfile',
