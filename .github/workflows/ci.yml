@@ -9,6 +9,7 @@ on:
       - feature/printgo-production-readiness
       - work/printgo-selective-ads-20261117
       - feat/multi-printer-agent-fleet
+      - feat/multi-printer-backend-agent-protocol
   pull_request:
     branches:
       - main
@@ -16,6 +17,7 @@ on:
       - develop
       - feature/printgo-production-readiness
       - feat/multi-printer-foundation
+      - feat/multi-printer-agent-fleet
 
 jobs:
   # =========================================================================
@@ -72,7 +74,7 @@ jobs:
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target
 
       - name: Validate Backend Runtime Syntax
-        run: node --check src/server.js && node --check src/services/redisClient.js && node --check src/services/queueService.js && node --check src/services/uploadWorker.js && node --check src/modules/upload/upload.controller.js && node --check src/modules/upload/upload.service.js && node --check src/utils/uploadPaths.js
+        run: node --check src/server.js && node --check src/services/printerAgentProtocol.service.js && node --check src/services/redisClient.js && node --check src/services/queueService.js && node --check src/services/uploadWorker.js && node --check src/modules/upload/upload.controller.js && node --check src/modules/upload/upload.service.js && node --check src/utils/uploadPaths.js
 
       - name: Run Backend Jest Test Suites (12 Suites)
         run: npx jest tests/upload_worker_storage_resolution.test.js tests/phase2_printer_qr_services_and_api.test.js tests/printer_status_and_safety.test.js tests/advertisement_repair_and_safety.test.js tests/ad_suppression_phase2.test.js tests/admin_analytics_printer_availability.test.js tests/readOnlyGuard_advertisement_scoping.test.js tests/readOnlyGuard_cash_payment_scoping.test.js tests/cash_payment_and_mode_switching.test.js tests/redis_infrastructure_safety.test.js tests/readOnlyGuard_staging_payment_mode_config.test.js tests/payment_mode_consistency.test.js --runInBand --forceExit
@@ -87,6 +89,12 @@ jobs:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+
+      - name: Run Multi-Printer Agent Protocol Tests
+        run: npx jest tests/printer_agent_protocol.test.js --runInBand --forceExit
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
 
       - name: Run Phase 3T Supervised Demo Payment Access Lock Suite (12 Tests)
         run: node tests/phase3t_demo_access_lock.test.js
