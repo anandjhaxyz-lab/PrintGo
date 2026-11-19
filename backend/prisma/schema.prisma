@@ -419,6 +419,9 @@ model PrintJob {
   machine         Machine?       @relation(fields: [machineId], references: [id], onDelete: SetNull)
   printerDeviceId String?
   printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
+  // Immutable physical Windows queue selected for this job at creation time.
+  // This must not be read from the mutable PrinterDevice row for Agent reports.
+  printerWindowsQueueName String?
   customerId    String?
   customer      Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
   documentId    String
