@@ -118,10 +118,11 @@ class PrinterFleetManager {
       if (!name) {
         throw new PrinterFleetError('INVALID_DISCOVERY_RECORD', 'Discovered printer is missing its exact Windows queue name.');
       }
-      if (discoveredByName.has(name)) {
+      const normalizedName = name.toLowerCase();
+      if (discoveredByName.has(normalizedName)) {
         throw new PrinterFleetError('DUPLICATE_DISCOVERED_QUEUE', `Duplicate discovered queue: ${name}`);
       }
-      discoveredByName.set(name, { ...printer, windowsPrinterName: name });
+      discoveredByName.set(normalizedName, { ...printer, windowsPrinterName: name });
     }
 
     const seenIds = new Set();
@@ -148,7 +149,7 @@ class PrinterFleetManager {
       }
 
       const discoveredPrinter = device.windowsPrinterName
-        ? discoveredByName.get(device.windowsPrinterName) || null
+        ? discoveredByName.get(device.windowsPrinterName.toLowerCase()) || null
         : null;
       const approvalValid = device.status === ACTIVE_DEVICE_STATUS && !!device.approvedAt;
       let canPrint = approvalValid && !!discoveredPrinter;
