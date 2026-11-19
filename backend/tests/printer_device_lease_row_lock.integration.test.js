@@ -124,6 +124,8 @@ describe('PostgreSQL PrinterDevice row-lock concurrency', () => {
     const firstLocked = deferred();
     const releaseFirst = deferred();
     const secondLocked = deferred();
+    let secondTransaction;
+    let secondAcquired = false;
 
     const firstTransaction = firstClient.$transaction(async (tx) => {
       await tx.$queryRawUnsafe(lockSql, 'device-a');
@@ -133,18 +135,22 @@ describe('PostgreSQL PrinterDevice row-lock concurrency', () => {
 
     try {
       await within(firstLocked.promise, 'first device row lock');
-      const secondTransaction = secondClient.$transaction(async (tx) => {
+      secondTransaction = secondClient.$transaction(async (tx) => {
         await tx.$queryRawUnsafe(lockSql, 'device-b');
+        secondAcquired = true;
         secondLocked.resolve();
       });
 
       await within(secondLocked.promise, 'independent second device row lock');
-      expect(true).toBe(true);
+      expect(secondAcquired).toBe(true);
       releaseFirst.resolve();
       await within(Promise.all([firstTransaction, secondTransaction]), 'independent row-lock transactions');
     } finally {
       releaseFirst.resolve();
-      await firstTransaction.catch(() => {});
+      await Promise.all([
+        firstTransaction.catch(() => {}),
+        secondTransaction?.catch(() => {})
+      ].filter(Boolean));
     }
   }, 15000);
 });
