@@ -554,18 +554,26 @@ const processPhysicalPrintJob = async (jobData) => {
     }
   }
 
-  // Idempotency Guard (P0) - Never re-print a previously dispatched job!
-  if (journal.isDispatched(jobData.jobId)) {
-    console.warn(`⚠️ IDEMPOTENCY GUARD: Job ${jobData.jobId} was already dispatched/printed locally. Refusing duplicate physical print!`);
+  // Duplicate delivery must distinguish durable completion from uncertain
+  // driver handoff. A dispatch intent is NOT proof of physical completion.
+  const replayDisposition = journal.getReplayDisposition(jobData.jobId);
+  if (replayDisposition === 'COMPLETED') {
+    console.warn(`⚠️ IDEMPOTENCY GUARD: Job ${jobData.jobId} has durable local completion evidence. Refusing duplicate physical print.`);
     socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true, ...deviceBinding });
     return;
   }
 
-  if (journal.isCorrupted) {
+  if (replayDisposition === 'AMBIGUOUS') {
+    const journalState = existingJournalEntry?.state || 'UNKNOWN';
+    const spoolerMayHaveAccepted = ['DISPATCH_INTENT', 'DISPATCHED_TO_SPOOLER', 'SPOOLER_ACCEPTED', 'SPOOLING'].includes(journalState);
+    const reason = journal.isCorrupted
+      ? `Local journal corrupted/unreadable: ${journal.corruptionReason}. Manual verification required.`
+      : `Duplicate job delivery found journal state "${journalState}" without durable physical-completion evidence. Manual verification required; automatic reprint refused.`;
+    console.warn(`⚠️ AMBIGUOUS DUPLICATE: ${jobData.jobId}: ${reason}`);
     socket.emit('print_physical_ambiguous', {
       jobId: jobData.jobId,
-      reason: `Local journal corrupted/unreadable: ${journal.corruptionReason}. Manual verification required.`,
-      wasSeenInQueue: false,
+      reason,
+      wasSeenInQueue: spoolerMayHaveAccepted,
       ...deviceBinding
     });
     return;
