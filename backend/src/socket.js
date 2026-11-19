@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const {
   handlePrinterAgentHello,
+  handlePrinterDeviceRegistryRequest,
   handlePrinterInventoryReport,
   handlePrinterDeviceTelemetry
 } = require('./services/printerAgentProtocol.service');
@@ -154,6 +155,17 @@ const setupSockets = (io) => {
     // this event and continue using the existing Machine Key + single-printer flow.
     socket.on('printer_agent_hello', async (payload) => {
       await handlePrinterAgentHello({ socket, prisma, logger, payload });
+    });
+
+    // Device-bound print requests fetch a fresh authenticated registry so an
+    // Admin approval/disable/remap is applied before any physical dispatch.
+    socket.on('printer_device_registry_request', async (payload = {}) => {
+      await handlePrinterDeviceRegistryRequest({
+        socket,
+        prisma,
+        logger,
+        requestId: payload?.requestId
+      });
     });
 
     // Discovery is persisted for Admin review only; it never approves a device.
