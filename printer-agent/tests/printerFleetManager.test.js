@@ -72,6 +72,18 @@ describe('PrinterFleetManager', () => {
     );
   });
 
+  test('refuses dispatch when an approved queue has no independent health monitor', async () => {
+    const manager = new PrinterFleetManager({
+      discoverPrinters: async () => [discovered('Epson L6460')],
+      getDeviceRegistry: async () => [activeDevice('device-1', 'Epson L6460')]
+    });
+
+    const [device] = await manager.refresh();
+    expect(device.canPrint).toBe(false);
+    expect(device.reason).toBe('DEVICE_MONITOR_UNAVAILABLE');
+    expect(() => manager.resolveForPrint('device-1')).toThrow();
+  });
+
   test('does not route an approved device when its exact queue is absent or renamed', async () => {
     const manager = new PrinterFleetManager({
       discoverPrinters: async () => [discovered('Epson L6460 (Copy 1)')],
