@@ -173,13 +173,20 @@ class SpoolerMonitor {
     });
   }
 
-  startPollingJob(jobId, localFilePath, socket) {
+  startPollingJob(jobId, localFilePath, socket, printerBinding = {}) {
+    const eventBinding = printerBinding && printerBinding.printerDeviceId
+      ? {
+          printerDeviceId: printerBinding.printerDeviceId,
+          windowsPrinterName: printerBinding.windowsPrinterName
+        }
+      : {};
+
     if (!this.printerName || this.printerName === 'SimulationMode') {
       console.log(`⚠️  SIMULATION MODE: Bypassing physical print for job ${jobId}`);
-      socket.emit('print_spooler_success', { jobId });
+      socket.emit('print_spooler_success', { jobId, ...eventBinding });
       setTimeout(() => {
-        if (this.journal) this.journal.recordCompleted(jobId, { mode: 'simulation' });
-        socket.emit('print_physical_success', { jobId, mode: 'simulation' });
+        if (this.journal) this.journal.recordCompleted(jobId, { mode: 'simulation', ...eventBinding });
+        socket.emit('print_physical_success', { jobId, mode: 'simulation', ...eventBinding });
         if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
       }, 3000);
       return null;
@@ -204,14 +211,16 @@ class SpoolerMonitor {
           socket.emit('print_physical_ambiguous', { 
             jobId, 
             reason: 'Spooler Monitoring Timeout while in queue',
-            wasSeenInQueue: true 
+            wasSeenInQueue: true,
+            ...eventBinding 
           });
         } else {
           // Never seen in queue and timed out
           socket.emit('print_physical_ambiguous', { 
             jobId, 
             reason: 'Job was never observed in queue within timeout window',
-            wasSeenInQueue: false 
+            wasSeenInQueue: false,
+            ...eventBinding 
           });
         }
         if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
@@ -239,16 +248,16 @@ class SpoolerMonitor {
               // Verified transition: It was in queue, and now is safely cleared
               clearInterval(pollSpooler);
               console.log(`✅ Job ${jobId} physically completed (verified in spooler and cleared)!`);
-              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
-              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
+              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             } else if (checkAttempts >= 3) {
               // Fast spooling edge case: If the job cleared faster than our first check,
               // check if spooler dispatch succeeded and printer has 0 errors
               clearInterval(pollSpooler);
               console.log(`ℹ️ Job ${jobId} cleared from spooler before queue capture. Confirming driver state...`);
-              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true });
-              socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true });
+              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
+              socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             }
             return;
@@ -266,7 +275,7 @@ class SpoolerMonitor {
               if (status.includes('Error') || status.includes('PaperOut') || status.includes('PaperJam') || status.includes('Blocked')) {
                 clearInterval(pollSpooler);
                 console.error(`❌ Physical Print Error for Job ${jobId}: ${status}`);
-                socket.emit('print_physical_error', { jobId, error: status });
+                socket.emit('print_physical_error', { jobId, error: status, ...eventBinding });
                 this.execFile('powershell.exe', [
                   '-NoProfile',
                   '-NonInteractive',
@@ -279,8 +288,8 @@ class SpoolerMonitor {
               // Was seen in queue on previous check, now gone -> completed!
               clearInterval(pollSpooler);
               console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
-              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
-              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
+              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             }
           } catch (e) {
@@ -300,13 +309,13 @@ class SpoolerMonitor {
           } else if (wasSeenInQueue) {
              clearInterval(pollSpooler);
              console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
-             if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true });
-             socket.emit('print_physical_success', { jobId, wasSeenInQueue: true });
+             if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+             socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
           } else if (checkAttempts >= 3) {
              clearInterval(pollSpooler);
-             if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true });
-             socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true });
+             if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
+             socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
           }
         });
