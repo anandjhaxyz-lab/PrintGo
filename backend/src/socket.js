@@ -572,7 +572,7 @@ const setupSockets = (io) => {
 
         // Agent-side pre-dispatch authorization failures never reached a printer.
         // Keep payment recovery aligned with physical printer errors.
-        if (failedJob.paymentId) {
+        if (failedJob.paymentId && failedJob.payment?.status === 'SUCCESS') {
           try {
             const paymentsService = require('./modules/payments/payments.service');
             await paymentsService.refundPayment(
