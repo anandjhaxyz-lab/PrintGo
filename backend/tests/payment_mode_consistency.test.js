@@ -297,7 +297,7 @@ describe('PrintGo Unified Payment Mode Consistency Suite', () => {
       expect(job.paymentMode).toBe(DEFAULT_PAYMENT_MODE);
       expect(prisma.session.findUnique).toHaveBeenCalledWith({
         where: { code: 'sess_abc' },
-        select: { paymentMode: true }
+        select: { machineId: true, printerDeviceId: true, paymentMode: true }
       });
       expect(prisma.machine.findUnique).toHaveBeenCalledWith({
         where: { id: 'mach-1' },
