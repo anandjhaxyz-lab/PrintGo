@@ -342,7 +342,7 @@ $assert_lease_constraints$;
 
 DO $assert_queue_snapshot$
 BEGIN
-  IF (SELECT "printerWindowsQueueName" FROM "PrintJob" WHERE "id" = 'job-a') <> 'Epson L6460' THEN
+  IF (SELECT "printerWindowsQueueName" FROM "PrintJob" WHERE "id" = 'job-a') IS DISTINCT FROM 'Epson L6460' THEN
     RAISE EXCEPTION '00016: known queue snapshot was not backfilled';
   END IF;
 
@@ -363,9 +363,9 @@ BEGIN
     RAISE EXCEPTION '00016: changing the device mapping rewrote the historical PrintJob queue snapshot';
   END IF;
 
-  IF (SELECT "status" FROM "PrintJob" WHERE "id" = 'job-a') <> 'COMPLETED'
-     OR (SELECT "cost" FROM "PrintJob" WHERE "id" = 'job-a') <> 12.50
-     OR (SELECT "paymentMode" FROM "PrintJob" WHERE "id" = 'job-a') <> 'CASH_AT_COUNTER' THEN
+  IF (SELECT "status" FROM "PrintJob" WHERE "id" = 'job-a') IS DISTINCT FROM 'COMPLETED'
+     OR (SELECT "cost" FROM "PrintJob" WHERE "id" = 'job-a') IS DISTINCT FROM 12.50
+     OR (SELECT "paymentMode" FROM "PrintJob" WHERE "id" = 'job-a') IS DISTINCT FROM 'CASH_AT_COUNTER' THEN
     RAISE EXCEPTION 'Full migration chain changed historical PrintJob payment/status/cost data';
   END IF;
 END
