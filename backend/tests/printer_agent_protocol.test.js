@@ -240,6 +240,7 @@ describe('Printer Agent protocol — inventory report', () => {
       userType: 'printer',
       machineId: 'machine-a',
       machineName: 'Shop PC',
+      agentProtocol: { supportsMultiPrinter: true },
       emit: jest.fn()
     };
     const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
@@ -257,10 +258,11 @@ describe('Printer Agent protocol — inventory report', () => {
       }
     });
 
-    expect(result.accepted).toBe(false);
+    expect(result).toEqual(expect.objectContaining({ accepted: false, code: 'INVALID_CONNECTION_TYPE' }));
     expect(io.to).not.toHaveBeenCalled();
     expect(socket.emit).toHaveBeenCalledWith('printer_inventory_report_ack', expect.objectContaining({
-      accepted: false
+      accepted: false,
+      code: 'INVALID_CONNECTION_TYPE'
     }));
   });
 
