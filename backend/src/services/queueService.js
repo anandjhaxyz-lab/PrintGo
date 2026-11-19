@@ -78,7 +78,7 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
     }
   }
 
-  console.warn(`Job ${job.shortId} was marked FAILED because device dispatch was refused [${code}].`);
+  console.warn(`Job ${job.shortId} was marked ${terminalStatus} because device dispatch was refused [${code}].`);
   return true;
 };
 
