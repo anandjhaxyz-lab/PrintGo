@@ -124,6 +124,7 @@ let statusInterval = null;
 let registeredMachineId = null;
 let fleetProtocolAccepted = false;
 let fleetManager = null;
+let latestRegistryIssuedAt = 0;
 let pendingRegistryRefresh = null;
 
 const settleRegistryRefresh = (requestId, accepted, details = {}) => {
@@ -176,6 +177,7 @@ socket.on('connect', () => {
   console.log(`✅ Connected to cloud backend! (Socket ID: ${socket.id})`);
   fleetProtocolAccepted = false;
   fleetManager = null;
+  latestRegistryIssuedAt = 0;
   
   // Register Public Key with Backend for E2EE
   socket.emit('register_public_key', { publicKey: publicKeyPem });
@@ -239,6 +241,10 @@ socket.on('printer_device_registry', async (payload) => {
   }
 
   try {
+    const registryIssuedAt = Date.parse(payload?.issuedAt);
+    if (!Number.isFinite(registryIssuedAt)) {
+      throw new Error('Backend PrinterDevice registry is missing a valid issuedAt timestamp.');
+    }
     const devices = validatePrinterDeviceRegistry(payload, registeredMachineId);
     const discoveredPrinters = await discoverWindowsPrinters({ execFile });
 
@@ -256,6 +262,19 @@ socket.on('printer_device_registry', async (payload) => {
     });
 
     const fleet = await nextFleetManager.refresh();
+    // Connect-time and print-time registry responses can overlap. Never let an
+    // older response overwrite a newer approved-device snapshot.
+    if (registryIssuedAt < latestRegistryIssuedAt) {
+      if (requestId) {
+        settleRegistryRefresh(requestId, true, {
+          machineId: registeredMachineId,
+          deviceCount: devices.length,
+          superseded: true
+        });
+      }
+      return;
+    }
+    latestRegistryIssuedAt = registryIssuedAt;
     fleetManager = nextFleetManager;
 
     // Initial hello performs a full inventory report. A print-time refresh only
@@ -279,7 +298,9 @@ socket.on('printer_device_registry', async (payload) => {
     }
   } catch (error) {
     // Fail closed: a bad registry or Windows inventory cannot enable a printer.
-    fleetManager = null;
+    if (!Number.isFinite(Date.parse(payload?.issuedAt)) || Date.parse(payload.issuedAt) >= latestRegistryIssuedAt) {
+      fleetManager = null;
+    }
     console.error(`❌ Multi-printer registry synchronization failed: ${error.message}`);
     if (requestId) {
       settleRegistryRefresh(requestId, false, {
