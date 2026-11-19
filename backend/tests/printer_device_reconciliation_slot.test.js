@@ -127,7 +127,7 @@ describe('Socket reconciliation request consumption', () => {
       jobId: job.shortId,
       status: 'NOT_DISPATCHED',
       printerDeviceId: job.printerDeviceId,
-      windowsPrinterName: job.printerDevice.windowsPrinterName
+      windowsPrinterName: job.printerWindowsQueueName
     };
     const active = {
       requestId: request.requestId,
