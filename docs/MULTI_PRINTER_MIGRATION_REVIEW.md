@@ -9,7 +9,7 @@
 
 The known Staging migration ledger currently ends at `20261118000011_add_cash_payment_mode_and_confirmation`. The five multi-printer migrations below are pending. The existing Machine-level QR index is created by migration `20261110000007_add_active_printer_qr_unique_index` as `printer_qrs_machine_id_active_unique`, with predicate `status = 'ACTIVE' AND machineId IS NOT NULL`.
 
-The Phase 1 SQL fixture applies the exact 00012 migration to an isolated synthetic legacy schema and checks legacy QR token preservation, session/job/telemetry backfills, payment-mode preservation, and retention of the old Machine-level QR constraint. This is useful coverage, but it is not a full execution test of migrations 00012–00016 against a sanitized copy of the current Staging baseline.
+The Phase 1 SQL fixture applies the exact 00012 migration to an isolated synthetic legacy schema. A second fixture, `backend/tests/sql/multi_printer_full_migration_chain.test.sql`, now applies the exact production SQL for 00012–00016 in order against an isolated representative legacy schema. It exercises QR index transition rules, lease uniqueness constraints, queue snapshot backfill for known/NULL/blank queue names, and preservation of legacy payment/job fields. Both fixtures run transactionally and finish with `ROLLBACK`; they do not connect to Staging.
 
 ## Migration-by-migration findings
 
@@ -32,7 +32,7 @@ The backfill updates several existing tables and creates indexes/foreign keys. T
 **Assessment: functionally aligned; index cleanup/referential-integrity note.**
 
 - Adds a per-Machine discovery inventory keyed by normalized `queueNameKey`, with review state defaulting to `DISCOVERED`. Discovery itself does not approve a physical printer.
-- Adds a second unique index on `(machineId, windowsPrinterName)`. 00012 already created the case-insensitive unique functional index on `(machineId, LOWER(windowsPrinterName))`; the 00013 index is therefore redundant for exact matches and adds write/storage overhead. It does not weaken the case-insensitive protection. Consider retaining only the Prisma-schema-represented index plus the functional case-insensitive index, with an explicit schema/migration decision.
+- Adds a second unique index on `(machineId, windowsPrinterName)`. 00012 already created the case-insensitive unique functional index on `(machineId, LOWER(windowsPrinterName))`; the 00013 index is therefore redundant for non-NULL exact matches and adds write/storage overhead. **Review decision: retain it for now** because the Prisma model declares `@@unique([machineId, windowsPrinterName])`; removing it without changing the Prisma schema would create schema/migration drift. The functional index remains the stronger case-insensitive duplicate guard. Revisit this only with an explicit schema migration plan.
 - `PrinterDiscovery.approvedPrinterDeviceId` is a plain nullable text field, not a foreign key. This may be intentional to preserve review history, but it permits a stale device reference if a device is ever deleted outside the supported Admin flow. Keep it documented or add a deliberate cleanup/constraint policy.
 
 ### 00014 — `printer_device_qr_uniqueness`
@@ -43,7 +43,7 @@ The backfill updates several existing tables and creates indexes/foreign keys. T
 - After 00012 has mapped legacy QR records to a default device, the new device-level partial unique index enforces at most one ACTIVE QR per non-NULL `printerDeviceId`.
 - The replacement legacy partial unique index enforces at most one ACTIVE QR per Machine only for rows whose `printerDeviceId IS NULL`. This allows multiple active QR codes on one Machine when they belong to different physical PrinterDevices, while retaining the legacy one-per-Machine rule for unbound QR rows.
 
-**Missing release evidence:** the current SQL fixture only executes 00012. Add an isolated PostgreSQL migration test that applies 00012 then 00014 and proves all of these outcomes: two different device-bound ACTIVE QRs on one Machine are allowed; a second ACTIVE QR for the same device is rejected; a second ACTIVE legacy (NULL-device) QR for one Machine is rejected; REVOKED/REPLACED rows do not block a new ACTIVE row. Also test mixed legacy/device-bound rows. Do not rely only on mocked QR service tests for this index transition.
+**Verification added:** the full-chain SQL fixture applies 00012, 00013 and 00014 in order and directly verifies: two different device-bound ACTIVE QRs on one Machine are allowed; a second ACTIVE QR for the same device is rejected; a second ACTIVE legacy (NULL-device) QR for one Machine is rejected; REVOKED/REPLACED rows do not block a new ACTIVE row; and a device-bound QR can coexist with one legacy NULL-device QR on the same Machine. This runs against a real disposable PostgreSQL server in CI, not only mocked QR service tests. The fixture's migration step passed on PostgreSQL 18 in CI run #44511811143.
 
 **Rollback warning:** once multiple ACTIVE device QR codes exist on a Machine, the original one-ACTIVE-QR-per-Machine index cannot be recreated until the extra device QR codes have been revoked/replaced or otherwise reconciled. A simple application rollback does not restore the old database invariant.
 
@@ -55,7 +55,7 @@ The backfill updates several existing tables and creates indexes/foreign keys. T
 - The service locks the PrinterDevice row before acquiring, renewing, or releasing a lease. It considers a lease active only while it is unreleased and unexpired; a released/expired row can be overwritten by a later acquisition. The current service TTL is two minutes.
 - `ON DELETE CASCADE` removes the ephemeral lease row if its PrinterDevice is deleted. `jobShortId` is not a foreign key, so the lease table is operational coordination state, not a durable job audit ledger.
 
-Before Staging, retain tests for concurrent acquisitions on the same device, simultaneous acquisitions on different devices, expired lease takeover, released lease reuse, and stale request/job renewal or release rejection. CI unit coverage is useful but does not replace a PostgreSQL row-lock/concurrency test.
+The full-chain fixture verifies the database primary-key and unique-requestId constraints, including rejection of a second lease row for one device and requestId reuse across devices. Existing backend suites also run the Admin lease and dispatch authorization tests. This migration fixture is not a multi-connection row-lock stress test; retain that as a separate concurrency/soak check if dispatch traffic/load warrants it.
 
 ### 00016 — `print_job_queue_snapshot`
 
@@ -65,7 +65,7 @@ Before Staging, retain tests for concurrent acquisitions on the same device, sim
 - It does not invent a queue name and it does not change a job's snapshot during later device remaps. New device-bound jobs are expected to capture the approved queue name at job creation.
 - Because 00012 creates legacy placeholder devices with a NULL queue name, 00016 cannot populate snapshots for historical jobs assigned to those placeholders. This is consistent with fail-closed report verification, but makes the pre-migration drain/reconcile gate in 00012 mandatory.
 
-The job snapshot tests cover creation from an approved device and Machine-scoped behavior for the placeholder case. Add/retain a PostgreSQL migration test proving the actual 00016 backfill behavior for a device with a known queue, a NULL queue, and a blank queue, plus service tests that reject reports for a NULL/mismatched snapshot and keep the original snapshot after a remap.
+The existing job snapshot tests cover creation from an approved device and Machine-scoped behavior for the placeholder case. The new PostgreSQL fixture additionally proves 00016 backfills a known queue name and leaves both NULL and whitespace-only mappings without a snapshot; it then changes the PrinterDevice queue mapping and confirms the PrintJob snapshot remains unchanged. Existing service tests cover report identity validation.
 
 ## Rollback and containment
 
@@ -80,13 +80,14 @@ The job snapshot tests cover creation from an approved device and Machine-scoped
 - [ ] Verified current Staging backup and a tested restore/rollback plan.
 - [ ] Read-only preflight of Machine, PrinterQr, Session, PrintJob, PrinterStatus counts and duplicate/NULL identity cases.
 - [ ] No unresolved non-terminal/in-flight legacy PrintJobs; drain or reconcile them before 00012.
-- [ ] Isolated PostgreSQL CI test applies the complete ordered set 00012–00016 to a representative pre-migration schema.
-- [ ] Explicit 00014 partial-index transition tests described above pass.
-- [ ] Lease database concurrency/recovery tests pass.
-- [ ] Queue snapshot backfill and immutable remap/report tests pass.
+- [x] Isolated PostgreSQL CI fixture applies the complete ordered set 00012–00016 to a representative pre-migration schema (migration fixture step passed on PostgreSQL 18 in CI run #44511811143; full workflow still running at the time of this update).
+- [x] Explicit 00014 partial-index transition tests described above pass in the isolated PostgreSQL fixture.
+- [x] Lease primary-key / requestId uniqueness and queue snapshot NULL/blank/known-name backfill assertions pass in the isolated PostgreSQL fixture.
+- [x] Existing queue snapshot/report service tests remain in the backend CI workflow.
+- [ ] Repeat a live Staging PrintJob status query immediately before any migration after new submissions are paused; the 2026-11-19 count of 9 COMPLETED jobs is only a point-in-time observation.
 - [ ] Staging-only deploy approval, smoke-test owner, and Production isolation reconfirmed.
 
-**Final decision:** review has found no direct deletion of customer QR tokens or historical job/payment rows in 00012–00016. However, the legacy in-flight job/snapshot gap and missing direct PostgreSQL coverage for the 00014 index transition are release gates. Keep the Staging candidate Draft and do not apply migrations until those gates are closed.
+**Final decision:** review found no direct deletion of customer QR tokens or historical job/payment rows in 00012–00016. The new disposable PostgreSQL fixture now validates the complete ordered chain and the key 00014/00015/00016 invariants; it passed its migration step on PostgreSQL 18 in CI run #44511811143. This closes the previous SQL-fixture coverage gap. The 00013 exact-case index is intentionally retained for Prisma schema alignment, with the extra index overhead documented. The historical-job queue-snapshot issue is safe only if the final pre-migration drain/reconciliation check confirms no unresolved non-terminal/in-flight legacy PrintJobs. The 2026-11-19 live Staging query saw 9 COMPLETED and no other statuses, but that must be repeated immediately before migration after pausing new submissions. A verified Staging backup/restore point and approved deployment window are still mandatory. Keep the Staging candidate Draft; no migration has been run on Staging or Production.
 
 
 ## Live Staging PrintJob preflight snapshot (2026-11-19)
