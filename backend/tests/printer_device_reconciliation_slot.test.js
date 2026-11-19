@@ -69,7 +69,8 @@ const makeDeviceJob = () => ({
   status: 'PRINTING',
   payment: { status: 'SUCCESS' },
   printerDeviceId: 'device-epson',
-  printerDevice: { windowsPrinterName: 'Epson L6460' }
+  printerWindowsQueueName: 'Epson L6460',
+  printerDevice: { windowsPrinterName: 'Epson L6460 (may have changed)' }
 });
 
 describe('Socket reconciliation request consumption', () => {
