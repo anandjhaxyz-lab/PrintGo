@@ -124,6 +124,54 @@ let statusInterval = null;
 let registeredMachineId = null;
 let fleetProtocolAccepted = false;
 let fleetManager = null;
+let pendingRegistryRefresh = null;
+
+const settleRegistryRefresh = (requestId, accepted, details = {}) => {
+  const pending = pendingRegistryRefresh;
+  if (!pending || pending.requestId !== requestId) return false;
+
+  clearTimeout(pending.timeoutId);
+  pendingRegistryRefresh = null;
+  if (accepted) {
+    pending.resolve(details);
+  } else {
+    pending.reject(new Error(details.message || details.code || 'PrinterDevice registry refresh failed.'));
+  }
+  return true;
+};
+
+const requestLatestPrinterRegistry = () => {
+  if (!fleetProtocolAccepted || !registeredMachineId) {
+    return Promise.reject(new Error('Multi-printer Agent protocol is not authenticated.'));
+  }
+  if (pendingRegistryRefresh) return pendingRegistryRefresh.promise;
+
+  const requestId = crypto.randomUUID();
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+
+  const pending = {
+    requestId,
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise,
+    timeoutId: null
+  };
+  pendingRegistryRefresh = pending;
+  pending.timeoutId = setTimeout(() => {
+    settleRegistryRefresh(requestId, false, {
+      code: 'REGISTRY_REFRESH_TIMEOUT',
+      message: 'The backend did not complete a fresh PrinterDevice registry sync within 15 seconds.'
+    });
+  }, 15000);
+
+  socket.emit('printer_device_registry_request', { requestId });
+  return promise;
+};
 socket.on('connect', () => {
   console.log(`✅ Connected to cloud backend! (Socket ID: ${socket.id})`);
   fleetProtocolAccepted = false;
@@ -183,8 +231,10 @@ socket.on('printer_agent_hello_ack', (ack) => {
 });
 
 socket.on('printer_device_registry', async (payload) => {
+  const requestId = typeof payload?.requestId === 'string' ? payload.requestId : null;
   if (!fleetProtocolAccepted) {
     console.warn('⚠️ Ignoring PrinterDevice registry because multi-printer capability was not negotiated.');
+    if (requestId) settleRegistryRefresh(requestId, false, { code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' });
     return;
   }
 
@@ -208,22 +258,46 @@ socket.on('printer_device_registry', async (payload) => {
     const fleet = await nextFleetManager.refresh();
     fleetManager = nextFleetManager;
 
-    socket.emit('printer_inventory_report', {
-      protocolVersion: 1,
-      discoveredPrinters
-    });
+    // Initial hello performs a full inventory report. A print-time refresh only
+    // synchronizes the approved registry and must not generate redundant reports.
+    if (!requestId) {
+      socket.emit('printer_inventory_report', {
+        protocolVersion: 1,
+        discoveredPrinters
+      });
+    }
 
     const approvedCount = fleet.filter((device) => device.canPrint).length;
     console.log(`🖨️ Printer fleet synchronized: ${discoveredPrinters.length} Windows queue(s) discovered; ${approvedCount} approved device(s) have independent monitors.`);
+
+    if (requestId) {
+      settleRegistryRefresh(requestId, true, {
+        machineId: registeredMachineId,
+        deviceCount: devices.length,
+        approvedCount
+      });
+    }
   } catch (error) {
     // Fail closed: a bad registry or Windows inventory cannot enable a printer.
     fleetManager = null;
     console.error(`❌ Multi-printer registry synchronization failed: ${error.message}`);
+    if (requestId) {
+      settleRegistryRefresh(requestId, false, {
+        code: 'REGISTRY_SYNC_FAILED',
+        message: error.message
+      });
+    }
   }
 });
 
 socket.on('printer_device_registry_error', (payload) => {
   console.warn(`⚠️ PrinterDevice registry unavailable: ${payload?.message || payload?.code || 'unknown error'}`);
+  if (payload?.requestId) {
+    settleRegistryRefresh(payload.requestId, false, {
+      code: payload.code || 'REGISTRY_UNAVAILABLE',
+      message: payload.message || 'Backend registry refresh failed.'
+    });
+  }
 });
 
 socket.on('printer_inventory_report_ack', (ack) => {
@@ -243,6 +317,12 @@ socket.on('machine_suspended', (data) => {
 socket.on('disconnect', () => {
   fleetProtocolAccepted = false;
   fleetManager = null;
+  if (pendingRegistryRefresh) {
+    settleRegistryRefresh(pendingRegistryRefresh.requestId, false, {
+      code: 'AGENT_DISCONNECTED',
+      message: 'Agent disconnected while refreshing the PrinterDevice registry.'
+    });
+  }
   console.log(`❌ Disconnected from backend. Attempting to reconnect...`);
 });
 
@@ -489,6 +569,9 @@ const processPhysicalPrintJob = async (jobData) => {
       if (os.platform() !== 'win32') {
         throw new Error('Device-bound physical printing is supported only on Windows x64 Agent installations.');
       }
+      // Refresh on every device-bound job so Admin approvals, disables and remaps
+      // are authoritative before this job chooses a physical Windows queue.
+      await requestLatestPrinterRegistry();
       if (!fleetProtocolAccepted || !fleetManager) {
         throw new Error('Authenticated multi-printer registry is unavailable. Device-bound dispatch is blocked.');
       }
