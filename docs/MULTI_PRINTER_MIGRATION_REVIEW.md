@@ -49,7 +49,7 @@ The backfill updates several existing tables and creates indexes/foreign keys. T
 
 ### 00015 — `printer_device_dispatch_leases`
 
-**Assessment: schema matches the current lease service; database-level concurrency verification required.**
+**Assessment: schema matches the current lease service; PostgreSQL row-lock behavior verified.**
 
 - The primary key on `printerDeviceId` enforces one current lease row per physical device. The unique `requestId` index prevents a request ID from being simultaneously reused on another lease row.
 - The service locks the PrinterDevice row before acquiring, renewing, or releasing a lease. It considers a lease active only while it is unreleased and unexpired; a released/expired row can be overwritten by a later acquisition. The current service TTL is two minutes.
