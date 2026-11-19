@@ -501,7 +501,14 @@ describe('Printer Agent protocol — authenticated registry refresh', () => {
       protocolVersion: 1,
       machineId: 'machine-authenticated',
       requestId,
-      devices
+      devices: [expect.objectContaining({
+        id: 'device-a',
+        displayName: 'Epson L6460',
+        windowsPrinterName: 'Epson L6460',
+        status: 'ACTIVE',
+        approvedAt: '2026-11-19T00:00:00.000Z',
+        sortOrder: 0
+      })]
     }));
   });
 
