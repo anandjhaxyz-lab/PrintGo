@@ -139,6 +139,7 @@ model PrinterDevice {
   sessions           Session[]
   printJobs          PrintJob[]
   printerStatuses    PrinterStatus[]
+  dispatchLease      PrinterDeviceDispatchLease?
 
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
@@ -146,6 +147,22 @@ model PrinterDevice {
   @@index([machineId, status])
   @@index([machineId, healthStatus])
   @@unique([machineId, windowsPrinterName])
+}
+
+// One active dispatch lease per physical printer. The device row is locked
+// during lease acquisition and Admin disable/remap mutations to serialize them.
+model PrinterDeviceDispatchLease {
+  printerDeviceId String        @id
+  printerDevice   PrinterDevice @relation(fields: [printerDeviceId], references: [id], onDelete: Cascade)
+  requestId       String        @unique
+  jobShortId      String
+  expiresAt       DateTime
+  releasedAt      DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([releasedAt, expiresAt])
+  @@index([jobShortId])
 }
 
 model PrinterDiscovery {
