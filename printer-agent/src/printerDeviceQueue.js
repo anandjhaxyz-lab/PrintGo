@@ -17,8 +17,8 @@ class PrinterDeviceQueue {
   }
 
   enqueue(laneKey, task) {
-    if (typeof laneKey !== 'string' || !laneKey.trim() || laneKey.length > 180) {
-      throw new PrinterDeviceQueueError('INVALID_PRINTER_LANE', 'A valid printer lane key is required.');
+    if (typeof laneKey !== 'string' || !laneKey.trim() || laneKey.length > 320) {
+      throw new PrinterDeviceQueueError('INVALID_PRINTER_LANE', 'A valid printer lane key of at most 320 characters is required.');
     }
     if (typeof task !== 'function') {
       throw new PrinterDeviceQueueError('INVALID_PRINTER_TASK', 'A printer queue task function is required.');
