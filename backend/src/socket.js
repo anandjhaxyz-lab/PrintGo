@@ -94,7 +94,7 @@ const setupSockets = (io) => {
             select: {
               shortId: true,
               printerDeviceId: true,
-              printerDevice: { select: { windowsPrinterName: true } }
+              printerWindowsQueueName: true
             }
           });
           
@@ -105,7 +105,7 @@ const setupSockets = (io) => {
               job.shortId,
               job.printerDeviceId ? {
                 printerDeviceId: job.printerDeviceId,
-                windowsPrinterName: job.printerDevice?.windowsPrinterName || null
+                windowsPrinterName: job.printerWindowsQueueName || null
               } : null
             ]));
             socket.activeReconciliation = {
