@@ -213,6 +213,8 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
     return { accepted: false, code: 'UNAUTHORIZED_AGENT' };
   }
 
+  // A repeated malformed hello must revoke any previously negotiated fleet capability.
+  socket.agentProtocol = null;
   const hello = validateAgentHello(payload);
   if (!hello.accepted) {
     socket.emit('printer_agent_hello_ack', hello);
