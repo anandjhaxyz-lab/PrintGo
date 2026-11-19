@@ -128,6 +128,57 @@ describe('PrinterDispatchAuthorizer', () => {
     disconnectAuthorizer.close();
   });
 
+  test('renews an active dispatch lease periodically and stops after driver handoff', () => {
+    jest.useFakeTimers();
+    const socket = createSocket();
+    socket.connected = true;
+    const authorizer = new PrinterDispatchAuthorizer(socket);
+    const input = {
+      jobId: 'JOB_DEVICE_006',
+      printerDeviceId: 'device-epson',
+      windowsPrinterName: 'Epson L6460'
+    };
+    const stopRenewal = authorizer.startLeaseRenewal({ requestId: 'request-lease' }, input, 1000);
+
+    jest.advanceTimersByTime(2500);
+    expect(socket.emitted.filter((entry) =>
+      entry.event === 'printer_device_dispatch_lease_renewal'
+    )).toHaveLength(2);
+
+    stopRenewal();
+    jest.advanceTimersByTime(3000);
+    expect(socket.emitted.filter((entry) =>
+      entry.event === 'printer_device_dispatch_lease_renewal'
+    )).toHaveLength(2);
+
+    expect(authorizer.releaseLease({ requestId: 'request-lease' }, input)).toBe(true);
+    expect(socket.emitted.at(-1)).toEqual({
+      event: 'printer_device_dispatch_lease_release',
+      payload: {
+        requestId: 'request-lease',
+        ...input
+      }
+    });
+    authorizer.close();
+  });
+
+  test('does not send lease renewal or release while disconnected', () => {
+    const socket = createSocket();
+    socket.connected = false;
+    const authorizer = new PrinterDispatchAuthorizer(socket);
+    const input = {
+      jobId: 'JOB_DEVICE_007',
+      printerDeviceId: 'device-epson',
+      windowsPrinterName: 'Epson L6460'
+    };
+
+    const stopRenewal = authorizer.startLeaseRenewal({ requestId: 'request-disconnected' }, input, 1000);
+    expect(authorizer.releaseLease({ requestId: 'request-disconnected' }, input)).toBe(false);
+    expect(socket.emitted).toHaveLength(0);
+    stopRenewal();
+    authorizer.close();
+  });
+
   test('rejects malformed requests without emitting anything', async () => {
     const socket = createSocket();
     const authorizer = new PrinterDispatchAuthorizer(socket);
