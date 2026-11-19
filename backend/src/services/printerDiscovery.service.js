@@ -68,7 +68,7 @@ const listApprovedPrinterDevices = async (user, query = {}, prisma) => {
   const parsedLimit = Number(query.limit);
   const take = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 100) : 100;
   const where = {
-    status: 'ACTIVE',
+    status: { in: ['ACTIVE', 'DISABLED', 'MAINTENANCE'] },
     approvedAt: { not: null },
     windowsPrinterName: { not: null }
   };
@@ -90,6 +90,9 @@ const listApprovedPrinterDevices = async (user, query = {}, prisma) => {
           take: 1,
           orderBy: { createdAt: 'desc' },
           select: { id: true, publicCode: true, label: true, status: true, createdAt: true }
+        },
+        dispatchLease: {
+          select: { jobShortId: true, expiresAt: true, releasedAt: true }
         }
       },
       orderBy: [{ machineId: 'asc' }, { sortOrder: 'asc' }, { displayName: 'asc' }]
@@ -101,6 +104,14 @@ const listApprovedPrinterDevices = async (user, query = {}, prisma) => {
     devices: devices.map((device) => ({
       ...device,
       activeQr: device.printerQrs?.[0] || null,
+      dispatchLease: device.dispatchLease &&
+        !device.dispatchLease.releasedAt &&
+        device.dispatchLease.expiresAt > new Date()
+        ? {
+            jobShortId: device.dispatchLease.jobShortId,
+            expiresAt: device.dispatchLease.expiresAt
+          }
+        : null,
       printerQrs: undefined
     })),
     total
