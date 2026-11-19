@@ -371,5 +371,8 @@ BEGIN
 END
 $assert_queue_snapshot$;
 
-RAISE NOTICE 'PASS: full 00012-00016 migration chain, QR uniqueness transition, lease indexes, legacy data preservation, and queue snapshot backfill.';
+DO $assert_complete_chain$ BEGIN
+  RAISE NOTICE 'PASS: full 00012-00016 migration chain, QR uniqueness transition, lease indexes, legacy data preservation, and queue snapshot backfill.';
+END
+$assert_complete_chain$;
 ROLLBACK;
