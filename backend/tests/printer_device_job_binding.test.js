@@ -4,6 +4,7 @@ describe('Agent PrintJob PrinterDevice binding validation', () => {
   const deviceJob = {
     shortId: 'JOBDEVICE01',
     printerDeviceId: 'device-123',
+    printerWindowsQueueName: 'Epson L6460',
     printerDevice: { windowsPrinterName: 'Epson L6460' }
   };
 
@@ -28,6 +29,39 @@ describe('Agent PrintJob PrinterDevice binding validation', () => {
       jobId: deviceJob.shortId,
       printerDeviceId: 'device-123',
       windowsPrinterName: 'Epson L6460 (Copy 1)'
+    })).toBe(false);
+  });
+
+  test('continues validating an in-flight job against its immutable queue snapshot after Admin remap', () => {
+    const remappedDeviceJob = {
+      ...deviceJob,
+      printerWindowsQueueName: 'Epson L6460',
+      printerDevice: { windowsPrinterName: 'Epson L6460 (Copy 1)' }
+    };
+
+    expect(verifyPrinterDeviceReport(remappedDeviceJob, {
+      jobId: deviceJob.shortId,
+      printerDeviceId: 'device-123',
+      windowsPrinterName: 'Epson L6460'
+    })).toBe(true);
+
+    expect(verifyPrinterDeviceReport(remappedDeviceJob, {
+      jobId: deviceJob.shortId,
+      printerDeviceId: 'device-123',
+      windowsPrinterName: 'Epson L6460 (Copy 1)'
+    })).toBe(false);
+  });
+
+  test('fails closed when the immutable PrintJob queue snapshot is missing', () => {
+    const noSnapshotJob = {
+      ...deviceJob,
+      printerWindowsQueueName: null,
+      printerDevice: { windowsPrinterName: 'Epson L6460' }
+    };
+    expect(verifyPrinterDeviceReport(noSnapshotJob, {
+      jobId: deviceJob.shortId,
+      printerDeviceId: 'device-123',
+      windowsPrinterName: 'Epson L6460'
     })).toBe(false);
   });
 
