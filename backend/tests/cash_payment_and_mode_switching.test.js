@@ -117,6 +117,11 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
     test('createJob captures session paymentMode onto PrintJob and leaves status PENDING_PAYMENT', async () => {
       const { createJob } = require('../src/modules/jobs/jobs.service');
 
+      mockPrisma.session.findUnique.mockResolvedValue({
+        machineId: 'mach-1',
+        printerDeviceId: null,
+        paymentMode: 'CASH_AT_COUNTER'
+      });
       mockPrisma.document.create.mockResolvedValue({ id: 'doc-1', originalName: 'notes.pdf', pages: 2 });
       mockPrisma.printJob.create.mockImplementation(async ({ data }) => ({
         id: 'job-uuid-1',

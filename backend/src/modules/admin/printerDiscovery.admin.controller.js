@@ -1,10 +1,33 @@
 const prisma = require('../../utils/prisma');
 const printerDiscoveryService = require('../../services/printerDiscovery.service');
+const printerQrService = require('../../services/printerQr.service');
 
 const listPrinterDiscoveries = async (req, res, next) => {
   try {
     const result = await printerDiscoveryService.listPrinterDiscoveries(req.user, req.query, prisma);
     res.status(200).json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const listApprovedPrinterDevices = async (req, res, next) => {
+  try {
+    const result = await printerDiscoveryService.listApprovedPrinterDevices(req.user, req.query, prisma);
+    const devices = result.devices.map((device) => ({
+      ...device,
+      activeQr: device.activeQr
+        ? { ...device.activeQr, targetUrl: printerQrService.getPublicQrUrl(device.activeQr.publicCode) }
+        : null
+    }));
+    res.status(200).json({
+      success: true,
+      data: {
+        ...result,
+        devices,
+        deviceQrEnabled: process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true'
+      }
+    });
   } catch (error) {
     next(error);
   }
@@ -25,4 +48,4 @@ const approvePrinterDiscovery = async (req, res, next) => {
   }
 };
 
-module.exports = { listPrinterDiscoveries, approvePrinterDiscovery };
+module.exports = { listPrinterDiscoveries, listApprovedPrinterDevices, approvePrinterDiscovery };

@@ -94,9 +94,72 @@ const getJobByShortId = async (shortId, user = null) => {
 };
 
 const createJob = async (jobData) => {
-  const { file, settings, machineId, encryptedKey, iv } = jobData;
-  
-  // Create document first
+  const { file, settings, encryptedKey, iv } = jobData;
+  let resolvedMachineId = jobData.machineId || null;
+  let resolvedPrinterDeviceId = null;
+  let resolvedPaymentMode = jobData.paymentMode;
+
+  // A signed session token identifies the session; the database remains the
+  // authority for Machine and child PrinterDevice binding. Ignore any client
+  // supplied printerDeviceId and re-check approval immediately before job creation.
+  if (jobData.sessionId) {
+    const sessionRecord = await prisma.session.findUnique({
+      where: { code: jobData.sessionId },
+      select: {
+        machineId: true,
+        printerDeviceId: true,
+        paymentMode: true
+      }
+    });
+
+    if (!sessionRecord || !sessionRecord.machineId) {
+      throw new AppError('Customer session is not bound to a valid printer.', 403);
+    }
+    if (resolvedMachineId && resolvedMachineId !== sessionRecord.machineId) {
+      throw new AppError('Session Machine binding mismatch. Print job creation was rejected.', 403);
+    }
+
+    resolvedMachineId = sessionRecord.machineId;
+    resolvedPaymentMode = sessionRecord.paymentMode || resolvedPaymentMode;
+
+    if (sessionRecord.printerDeviceId) {
+      const device = await prisma.printerDevice.findUnique({
+        where: { id: sessionRecord.printerDeviceId },
+        select: {
+          id: true,
+          machineId: true,
+          status: true,
+          approvedAt: true,
+          windowsPrinterName: true,
+          isDefault: true
+        }
+      });
+      if (!device || device.machineId !== resolvedMachineId) {
+        throw new AppError('Session physical printer mapping does not belong to the session Machine.', 403);
+      }
+      const isLegacyPlaceholder = Boolean(
+        device.isDefault === true &&
+        device.status === 'DISCOVERY_REQUIRED' &&
+        !device.approvedAt &&
+        !device.windowsPrinterName
+      );
+
+      // Phase 1 backfilled historic Machine QR sessions to an unbound primary
+      // placeholder. Preserve those legacy sessions as Machine-scoped jobs.
+      if (!isLegacyPlaceholder) {
+        if (
+          device.status !== 'ACTIVE' ||
+          !device.approvedAt ||
+          !device.windowsPrinterName?.trim()
+        ) {
+          throw new AppError('The physical printer selected by this QR is no longer approved or active. Please contact shop staff.', 409);
+        }
+        resolvedPrinterDeviceId = device.id;
+      }
+    }
+  }
+
+  // Create document only after server-side session and physical printer checks.
   const document = await prisma.document.create({
     data: {
       originalName: file.originalName,
@@ -109,25 +172,17 @@ const createJob = async (jobData) => {
 
   // Server-side price calculation with dynamic pricing and immutable snapshot
   const { calculatePrice } = require('../../services/pricing.service');
-  const priceResult = await calculatePrice(settings, { pages: file.pages }, machineId);
+  const priceResult = await calculatePrice(settings, { pages: file.pages }, resolvedMachineId);
   const { cost, pagesToPrint, pricingSnapshot } = priceResult;
   if (jobData.sessionId) {
     pricingSnapshot.sessionId = jobData.sessionId;
   }
 
-  // Mandatory Correction 1: Session-level payment mode snapshot
-  // Copy paymentMode from that session, NOT from machine's latest setting
-  let resolvedPaymentMode = jobData.paymentMode;
-  if (!resolvedPaymentMode && jobData.sessionId) {
-    const sessionRecord = await prisma.session.findUnique({
-      where: { code: jobData.sessionId },
-      select: { paymentMode: true }
-    });
-    resolvedPaymentMode = sessionRecord?.paymentMode;
-  }
-  if (!resolvedPaymentMode && machineId) {
+  // Use the session's immutable payment-mode snapshot; legacy non-session
+  // jobs retain the Machine fallback.
+  if (!resolvedPaymentMode && resolvedMachineId) {
     const machineRecord = await prisma.machine.findUnique({
-      where: { id: machineId },
+      where: { id: resolvedMachineId },
       select: { paymentMode: true }
     });
     resolvedPaymentMode = machineRecord?.paymentMode;
@@ -139,7 +194,8 @@ const createJob = async (jobData) => {
   const newJob = await prisma.printJob.create({
     data: {
       shortId: generateShortId(),
-      machineId: machineId || null,
+      machineId: resolvedMachineId,
+      printerDeviceId: resolvedPrinterDeviceId,
       documentId: document.id,
       cost,
       paymentMode: finalPaymentMode,

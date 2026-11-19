@@ -200,10 +200,9 @@ model PrinterQr {
   @@index([machineId])
   @@index([printerDeviceId])
   @@index([status])
-  // Phase 1 retains the active-per-Machine index. Phase 3 replaces it only after
-  // device-aware QR APIs and Admin UI are deployed together.
-  // Note: PostgreSQL partial unique index "printer_qrs_machine_id_active_unique"
-  // enforces at database level that at most one ACTIVE record exists per machineId (excluding null).
+  // PostgreSQL partial unique indexes enforce one ACTIVE legacy QR per Machine
+  // (printerDeviceId NULL) and one ACTIVE QR per PrinterDevice. Multiple devices
+  // under the same Machine can each have their own permanent customer QR.
 }
 
 model Session {

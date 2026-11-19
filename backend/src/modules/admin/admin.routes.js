@@ -135,11 +135,13 @@ const printerQrAdminController = require('./printerQr.admin.controller');
 const printerDiscoveryAdminController = require('./printerDiscovery.admin.controller');
 
 router.get('/printer-discoveries', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.listPrinterDiscoveries);
+router.get('/printer-devices', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.listApprovedPrinterDevices);
 router.post('/printer-discoveries/:id/approve', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.approvePrinterDiscovery);
 
 router.get('/printer-qrs', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.listPrinterQrs);
 router.get('/printer-qrs/:id', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.getPrinterQrById);
 router.post('/printer-qrs', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.generatePrinterQr);
+router.post('/printer-devices/:id/qr', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.generatePrinterDeviceQr);
 router.post('/printer-qrs/:id/revoke', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.revokePrinterQr);
 router.post('/printer-qrs/:id/replace', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.replacePrinterQr);
 router.get('/machines/:id/qr', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.getMachineQrLedger);
