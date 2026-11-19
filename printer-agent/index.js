@@ -19,7 +19,14 @@ try {
 }
 const SpoolerMonitor = require('./src/spooler');
 const JobJournal = require('./src/journal');
+const { PrinterFleetManager } = require('./src/printerFleetManager');
+const { discoverWindowsPrinters } = require('./src/windowsPrinterDiscovery');
+const {
+  buildAgentHello,
+  validatePrinterDeviceRegistry
+} = require('./src/agentProtocol');
 const journal = new JobJournal();
+const agentPackage = require('./package.json');
 
 process.on('uncaughtException', (err) => {
   console.error('🔥 CRITICAL ERROR: Uncaught Exception:', err);
@@ -111,18 +118,36 @@ if (fs.existsSync(pubKeyPath) && fs.existsSync(privKeyPath)) {
 const spoolerMonitor = new SpoolerMonitor({ execFile, printerName: PRINTER_NAME, journal });
 
 let statusInterval = null;
+let registeredMachineId = null;
+let fleetProtocolAccepted = false;
+let fleetManager = null;
 socket.on('connect', () => {
   console.log(`✅ Connected to cloud backend! (Socket ID: ${socket.id})`);
+  fleetProtocolAccepted = false;
+  fleetManager = null;
   
   // Register Public Key with Backend for E2EE
   socket.emit('register_public_key', { publicKey: publicKeyPem });
+
+  // Negotiate the additive fleet protocol. Older backends ignore this event;
+  // the existing single-printer flow remains active in that case.
+  socket.emit('printer_agent_hello', buildAgentHello({
+    agentVersion: agentPackage.version,
+    markerPath: journal.markerPath,
+    journalSchemaVersion: 2
+  }));
   
   // Clear any previous interval to prevent leaks on reconnect
   if (statusInterval) clearInterval(statusInterval);
   
-  // Periodically send printer status
+  // Per-device monitoring is enabled only after a machine-bound registry is
+  // validated. Until then, keep the legacy PRINTER_NAME status path unchanged.
   statusInterval = setInterval(() => {
-    spoolerMonitor.checkPrinterStatus(socket);
+    if (fleetManager && fleetManager.monitors.size > 0) {
+      fleetManager.checkPrinterStatuses(socket);
+    } else {
+      spoolerMonitor.checkPrinterStatus(socket);
+    }
   }, 30000); // every 30s
 });
 
@@ -132,7 +157,75 @@ socket.on('printer_registration_failed', (data) => {
 });
 
 socket.on('printer_registered_success', (data) => {
+  registeredMachineId = typeof data?.machineId === 'string' ? data.machineId : null;
   console.log(`✅ Registration Success. Machine: ${data.name}`);
+});
+
+socket.on('printer_agent_hello_ack', (ack) => {
+  if (!ack || ack.accepted !== true) {
+    fleetProtocolAccepted = false;
+    console.warn(`⚠️ Multi-printer protocol not negotiated: ${ack?.reason || ack?.code || 'backend did not accept hello'}`);
+    return;
+  }
+
+  fleetProtocolAccepted = ack.supportsMultiPrinter === true;
+  if (fleetProtocolAccepted) {
+    console.log(`✅ Multi-printer protocol v${ack.protocolVersion} accepted for Machine ${ack.machineId} (limit: ${ack.maxPrinters})`);
+  } else {
+    console.log('ℹ️ Backend accepted Agent hello; legacy single-printer mode remains active on this platform.');
+  }
+});
+
+socket.on('printer_device_registry', async (payload) => {
+  if (!fleetProtocolAccepted) {
+    console.warn('⚠️ Ignoring PrinterDevice registry because multi-printer capability was not negotiated.');
+    return;
+  }
+
+  try {
+    const devices = validatePrinterDeviceRegistry(payload, registeredMachineId);
+    const discoveredPrinters = await discoverWindowsPrinters({ execFile });
+
+    const nextFleetManager = new PrinterFleetManager({
+      maxDevices: 10,
+      journal,
+      discoverPrinters: async () => discoveredPrinters,
+      getDeviceRegistry: async () => devices,
+      monitorFactory: ({ printerDevice, printerName }) => new SpoolerMonitor({
+        execFile,
+        printerName,
+        printerDeviceId: printerDevice.id,
+        journal
+      })
+    });
+
+    const fleet = await nextFleetManager.refresh();
+    fleetManager = nextFleetManager;
+
+    socket.emit('printer_inventory_report', {
+      protocolVersion: 1,
+      discoveredPrinters
+    });
+
+    const approvedCount = fleet.filter((device) => device.canPrint).length;
+    console.log(`🖨️ Printer fleet synchronized: ${discoveredPrinters.length} Windows queue(s) discovered; ${approvedCount} approved device(s) have independent monitors.`);
+  } catch (error) {
+    // Fail closed: a bad registry or Windows inventory cannot enable a printer.
+    fleetManager = null;
+    console.error(`❌ Multi-printer registry synchronization failed: ${error.message}`);
+  }
+});
+
+socket.on('printer_device_registry_error', (payload) => {
+  console.warn(`⚠️ PrinterDevice registry unavailable: ${payload?.message || payload?.code || 'unknown error'}`);
+});
+
+socket.on('printer_inventory_report_ack', (ack) => {
+  if (ack?.accepted) {
+    console.log(`✅ Backend received discovery inventory: ${ack.receivedCount} queue(s).`);
+  } else {
+    console.warn(`⚠️ Backend rejected discovery inventory: ${ack?.message || ack?.code || 'unknown error'}`);
+  }
 });
 
 socket.on('machine_suspended', (data) => {
@@ -142,6 +235,8 @@ socket.on('machine_suspended', (data) => {
 });
 
 socket.on('disconnect', () => {
+  fleetProtocolAccepted = false;
+  fleetManager = null;
   console.log(`❌ Disconnected from backend. Attempting to reconnect...`);
 });
 
