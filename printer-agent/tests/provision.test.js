@@ -38,7 +38,7 @@ describe('Printer Agent Provisioning & Lifecycle Matrix', () => {
     expect(marker.schemaVersion).toBe(1);
 
     const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8'));
-    expect(journal.version).toBe(1);
+    expect(journal.version).toBe(2);
     expect(journal.jobs).toEqual({});
   });
 
