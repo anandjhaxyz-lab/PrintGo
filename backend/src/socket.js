@@ -570,26 +570,6 @@ const setupSockets = (io) => {
           include: { document: true, payment: true }
         });
 
-        // Agent-side pre-dispatch authorization failures never reached a printer.
-        // Keep payment recovery aligned with physical printer errors.
-        if (failedJob.paymentId && failedJob.payment?.status === 'SUCCESS') {
-          try {
-            const paymentsService = require('./modules/payments/payments.service');
-            await paymentsService.refundPayment(
-              failedJob.shortId,
-              null,
-              `Automatic refund: Printer Agent could not submit the document. ${error || 'Unknown spooler error'}`,
-              {
-                initiatedBy: 'SYSTEM',
-                preserveJobStatus: true,
-                idempotencyKey: `agent_spooler_failure_${failedJob.id}_${failedJob.paymentId}`
-              }
-            );
-          } catch (refundError) {
-            logger.error(`Automatic refund failed for spooler error on job ${jobId}:`, refundError);
-          }
-        }
-
         // P3-002: Automated Refund on Print Failure
         if (failedJob.paymentId) {
           logger.info(`Initiating automated refund for FAILED job ${jobId}...`);
@@ -629,8 +609,29 @@ const setupSockets = (io) => {
         const failedJob = await prisma.printJob.update({
           where: { shortId: jobId },
           data: { status: 'FAILED' },
-          include: { document: true }
+          include: { document: true, payment: true }
         });
+
+        // This event is used for Agent failures before durable driver intent,
+        // including a final backend authorization denial. Refund only payments
+        // that have already reached SUCCESS and use a stable idempotency key.
+        if (failedJob.paymentId && failedJob.payment?.status === 'SUCCESS') {
+          try {
+            const paymentsService = require('./modules/payments/payments.service');
+            await paymentsService.refundPayment(
+              failedJob.shortId,
+              null,
+              `Automatic refund: Printer Agent could not submit the document. ${error || 'Unknown spooler error'}`,
+              {
+                initiatedBy: 'SYSTEM',
+                preserveJobStatus: true,
+                idempotencyKey: `agent_spooler_failure_${failedJob.id}_${failedJob.paymentId}`
+              }
+            );
+          } catch (refundError) {
+            logger.error(`Automatic refund failed for spooler error on job ${jobId}:`, refundError);
+          }
+        }
       } catch (err) {
         logger.error(`Failed to update job ${jobId} to FAILED:`, err);
         io.to(`machine_${socket.machineId}`).emit('job_status_changed', { id: 'error', shortId: jobId, status: 'FAILED', error });
