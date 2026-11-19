@@ -342,9 +342,10 @@ describe('Printer Agent protocol — inventory report', () => {
     };
     const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
 
-    const result = handlePrinterInventoryReport({
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma: {},
       logger: { warn: jest.fn() },
       payload: {
         protocolVersion: 1,
@@ -363,7 +364,7 @@ describe('Printer Agent protocol — inventory report', () => {
     }));
   });
 
-  test('forwards valid inventory only to Admin sockets and does not create/approve devices', () => {
+  test('persists valid inventory before Admin broadcast and never creates or approves PrinterDevice', async () => {
     const adminRoom = { emit: jest.fn() };
     const socket = {
       userType: 'printer',
@@ -374,9 +375,26 @@ describe('Printer Agent protocol — inventory report', () => {
     };
     const io = { to: jest.fn(() => adminRoom) };
 
-    const result = handlePrinterInventoryReport({
+    const tx = {
+      $queryRawUnsafe: jest.fn().mockResolvedValue([{ id: 'machine-a' }]),
+      printerDiscovery: {
+        updateMany: jest.fn().mockResolvedValue({ count: 2 }),
+        upsert: jest.fn().mockImplementation(async ({ create, update }) => ({
+          id: 'discovery-1',
+          ...create,
+          printerDeviceId: null,
+          updateInput: update
+        }))
+      }
+    };
+    const prisma = {
+      $transaction: jest.fn((callback) => callback(tx)),
+      printerDiscovery: tx.printerDiscovery
+    };
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma,
       logger: { warn: jest.fn() },
       payload: {
         protocolVersion: 1,
@@ -384,17 +402,52 @@ describe('Printer Agent protocol — inventory report', () => {
           windowsPrinterName: 'Epson L6460',
           driverName: 'Epson Driver',
           portName: 'USB001',
-          connectionType: 'USB'
+          connectionType: 'USB',
+          printerStatus: 3,
+          detectedErrorState: 0,
+          workOffline: false,
+          isDefault: true
         }]
       }
     });
 
     expect(result).toEqual({ accepted: true, receivedCount: 1 });
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRawUnsafe).toHaveBeenCalledWith(
+      'SELECT "id" FROM "Machine" WHERE "id" = $1 FOR UPDATE',
+      'machine-a'
+    );
+    expect(tx.printerDiscovery.updateMany).toHaveBeenCalledWith({
+      where: { machineId: 'machine-a' },
+      data: { isPresent: false }
+    });
+    expect(tx.printerDiscovery.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        machineId_queueNameKey: {
+          machineId: 'machine-a',
+          queueNameKey: 'epson l6460'
+        }
+      },
+      create: expect.objectContaining({
+        machineId: 'machine-a',
+        windowsPrinterName: 'Epson L6460',
+        queueNameKey: 'epson l6460',
+        printerStatus: '3',
+        detectedErrorState: '0',
+        isPresent: true
+      })
+    }));
+    expect(tx.printerDiscovery.upsert.mock.calls[0][0].update.printerDeviceId).toBeUndefined();
+
     expect(io.to).toHaveBeenCalledWith('admins');
     expect(adminRoom.emit).toHaveBeenCalledWith('printer_inventory_report', expect.objectContaining({
       machineId: 'machine-a',
       machineName: 'Hyderabad Client PC',
-      discoveredPrinters: [expect.objectContaining({ windowsPrinterName: 'Epson L6460' })]
+      discoveredPrinters: [expect.objectContaining({
+        id: 'discovery-1',
+        windowsPrinterName: 'Epson L6460',
+        printerDeviceId: null
+      })]
     }));
     expect(socket.emit).toHaveBeenCalledWith('printer_inventory_report_ack', expect.objectContaining({
       accepted: true,
@@ -409,9 +462,10 @@ describe('Printer Agent protocol — inventory report', () => {
       emit: jest.fn()
     };
     const io = { to: jest.fn() };
-    const result = handlePrinterInventoryReport({
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma: {},
       logger: { warn: jest.fn() },
       payload: { protocolVersion: 1, discoveredPrinters: [] }
     });
