@@ -389,9 +389,13 @@ socket.on('physical_print_job', (jobData) => {
   }
 
   const rawPrinterDeviceId = jobData?.printerDeviceId;
-  const laneKey = rawPrinterDeviceId !== undefined && rawPrinterDeviceId !== null
-    ? `device:${typeof rawPrinterDeviceId === 'string' ? rawPrinterDeviceId : 'invalid'}`
-    : `legacy:${registeredMachineId || 'unregistered-machine'}`;
+  const hasDeviceId = rawPrinterDeviceId !== undefined && rawPrinterDeviceId !== null;
+  const laneQueueName = hasDeviceId ? jobData?.windowsPrinterName : PRINTER_NAME;
+  const laneKey = typeof laneQueueName === 'string' && laneQueueName.trim()
+    ? `queue:${laneQueueName.trim().toLocaleLowerCase('en-US')}`
+    : (hasDeviceId
+      ? `device:${typeof rawPrinterDeviceId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(rawPrinterDeviceId) ? rawPrinterDeviceId : 'invalid'}`
+      : `legacy:${registeredMachineId || 'unregistered-machine'}`);
 
   printerDeviceQueue.enqueue(laneKey, async () => {
     if (activePrintJobIds.has(jobId)) {
@@ -465,11 +469,6 @@ const processPhysicalPrintJob = async (jobData) => {
     });
     return;
   }
-
-  console.log(`\n======================================================`);
-  console.log(`📥 NEW PRINT JOB RECEIVED! [Job ID: ${jobData.jobId}]`);
-  console.log(`📄 Document: ${jobData.originalName}`);
-  console.log(`======================================================`);
 
   let fileUrl = jobData.fileUrl;
   if (fileUrl && fileUrl.startsWith('https://localhost:5000')) {
