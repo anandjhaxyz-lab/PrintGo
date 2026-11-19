@@ -90,6 +90,84 @@ async function disablePrinterDevice(printerDeviceId, data = {}, user, prisma) {
   });
 }
 
+async function enablePrinterDevice(printerDeviceId, data = {}, user, prisma) {
+  requireAdmin(user);
+  const reason = validateReason(data.reason);
+
+  return prisma.$transaction(async (tx) => {
+    const reference = await tx.printerDevice.findUnique({
+      where: { id: printerDeviceId },
+      select: { machineId: true }
+    });
+    if (!reference) throw new AppError('Printer device not found.', 404);
+
+    await lockMachineAndDevice(tx, reference.machineId, printerDeviceId);
+    const device = await tx.printerDevice.findUnique({
+      where: { id: printerDeviceId },
+      include: { machine: { select: { id: true, name: true, status: true, companyId: true } } }
+    });
+    if (!device) throw new AppError('Printer device not found.', 404);
+    await verifyCompanyAccess(device, user);
+    await assertNoActiveDispatchLease(tx, printerDeviceId);
+
+    if (device.status === 'ACTIVE') {
+      return { device, alreadyEnabled: true };
+    }
+    if (device.status !== 'DISABLED') {
+      throw new AppError('Only a DISABLED printer can be re-enabled through this action.', 409);
+    }
+    if (device.machine?.status !== 'ACTIVE') {
+      throw new AppError('The Machine must be ACTIVE before a physical printer can be enabled.', 409);
+    }
+    if (typeof device.windowsPrinterName !== 'string' || !device.windowsPrinterName.trim()) {
+      throw new AppError('This printer has no approved Windows queue mapping. Remap it before enabling.', 409);
+    }
+
+    const queueNameKey = device.windowsPrinterName.toLowerCase();
+    const discovery = await tx.printerDiscovery.findFirst({
+      where: {
+        machineId: device.machineId,
+        queueNameKey,
+        reviewStatus: 'APPROVED',
+        approvedPrinterDeviceId: device.id,
+        lastSeenAt: { gte: new Date(Date.now() - DISCOVERY_MAX_AGE_MS) }
+      }
+    });
+    if (!discovery || discovery.windowsPrinterName !== device.windowsPrinterName) {
+      throw new AppError('The exact Windows queue has not been discovered recently on this Machine. Reconnect the Agent before enabling.', 409);
+    }
+
+    await tx.$queryRaw`SELECT "id" FROM "PrinterDiscovery" WHERE "id" = ${discovery.id} FOR UPDATE`;
+    const now = new Date();
+    const updated = await tx.printerDevice.update({
+      where: { id: device.id },
+      data: {
+        status: 'ACTIVE',
+        healthStatus: 'UNKNOWN',
+        approvedAt: now,
+        approvedBy: user.id || user.email,
+        lastDiscoveredAt: discovery.lastSeenAt
+      },
+      include: { machine: { select: { id: true, name: true, status: true, companyId: true } } }
+    });
+
+    await tx.activityLog.create({
+      data: {
+        action: 'PRINTER_DEVICE_ENABLED',
+        details: JSON.stringify({
+          printerDeviceId: device.id,
+          windowsPrinterName: device.windowsPrinterName,
+          reason
+        }),
+        userId: user.id || null,
+        machineId: device.machineId
+      }
+    });
+
+    return { device: updated, alreadyEnabled: false };
+  });
+}
+
 async function remapPrinterDevice(printerDeviceId, data = {}, user, prisma) {
   requireAdmin(user);
   const reason = validateReason(data.reason);
@@ -217,5 +295,6 @@ async function remapPrinterDevice(printerDeviceId, data = {}, user, prisma) {
 module.exports = {
   MIN_OPERATOR_REASON_LENGTH,
   disablePrinterDevice,
+  enablePrinterDevice,
   remapPrinterDevice
 };
