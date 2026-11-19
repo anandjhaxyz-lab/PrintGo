@@ -290,10 +290,12 @@ class JobJournal {
 
     const existingId = entry.printerDeviceId || null;
     const existingQueue = entry.windowsPrinterName || null;
+    const legacyQueue = entry.printerName || null;
 
     if (
       (existingId && existingId !== binding.printerDeviceId) ||
-      (existingQueue && existingQueue !== binding.windowsPrinterName)
+      (existingQueue && existingQueue !== binding.windowsPrinterName) ||
+      (legacyQueue && legacyQueue !== binding.windowsPrinterName)
     ) {
       const error = new Error('A journalled job cannot be rebound to a different physical printer.');
       error.code = 'PRINTER_BINDING_MISMATCH';
