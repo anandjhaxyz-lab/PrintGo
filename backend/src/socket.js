@@ -5,6 +5,11 @@ const { getMachineAvailability, computePrinterAvailability } = require('./servic
 
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const {
+  handlePrinterAgentHello,
+  handlePrinterInventoryReport,
+  handlePrinterDeviceTelemetry
+} = require('./services/printerAgentProtocol.service');
 
 const setupSockets = (io) => {
   // WebSocket Authentication Middleware
@@ -132,6 +137,18 @@ const setupSockets = (io) => {
       }
     });
 
+    // Backward-compatible Agent protocol negotiation. Older agents never emit
+    // this event and continue using the existing Machine Key + single-printer flow.
+    socket.on('printer_agent_hello', async (payload) => {
+      await handlePrinterAgentHello({ socket, prisma, logger, payload });
+    });
+
+    // Discovery is advisory only. This event never approves, binds, creates or
+    // mutates PrinterDevice records; it is forwarded to Admin sockets for review.
+    socket.on('printer_inventory_report', (payload) => {
+      handlePrinterInventoryReport({ socket, io, logger, payload });
+    });
+
     // Kiosk <-> Mobile Sync
     socket.on('join_session', (sessionId) => {
       // Validate: session tokens can only join their own session room
@@ -207,6 +224,13 @@ const setupSockets = (io) => {
     });
 
     socket.on('printer_status_update', async (status) => {
+      // Keep child-printer health separate from the legacy Machine-wide
+      // PrinterStatus stream until device-bound QR/session routing ships.
+      if (status?.printerDeviceId) {
+        await handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status });
+        return;
+      }
+
       if (socket.machineId) {
         try {
           const printerModel = (status?.printerModel || status?.printerName || status?.model || '').trim();
