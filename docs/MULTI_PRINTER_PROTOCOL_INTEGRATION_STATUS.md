@@ -55,9 +55,10 @@ The Agent discovers installed Windows queues locally and emits `printer_inventor
 
 - The backend accepts this event only from an authenticated printer socket that successfully negotiated multi-printer capability.
 - Queue names and metadata are normalized and bounded; duplicate queues and malformed values are rejected.
-- Valid inventory is forwarded to the Admin Socket.IO room as `printer_inventory_report`.
-- The backend does not auto-create, bind, approve, activate or modify PrinterDevice records from discovery.
-- Discovery inventory is advisory and currently transient; persistence and Admin approval UI are subsequent work.
+- Inventory is persisted as Machine-scoped discovery data, with repeat reports updating last-seen state while preserving Admin review status and any approval link.
+- The Admin UI lists discovered queues and requires an explicit Admin approval action. A discovery event never creates, binds, approves or activates a PrinterDevice.
+- Approval is tenant-scoped, rejects stale discovery, duplicate queue mappings, inactive Machines and the per-PC device limit, and creates an ACTIVE PrinterDevice with approval evidence.
+- Registry responses to the Agent contain the authenticated Machine's queue-bound PrinterDevices only; the Agent enables a local monitor only for ACTIVE devices with approval evidence and an exact local Windows queue match.
 
 ## 5. Device health telemetry
 
