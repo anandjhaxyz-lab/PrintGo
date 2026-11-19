@@ -14,6 +14,7 @@ on:
       - feat/multi-printer-device-qr-session-binding
       - feat/multi-printer-agent-device-dispatch
       - docs/hyderabad-windows-physical-certification
+      - fix/multi-printer-release-review-blockers
   pull_request:
     branches:
       - main
@@ -25,6 +26,7 @@ on:
       - feat/multi-printer-backend-agent-protocol
       - feat/multi-printer-device-routing
       - feat/multi-printer-device-qr-session-binding
+      - docs/hyderabad-windows-physical-certification
 
 jobs:
   # =========================================================================
