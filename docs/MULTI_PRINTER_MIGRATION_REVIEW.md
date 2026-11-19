@@ -87,3 +87,18 @@ The job snapshot tests cover creation from an approved device and Machine-scoped
 - [ ] Staging-only deploy approval, smoke-test owner, and Production isolation reconfirmed.
 
 **Final decision:** review has found no direct deletion of customer QR tokens or historical job/payment rows in 00012–00016. However, the legacy in-flight job/snapshot gap and missing direct PostgreSQL coverage for the 00014 index transition are release gates. Keep the Staging candidate Draft and do not apply migrations until those gates are closed.
+
+
+## Live Staging PrintJob preflight snapshot (2026-11-19)
+
+A read-only query was run against Render Postgres service `printgo-db-staging` (database `printgo_staging`) after confirming the resource name and ID in the Staging database inventory. The query grouped the current `PrintJob` table by `status`.
+
+Result at query time:
+- `COMPLETED`: 9
+- All other statuses: 0 rows returned
+- Total PrintJobs: 9
+- Observed non-completed / potentially in-flight PrintJobs: 0
+
+This satisfies the *current point-in-time* non-terminal-job count preflight. It does not remove the need to repeat the same read-only check immediately before any migration, after stopping/pausing new submissions for the release window. The result may change as soon as new jobs arrive. It also does not close the separate 00014 PostgreSQL index-transition test gap or the complete migration/lease/snapshot test gates above.
+
+The query was read-only; no Staging or Production data was changed.
