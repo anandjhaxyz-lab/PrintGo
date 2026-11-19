@@ -248,11 +248,6 @@ describe('Printer Agent protocol — per-device telemetry isolation', () => {
       where: { id: 'device-a' },
       data: expect.objectContaining({ healthStatus: 'PAPER_OUT', lastTelemetryAt: expect.any(Date) })
     }));
-    expect(prisma.tx.printerDiscovery.upsert).toHaveBeenCalledWith(expect.objectContaining({
-      where: { machineId_queueNameKey: { machineId: 'machine-a', queueNameKey: 'epson l6460' } },
-      create: expect.objectContaining({ reviewStatus: 'DISCOVERED', windowsPrinterName: 'Epson L6460' })
-    }));
-    expect(prisma.tx.printerDiscovery.upsert.mock.calls[0][0].update).not.toHaveProperty('reviewStatus');
     expect(io.to).toHaveBeenCalledWith('admins');
     expect(adminRoom.emit).toHaveBeenCalledWith('printer_device_status_update', expect.objectContaining({
       machineId: 'machine-a',
@@ -407,6 +402,11 @@ describe('Printer Agent protocol — inventory report', () => {
     });
 
     expect(result).toEqual({ accepted: true, receivedCount: 1 });
+    expect(prisma.tx.printerDiscovery.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { machineId_queueNameKey: { machineId: 'machine-a', queueNameKey: 'epson l6460' } },
+      create: expect.objectContaining({ reviewStatus: 'DISCOVERED', windowsPrinterName: 'Epson L6460' })
+    }));
+    expect(prisma.tx.printerDiscovery.upsert.mock.calls[0][0].update).not.toHaveProperty('reviewStatus');
     expect(io.to).toHaveBeenCalledWith('admins');
     expect(adminRoom.emit).toHaveBeenCalledWith('printer_inventory_report', expect.objectContaining({
       machineId: 'machine-a',
