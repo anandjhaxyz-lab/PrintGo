@@ -117,7 +117,7 @@ export const PrintersView = ({
     setIsLoadingQrs(true);
     try {
       const res = await axios.get(`${API_URL}/api/admin/printer-qrs`, {
-        params: { limit: 100 }
+        params: { limit: 100, legacyOnly: true }
       });
 
       if (res.data?.success && res.data.data?.qrs) {

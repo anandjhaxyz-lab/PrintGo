@@ -15,9 +15,7 @@ const recordPrinterDiscoveryInventory = async (prisma, machineId, discoveredPrin
   return prisma.$transaction(async (tx) => Promise.all(discoveredPrinters.map((printer) => {
     const windowsPrinterName = String(printer.windowsPrinterName || '').trim();
     const queueNameKey = windowsPrinterName.toLowerCase();
-    if (!windowsPrinterName || !queueNameKey) {
-      throw new Error('A discovered Windows queue must have a non-empty exact name.');
-    }
+    if (!windowsPrinterName || !queueNameKey) throw new Error('A discovered Windows queue must have a non-empty exact name.');
 
     const metadata = {
       windowsPrinterName,
@@ -37,7 +35,7 @@ const recordPrinterDiscoveryInventory = async (prisma, machineId, discoveredPrin
     return tx.printerDiscovery.upsert({
       where: { machineId_queueNameKey: { machineId, queueNameKey } },
       create: { machineId, ...metadata, reviewStatus: 'DISCOVERED' },
-      // Preserve any Admin review and approval link across later Agent reports.
+      // Preserve Admin review and approval link across later Agent reports.
       update: metadata
     });
   })));
@@ -66,6 +64,49 @@ const listPrinterDiscoveries = async (user, query = {}, prisma) => {
   return { discoveries, total };
 };
 
+const listApprovedPrinterDevices = async (user, query = {}, prisma) => {
+  const parsedLimit = Number(query.limit);
+  const take = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 100) : 100;
+  const where = {
+    status: 'ACTIVE',
+    approvedAt: { not: null },
+    windowsPrinterName: { not: null }
+  };
+
+  if (query.machineId) where.machineId = String(query.machineId);
+  if (user && user.role !== 'SUPERADMIN') {
+    if (!user.companyId) return { devices: [], total: 0 };
+    where.machine = { companyId: user.companyId };
+  }
+
+  const [devices, total] = await Promise.all([
+    prisma.printerDevice.findMany({
+      where,
+      take,
+      include: {
+        machine: { select: { id: true, name: true, location: true, companyId: true } },
+        printerQrs: {
+          where: { status: 'ACTIVE' },
+          take: 1,
+          orderBy: { createdAt: 'desc' },
+          select: { id: true, publicCode: true, label: true, status: true, createdAt: true }
+        }
+      },
+      orderBy: [{ machineId: 'asc' }, { sortOrder: 'asc' }, { displayName: 'asc' }]
+    }),
+    prisma.printerDevice.count({ where })
+  ]);
+
+  return {
+    devices: devices.map((device) => ({
+      ...device,
+      activeQr: device.printerQrs?.[0] || null,
+      printerQrs: undefined
+    })),
+    total
+  };
+};
+
 const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => {
   if (!user || !['SUPERADMIN', 'FRANCHISEE'].includes(user.role)) {
     throw new AppError('Only an authorized Admin can approve a discovered printer.', 403);
@@ -87,9 +128,7 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
       const existingApproved = await tx.printerDevice.findUnique({ where: { id: discovery.approvedPrinterDeviceId } });
       if (existingApproved) return { device: existingApproved, alreadyApproved: true };
     }
-    if (discovery.reviewStatus !== 'DISCOVERED') {
-      throw new AppError('This discovery has already been reviewed.', 409);
-    }
+    if (discovery.reviewStatus !== 'DISCOVERED') throw new AppError('This discovery has already been reviewed.', 409);
     if (discovery.machine.status !== 'ACTIVE') {
       throw new AppError('The Machine must be ACTIVE before a discovered printer can be approved.', 409);
     }
@@ -106,7 +145,6 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
       throw new AppError('displayName must be a non-empty label of at most 120 characters.', 400);
     }
 
-    // Serialize approvals for different queues belonging to the same Machine.
     await tx.$queryRaw`SELECT "id" FROM "Machine" WHERE "id" = ${discovery.machineId} FOR UPDATE`;
 
     const mappedQueue = await tx.printerDevice.findFirst({
@@ -171,5 +209,6 @@ module.exports = {
   DISCOVERY_MAX_AGE_MS,
   recordPrinterDiscoveryInventory,
   listPrinterDiscoveries,
+  listApprovedPrinterDevices,
   approvePrinterDiscovery
 };

@@ -847,6 +847,143 @@ async function runTestSuite() {
     assert(trackedStatus === 'WAITING' || trackedStatus === 'PRINTING', `Status is WAITING or PRINTING for print queue, got ${trackedStatus}`);
   });
 
+  // Case 19: Device-specific customer QR -> DB Session -> DB PrintJob binding.
+  // The same Machine has two physical printers and therefore two independent active customer QRs.
+  await test('Case 19: Device QR binds its exact PrinterDevice through Session and PrintJob', async () => {
+    await prisma.printerQr.updateMany({
+      where: { machineId: machineA.id, printerDeviceId: { not: null }, status: 'ACTIVE' },
+      data: { status: 'REVOKED', revokedReason: 'Resetting Phase 4 device QR fixture' }
+    });
+
+    const deviceA1 = await prisma.printerDevice.upsert({
+      where: { machineId_windowsPrinterName: { machineId: machineA.id, windowsPrinterName: 'PHASE4-QUEUE-COUNTER-A' } },
+      update: {
+        displayName: 'Counter Printer A',
+        status: 'ACTIVE',
+        approvedAt: new Date(),
+        approvedBy: operatorUser.id
+      },
+      create: {
+        machineId: machineA.id,
+        displayName: 'Counter Printer A',
+        windowsPrinterName: 'PHASE4-QUEUE-COUNTER-A',
+        driverName: 'Phase 4 Test Driver A',
+        portName: 'USB001',
+        connectionType: 'USB',
+        status: 'ACTIVE',
+        approvedAt: new Date(),
+        approvedBy: operatorUser.id,
+        sortOrder: 0
+      }
+    });
+
+    const deviceA2 = await prisma.printerDevice.upsert({
+      where: { machineId_windowsPrinterName: { machineId: machineA.id, windowsPrinterName: 'PHASE4-QUEUE-COUNTER-B' } },
+      update: {
+        displayName: 'Counter Printer B',
+        status: 'ACTIVE',
+        approvedAt: new Date(),
+        approvedBy: operatorUser.id
+      },
+      create: {
+        machineId: machineA.id,
+        displayName: 'Counter Printer B',
+        windowsPrinterName: 'PHASE4-QUEUE-COUNTER-B',
+        driverName: 'Phase 4 Test Driver B',
+        portName: 'USB002',
+        connectionType: 'USB',
+        status: 'ACTIVE',
+        approvedAt: new Date(),
+        approvedBy: operatorUser.id,
+        sortOrder: 1
+      }
+    });
+
+    const qrA1 = await printerQrService.generatePrinterDeviceQr(
+      deviceA1.id,
+      { label: 'Counter A Customer QR' },
+      operatorUser
+    );
+    const qrA2 = await printerQrService.generatePrinterDeviceQr(
+      deviceA2.id,
+      { label: 'Counter B Customer QR' },
+      operatorUser
+    );
+
+    assert(qrA1.printerDeviceId === deviceA1.id, 'First device QR must bind to Counter Printer A');
+    assert(qrA2.printerDeviceId === deviceA2.id, 'Second device QR must bind to Counter Printer B');
+    assert(qrA1.machineId === machineA.id && qrA2.machineId === machineA.id, 'Both device QRs must retain the same Machine boundary');
+    assert(qrA1.publicCode !== qrA2.publicCode, 'Each physical printer must have a different permanent public code');
+
+    const activeDeviceQrCount = await prisma.printerQr.count({
+      where: { machineId: machineA.id, printerDeviceId: { not: null }, status: 'ACTIVE' }
+    });
+    assert(activeDeviceQrCount === 2, 'Two physical printers under one Machine must be allowed to have independent ACTIVE QRs');
+
+    const resolved = await printerQrService.resolvePrinterQr(qrA1.publicCode);
+    assert(resolved.success === true, 'Scanning device A QR must create a fresh session');
+
+    const session = await prisma.session.findUnique({ where: { code: resolved.sessionCode } });
+    assert(session.machineId === machineA.id, 'Device session must retain the parent Machine ID');
+    assert(session.printerQrId === qrA1.id, 'Device session must retain the exact permanent QR ID');
+    assert(session.printerDeviceId === deviceA1.id, 'Device session must bind to Counter Printer A, not the other queue');
+
+    const preScan = await printerQrService.getPublicPrinterQrInfo(qrA1.publicCode);
+    assert(preScan.printer.name === deviceA1.displayName, 'Public QR preview should show the physical device display name');
+    assert(preScan.machineId === undefined && preScan.printerDeviceId === undefined, 'Public QR preview must not expose internal database IDs');
+
+    // A forged client printerDeviceId must not redirect a job to Counter Printer B.
+    const { req, res, next, getStatusCode, getResponseData, getError } = createMockReqRes({
+      body: {
+        printerDeviceId: deviceA2.id,
+        file: {
+          originalName: 'DeviceBoundJob.pdf',
+          filename: 'DeviceBoundJob_' + Date.now() + '.pdf',
+          mimetype: 'application/pdf',
+          size: 4096,
+          pages: 2
+        },
+        settings: {
+          color: 'bw',
+          duplex: 'single',
+          copies: 1,
+          pageRangeType: 'all',
+          pagesToPrint: 2
+        }
+      },
+      session: {
+        sessionId: resolved.sessionCode,
+        machineId: machineA.id,
+        role: 'mobile'
+      }
+    });
+
+    await jobsController.createJob(req, res, next);
+    assert(!getError(), `Device-bound job should be accepted: ${getError()?.message}`);
+    assert(getStatusCode() === 200, `Expected 200 for device-bound job, got ${getStatusCode()}`);
+    const job = getResponseData().job;
+    assert(job.machineId === machineA.id, 'PrintJob must remain inside the owning Machine boundary');
+    assert(job.printerDeviceId === deviceA1.id, 'PrintJob must use the database Session binding and ignore the forged client device ID');
+    assert(job.printerDeviceId !== deviceA2.id, 'PrintJob must not be redirected to Counter Printer B');
+  });
+
+  // Device-specific rotation must preserve the immutable PrinterDevice binding.
+  await test('Case 20: Rotating a device QR preserves its PrinterDevice mapping', async () => {
+    const device = await prisma.printerDevice.findFirst({
+      where: { machineId: machineA.id, windowsPrinterName: 'PHASE4-QUEUE-COUNTER-A' }
+    });
+    const currentQr = await prisma.printerQr.findFirst({
+      where: { printerDeviceId: device.id, status: 'ACTIVE' }
+    });
+    const replacement = await printerQrService.replacePrinterQr(
+      currentQr.id,
+      { reason: 'QR label damaged and needs a fresh flyer', label: 'Counter A Replacement' },
+      operatorUser
+    );
+    assert(replacement.newQr.printerDeviceId === device.id, 'Replacement QR must remain bound to the same physical PrinterDevice');
+    assert(replacement.newQr.machineId === machineA.id, 'Replacement QR must preserve the parent Machine binding');
+  });
+
   console.log('\n======================================================================');
   console.log(`PHASE 4 TEST SUMMARY: ${passed} PASSED, ${failed} FAILED`);
   console.log('======================================================================\n');
