@@ -98,7 +98,7 @@ Admin lifecycle controls:
 - Admins can remap a device only to a fresh discovery on the same Machine that is not already mapped to another PrinterDevice. Remapping preserves the stable PrinterDevice ID and permanent QR; a DISABLED device remains DISABLED.
 - A DISABLED device can be re-enabled only when the Machine is ACTIVE and the exact Windows queue is present in a recent, approved discovery record for that same PrinterDevice. Enable/disable/remap actions write ActivityLog records.
 - The Admin fleet panel exposes the current device status and any unexpired dispatch lease; lifecycle buttons are disabled while a lease is active. The backend independently enforces the same checks and returns 409 if a live dispatch lease exists.
-- Approval, remap, enable/disable and dispatch authorization use a consistent Machine-first lock order. Dispatch authorization and Admin operations then serialize on the same PrinterDevice row to avoid disable/remap races and conflicting queue updates.
+- Admin approval/remap/enable/disable transactions acquire the Machine row first and then their relevant discovery/device rows. Agent dispatch authorization, lease renewal and release lock the PrinterDevice row. Admin mutations and Agent dispatch therefore serialize on the same PrinterDevice row to avoid disable/remap races and conflicting queue updates.
 
 The PR does not turn on `ENABLE_MULTI_PRINTER_DISPATCH` and does not change any deployed environment variables. Physical certification on the client's Hyderabad Windows PC remains a separate gate.
 
