@@ -1,5 +1,6 @@
 const {
   disablePrinterDevice,
+  enablePrinterDevice,
   remapPrinterDevice
 } = require('../src/services/printerDeviceAdmin.service');
 
@@ -14,7 +15,7 @@ function fixtures({ device = {}, discovery = {}, lease = null } = {}) {
     windowsPrinterName: 'Epson L6460',
     status: 'ACTIVE',
     approvedAt: new Date(),
-    machine: { id: 'machine-a', name: 'Shop PC', companyId: 'company-a' },
+    machine: { id: 'machine-a', name: 'Shop PC', status: 'ACTIVE', companyId: 'company-a' },
     ...device
   };
   const baseDiscovery = {
@@ -38,6 +39,11 @@ function fixtures({ device = {}, discovery = {}, lease = null } = {}) {
     },
     printerDiscovery: {
       findUnique: jest.fn(),
+      findFirst: jest.fn().mockResolvedValue({
+        ...baseDiscovery,
+        reviewStatus: 'APPROVED',
+        approvedPrinterDeviceId: 'device-a'
+      }),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       update: jest.fn().mockResolvedValue({ ...baseDiscovery, reviewStatus: 'APPROVED', approvedPrinterDeviceId: 'device-a' })
     },
@@ -134,6 +140,109 @@ describe('Admin printer device disable/remap controls', () => {
     }, superadmin, disabled.prisma);
     expect(result.alreadyDisabled).toBe(true);
     expect(disabled.tx.printerDevice.update).not.toHaveBeenCalled();
+  });
+
+  test('re-enables a disabled printer only after exact fresh same-Machine discovery', async () => {
+    const f = fixtures({
+      device: { status: 'DISABLED' },
+      discovery: {
+        windowsPrinterName: 'Epson L6460',
+        queueNameKey: 'epson l6460',
+        reviewStatus: 'APPROVED',
+        approvedPrinterDeviceId: 'device-a'
+      }
+    });
+    f.tx.printerDevice.findUnique
+      .mockResolvedValueOnce({ machineId: 'machine-a' })
+      .mockResolvedValueOnce(f.device);
+
+    const result = await enablePrinterDevice('device-a', {
+      reason: 'Hardware service completed'
+    }, superadmin, f.prisma);
+
+    expect(result.alreadyEnabled).toBe(false);
+    expect(result.device.status).toBe('ACTIVE');
+    expect(f.tx.printerDiscovery.findFirst).toHaveBeenCalledWith({
+      where: {
+        machineId: 'machine-a',
+        queueNameKey: 'epson l6460',
+        reviewStatus: 'APPROVED',
+        approvedPrinterDeviceId: 'device-a',
+        lastSeenAt: { gte: expect.any(Date) }
+      }
+    });
+    expect(f.tx.printerDevice.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'device-a' },
+      data: expect.objectContaining({
+        status: 'ACTIVE',
+        approvedBy: 'admin-a',
+        healthStatus: 'UNKNOWN'
+      })
+    }));
+    expect(f.tx.activityLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        action: 'PRINTER_DEVICE_ENABLED',
+        machineId: 'machine-a',
+        userId: 'admin-a'
+      })
+    });
+  });
+
+  test('blocks re-enable when the exact queue is not recently discovered or the Machine is inactive', async () => {
+    const missingDiscovery = fixtures({
+      device: { status: 'DISABLED' },
+      discovery: {
+        windowsPrinterName: 'Epson L6460',
+        queueNameKey: 'epson l6460',
+        reviewStatus: 'APPROVED',
+        approvedPrinterDeviceId: 'device-a'
+      }
+    });
+    missingDiscovery.tx.printerDevice.findUnique
+      .mockResolvedValueOnce({ machineId: 'machine-a' })
+      .mockResolvedValueOnce(missingDiscovery.device);
+    missingDiscovery.tx.printerDiscovery.findFirst.mockResolvedValue(null);
+    await expect(enablePrinterDevice('device-a', {
+      reason: 'Service is complete'
+    }, superadmin, missingDiscovery.prisma)).rejects.toMatchObject({ statusCode: 409 });
+    expect(missingDiscovery.tx.printerDevice.update).not.toHaveBeenCalled();
+
+    const inactiveMachine = fixtures({
+      device: {
+        status: 'DISABLED',
+        machine: { id: 'machine-a', name: 'Shop PC', status: 'SUSPENDED', companyId: 'company-a' }
+      }
+    });
+    inactiveMachine.tx.printerDevice.findUnique
+      .mockResolvedValueOnce({ machineId: 'machine-a' })
+      .mockResolvedValueOnce(inactiveMachine.device);
+    await expect(enablePrinterDevice('device-a', {
+      reason: 'Service is complete'
+    }, superadmin, inactiveMachine.prisma)).rejects.toMatchObject({ statusCode: 409 });
+    expect(inactiveMachine.tx.printerDevice.update).not.toHaveBeenCalled();
+  });
+
+  test('blocks re-enable while a live dispatch lease exists', async () => {
+    const f = fixtures({
+      device: { status: 'DISABLED' },
+      lease: {
+        printerDeviceId: 'device-a',
+        requestId: 'request-live',
+        jobShortId: 'JOB_PRINTING',
+        expiresAt: new Date(Date.now() + 30000),
+        releasedAt: null
+      }
+    });
+    f.tx.printerDevice.findUnique
+      .mockResolvedValueOnce({ machineId: 'machine-a' })
+      .mockResolvedValueOnce(f.device);
+    await expect(enablePrinterDevice('device-a', {
+      reason: 'Service has been completed'
+    }, superadmin, f.prisma)).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'DEVICE_DISPATCH_IN_PROGRESS'
+    });
+    expect(f.tx.printerDevice.update).not.toHaveBeenCalled();
   });
 
   test('remaps an approved device only to a fresh unclaimed queue on the same Machine', async () => {
