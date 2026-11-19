@@ -194,3 +194,39 @@ The database checks passed for the observed snapshot and the Staging ingress loc
 5. Obtain explicit release approval, maintenance-window owner, migration operator, smoke-test owner, and rollback decision owner.
 
 Maintenance Mode was enabled by the operator; do not disable it until the operator-approved reopening sequence is completed. No Staging data or schema was modified; no deployment or migration was performed; Production remained untouched.
+
+
+## Release authorization blockers rechecked — 2026-11-19
+
+### GitHub dependency / deployment-path inspection
+The current PR metadata was fetched directly from GitHub:
+- PR #9: Draft, open, unmerged; base `feature/printgo-production-readiness`; head `feat/multi-printer-foundation`.
+- PR #10: Draft, open, unmerged; base #9 head branch.
+- PR #11: Draft, open, unmerged; base #10 head branch.
+- PR #12: Draft, open, unmerged; base #11 head branch.
+- PR #13: Draft, open, unmerged; base #12 head branch.
+- PR #15: Draft, open, unmerged; base #13 head branch.
+- PR #16: Draft, open, unmerged; documentation branch.
+- PR #17: Draft, open, unmerged; Blueprint/CI sidecar branch.
+- PR #18: Draft, open, unmerged; candidate head `docs/hyderabad-windows-physical-certification`, base `feature/printgo-production-readiness`.
+
+No submitted PR reviews were returned for the inspected PRs. PR #9 directly targets the live Staging backend's watched branch. The Staging backend still has auto-deploy enabled on commit and runs `npx prisma migrate deploy` in pre-deploy. Therefore, merging PR #9 as-is can trigger a deploy of an incomplete stack and apply pending migrations. Do not merge any part of this chain until an approved release strategy isolates/controls the deployment path and the exact fully integrated candidate has approval. The connected Render integration exposes no service-update/auto-deploy-toggle action; no such setting was changed.
+
+PR #18 changed-file inspection shows migration files 00012–00016 plus backend/frontend/Agent implementation and tests. CI validates the full chain in a disposable PostgreSQL database, but it is not equivalent to running `npx prisma migrate status` against live Staging from the exact approved candidate. The latter remains a manual, controlled release-window check.
+
+### External payment / PITR evidence limitations
+- The connected app tools provide Render service metadata, Postgres metadata and read-only SQL, but no Postgres Recovery/PITR status, Recovery-page export-list, or Cashfree merchant-order lookup action.
+- Render's official API documents a dedicated endpoint `GET /v1/postgres/{postgresId}/recovery` for PITR availability, and its Recovery dashboard page displays the recovery window. Capture the actual returned `recoveryStatus` / `startsAt` or Recovery-page screenshot for `printgo-db-staging`; do not infer an exact window only from the plan tier. Official API reference: https://api-docs.render.com/reference/retrieve-postgres-recovery-info
+- Render docs state PITR availability window depends on workspace plan (Hobby 3 days; Pro or higher 7 days) and logical exports are retained for 7 days. Actual PITR availability and current start time must still be checked for this database: https://render.com/docs/postgresql-backups
+- No Cashfree connector is currently available in the connected app tools. Local DB has 9 SUCCESS payments and no PaymentEvent / Refund / ReconciliationRecord rows, but this does not prove there is no external gateway order or callback in flight. A payment owner must verify in Cashfree Dashboard before reopening any external ingress or running a release.
+- The client Windows operator must separately confirm that customer intake is physically stopped, Windows spooler is idle, and no physical print result is ambiguous. Database status and Agent heartbeat do not prove spooler state.
+
+### Latest read-only recheck after Maintenance Mode
+At approximately `2026-11-19T13:29:41Z`:
+- Maintenance Mode remains enabled in Render service metadata; the `maintenance_mode_enabled` event is present and no later service events were returned in the inspected window.
+- PrintJobs remain 9 COMPLETED; non-terminal count 0.
+- Payments remain 9 SUCCESS.
+- Latest PrinterStatus telemetry remains online, paper OK, toner OK, jam false; `connectionType` is NULL.
+- No deploy or migration event was observed after the maintenance enable in the inspected event response.
+
+**Decision remains: NOT AUTHORIZED TO MIGRATE/DEPLOY OR REOPEN.** Keep Staging Maintenance Mode enabled until the operator, payment, PITR and release-path gates have documented proof and a separately approved release window. Production remains untouched.
