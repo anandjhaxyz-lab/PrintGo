@@ -26,6 +26,7 @@ const makeDeviceJob = (overrides = {}) => ({
   shortId: 'JOB_DEVICE_001',
   machineId: 'machine-a',
   printerDeviceId: 'device-epson',
+  printerWindowsQueueName: 'Epson L6460',
   status: 'WAITING',
   pagesToPrint: 2,
   color: 'color',
