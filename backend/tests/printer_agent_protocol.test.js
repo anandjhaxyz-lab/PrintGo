@@ -332,7 +332,7 @@ describe('Printer Agent protocol — inventory report', () => {
     })).toThrow(expect.objectContaining({ code: 'DUPLICATE_DISCOVERED_QUEUE' }));
   });
 
-  test('rejects invalid inventory metadata and never forwards invalid input', () => {
+  test('rejects invalid inventory metadata and never forwards invalid input', async () => {
     const socket = {
       userType: 'printer',
       machineId: 'machine-a',
@@ -455,7 +455,7 @@ describe('Printer Agent protocol — inventory report', () => {
     }));
   });
 
-  test('refuses inventory reports before successful multi-printer negotiation', () => {
+  test('refuses inventory reports before successful multi-printer negotiation', async () => {
     const socket = {
       userType: 'printer',
       machineId: 'machine-a',
@@ -478,12 +478,13 @@ describe('Printer Agent protocol — inventory report', () => {
     }));
   });
 
-  test('refuses inventory reports from non-printer sockets', () => {
+  test('refuses inventory reports from non-printer sockets', async () => {
     const socket = { userType: 'session', machineId: 'machine-a', emit: jest.fn() };
     const io = { to: jest.fn() };
-    const result = handlePrinterInventoryReport({
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma: {},
       logger: { warn: jest.fn() },
       payload: { protocolVersion: 1, discoveredPrinters: [] }
     });
