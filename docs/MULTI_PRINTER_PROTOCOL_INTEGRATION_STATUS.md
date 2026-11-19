@@ -1,7 +1,7 @@
 # PrintGo Multi-Printer — Backend / Agent Protocol Integration
 
-**Status:** Protocol integration development slice  
-**Branch:** `feat/multi-printer-backend-agent-protocol`  
+**Status:** Phase 3A — persistent discovery and Admin device approval API slice  
+**Branch:** `feat/multi-printer-device-qr-session`  
 **Parent:** `feat/multi-printer-agent-fleet`  
 **Protocol version:** 1  
 **Scope:** One authenticated Windows x64 Agent / one Machine / up to 10 queue-bound PrinterDevices  
@@ -49,15 +49,24 @@ The query is constrained to the authenticated Machine and queue-bound records. U
 
 The Agent checks that the response Machine ID matches the server's authenticated registration event / hello acknowledgement, then validates device IDs, queue names, statuses, duplicate mappings and fleet size.
 
-## 4. Discovery and approval
+## 4. Discovery persistence and explicit Admin binding / approval
 
 The Agent discovers installed Windows queues locally and emits `printer_inventory_report`.
 
 - The backend accepts this event only from an authenticated printer socket that successfully negotiated multi-printer capability.
 - Queue names and metadata are normalized and bounded; duplicate queues and malformed values are rejected.
-- Valid inventory is forwarded to the Admin Socket.IO room as `printer_inventory_report`.
-- The backend does not auto-create, bind, approve, activate or modify PrinterDevice records from discovery.
-- Discovery inventory is advisory and currently transient; persistence and Admin approval UI are subsequent work.
+- The backend persists each complete snapshot in the new `PrinterDiscovery` table, keyed by authenticated Machine and case-normalized Windows queue name.
+- Each report is serialized with a row lock on the authenticated Machine. Previously seen queues are marked `isPresent=false`; rows in the current snapshot are upserted as present with first/last-seen timestamps.
+- The committed snapshot is then forwarded to the Admin Socket.IO room as `printer_inventory_report`. A persistence failure is acknowledged as rejected and is not broadcast as a successful inventory update.
+- Discovery does not create, bind, approve, activate or mutate PrinterDevice records. The discovery-to-device relation is set only by an explicit Admin bind operation.
+
+Admin API endpoints added in this slice (all behind existing Admin authentication, role checks and read-only guard):
+- `GET /api/admin/machines/:id/printer-discovery` — current queue inventory; `?includeAbsent=true` includes historical/absent queues.
+- `GET /api/admin/machines/:id/printer-devices` — Machine-scoped logical devices with discovery and QR/job counts.
+- `POST /api/admin/machines/:id/printer-devices/bind-discovery` with `{ discoveryId, displayName? }` — binds the currently present exact queue to the unbound legacy placeholder where available, or creates a child PrinterDevice. It always leaves the device `PENDING_APPROVAL`.
+- `POST /api/admin/printer-devices/:id/approve` — explicitly approves a mapped device only if the exact queue is still present in the latest persisted inventory; records `approvedAt` and `approvedBy`.
+
+The bind operation enforces one PC / at most 10 queue-bound devices and rejects duplicate case-insensitive queue mappings. Approval is never automatic. This slice adds backend APIs only; a customer-facing flow and Admin UI are not part of this PR.
 
 ## 5. Device health telemetry
 
@@ -75,7 +84,7 @@ Backend:
 - No multi-printer print dispatch: existing `physical_print_job` still follows the legacy `PRINTER_NAME` path.
 - No device-bound Session or PrintJob routing.
 - No durable per-device BullMQ lanes or concurrency changes.
-- No Admin UI persistence/approval flow.
+- No Admin frontend UI for the new discovery/bind/approval APIs yet.
 - No customer QR changes.
 - No Branch or multi-city functionality.
 - No OTA update or local Agent install.
@@ -91,6 +100,10 @@ Automated tests cover:
 - Safe registry DTO and maximum fleet size.
 - Cross-Machine response rejection in the Agent.
 - Inventory validation, duplicate prevention and negotiation/authentication gate.
+- Durable inventory upsert, stale queue absent marking, and persist-before-broadcast behavior.
+- Machine row-lock serialization for inventory and Admin binding/approval operations.
+- Explicit device binding to exact queue, default legacy placeholder reuse, max-10 enforcement, and no implicit approval.
+- Explicit approval requires the same queue to be present in the latest inventory.
 - Device telemetry identity tagging.
 
 CI runs on disposable test infrastructure only. Passing CI does not certify real Windows queue/driver behavior.
