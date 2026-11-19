@@ -119,14 +119,19 @@ describe('PrinterDeviceQueue', () => {
 
   test('rejects invalid lane keys and non-function tasks', () => {
     const queue = new PrinterDeviceQueue();
-    expect(() => queue.enqueue('', () => {})).toThrow(
-      expect.objectContaining({ code: 'INVALID_PRINTER_LANE' })
-    );
-    expect(() => queue.enqueue('Q'.repeat(321), () => {})).toThrow(
-      expect.objectContaining({ code: 'INVALID_PRINTER_LANE' })
-    );
-    expect(() => queue.enqueue('device:a', null)).toThrow(
-      expect.objectContaining({ code: 'INVALID_PRINTER_TASK' })
-    );
+    const expectErrorCode = (operation, code) => {
+      let thrown;
+      try {
+        operation();
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeDefined();
+      expect(thrown.code).toBe(code);
+    };
+
+    expectErrorCode(() => queue.enqueue('', () => {}), 'INVALID_PRINTER_LANE');
+    expectErrorCode(() => queue.enqueue('Q'.repeat(321), () => {}), 'INVALID_PRINTER_LANE');
+    expectErrorCode(() => queue.enqueue('device:a', null), 'INVALID_PRINTER_TASK');
   });
 });
