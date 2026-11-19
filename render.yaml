@@ -28,18 +28,13 @@ services:
         value: admin
       - key: ADMIN_PASS
         generateValue: true
-      - key: REDIS_HOST
+      - key: REDIS_URL
         fromService:
-          type: redis
+          type: keyvalue
           name: printgo-redis
-          property: host
-      - key: REDIS_PORT
-        fromService:
-          type: redis
-          name: printgo-redis
-          property: port
+          property: connectionString
 
-  - type: redis
+  - type: keyvalue
     name: printgo-redis
     plan: free
 
