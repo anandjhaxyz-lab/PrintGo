@@ -33,6 +33,12 @@ These are not the multi-printer feature candidate commits.
 
 Staging frontend deploys are manual in the currently configured Render services. Confirm the selected frontend commit matches the backend release candidate before deploying either frontend.
 
+Latest live Staging frontend deploys observed during this review:
+- Admin Staging: commit 2828ea390c0c3285b79fb2fdf3e3b335d7537a97.
+- Customer Staging: commit bc915bd18454bec2359f7a1d8b7a01bbd0f382f2.
+
+These differ from the latest live Staging backend commit cb4859550276bc73f1d4d3c07fc9fe011560878e. They are currently live on the same tracked feature/printgo-production-readiness branch, but they are not the multi-printer candidate. After the code stack is approved, deploy both Staging frontends from the same reviewed integrated release candidate as the backend; do not assume the three service SHAs automatically match.
+
 ### Staging data services
 
 Read-only Render inventory showed:
@@ -191,4 +197,4 @@ Stop and escalate rather than continuing if any of these occur:
 - A paid job remains stuck, refund state is unclear, or a prior print outcome is ambiguous.
 - Any Production resource or Production credential is unexpectedly involved.
 
-**Current decision:** NOT READY TO DEPLOY. PRs #9–#15 remain Draft and unmerged. PR #16 is the documentation Draft; PR #17 proposes the legacy Blueprint / backend CI alignment and still requires Node 24 CI verification. The Staging migration ledger is applied through 00011, while multi-printer migrations 00012–00016 are pending. The live Staging backend currently reports Node 24.22.1 and uses migrate deploy; its tracked branch is still separate from the multi-printer feature stack. The client Windows PC is currently unavailable/offline. No deployment, migration or Render environment change has been performed by this runbook.
+**Current decision:** NOT READY TO DEPLOY. PRs #9–#15 remain Draft and unmerged. PR #16 is the documentation Draft. PR #17 proposes the legacy Blueprint / backend CI alignment; its Node 24 CI run #44502424580 has passed, but the Draft PR still requires review and approval. The Staging Admin and Customer frontends are also deployed at different SHAs from the backend, so all three must be aligned to the approved release candidate before functional rollout. The Staging migration ledger is applied through 00011, while multi-printer migrations 00012–00016 are pending. The live Staging backend currently reports Node 24.22.1 and uses migrate deploy; its tracked branch is still separate from the multi-printer feature stack. The client Windows PC is currently unavailable/offline. No deployment, migration or Render environment change has been performed by this runbook.
