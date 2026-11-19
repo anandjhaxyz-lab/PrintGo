@@ -132,6 +132,13 @@ router.post('/reconciliation/:id/resolve', restrictTo('SUPERADMIN'), adminContro
 // PERMANENT PRINTER QR MANAGEMENT (Phase 2)
 // ==============================================
 const printerQrAdminController = require('./printerQr.admin.controller');
+const printerDeviceAdminController = require('./printerDevice.admin.controller');
+
+// Machine-scoped Agent discovery and explicit device mapping / approval.
+router.get('/machines/:id/printer-discovery', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDeviceAdminController.listPrinterDiscovery);
+router.get('/machines/:id/printer-devices', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDeviceAdminController.listPrinterDevices);
+router.post('/machines/:id/printer-devices/bind-discovery', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDeviceAdminController.bindDiscoveredPrinterDevice);
+router.post('/printer-devices/:id/approve', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDeviceAdminController.approvePrinterDevice);
 
 router.get('/printer-qrs', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.listPrinterQrs);
 router.get('/printer-qrs/:id', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.getPrinterQrById);
