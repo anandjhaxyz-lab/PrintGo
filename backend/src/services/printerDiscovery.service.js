@@ -124,6 +124,15 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
   }
 
   return prisma.$transaction(async (tx) => {
+    const discoveryReference = await tx.printerDiscovery.findUnique({
+      where: { id: discoveryId },
+      select: { machineId: true }
+    });
+    if (!discoveryReference) throw new AppError('Printer discovery record not found.', 404);
+
+    // Admin printer mutations take the Machine lock first so concurrent
+    // approval/remap flows cannot deadlock while changing queue assignments.
+    await tx.$queryRaw`SELECT "id" FROM "Machine" WHERE "id" = ${discoveryReference.machineId} FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "PrinterDiscovery" WHERE "id" = ${discoveryId} FOR UPDATE`;
     const discovery = await tx.printerDiscovery.findUnique({
       where: { id: discoveryId },
