@@ -751,7 +751,7 @@ const getPublicPrinterQrInfo = async (publicCode) => {
         select: { id: true, name: true, location: true, status: true, printerModel: true, paymentMode: true }
       },
       printerDevice: {
-        select: { id: true, machineId: true, displayName: true, printerModel: true, windowsPrinterName: true, status: true, approvedAt: true }
+        select: { id: true, machineId: true, displayName: true, printerModel: true, windowsPrinterName: true, status: true, approvedAt: true, isDefault: true }
       }
     }
   });
