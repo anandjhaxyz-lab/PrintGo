@@ -79,7 +79,10 @@ Backend dispatch:
 - The existing durable BullMQ publisher remains at global concurrency 1 to preserve deterministic event publication order.
 - A PrintJob with `printerDeviceId` is dispatchable only when `ENABLE_MULTI_PRINTER_DISPATCH=true`, and a fresh database read confirms the exact child device belongs to the same Machine, is `ACTIVE`, has `approvedAt`, and has a non-empty exact Windows queue name.
 - The device identity and queue name sent to the Agent are read from the database, never from the customer payload.
-- The job is atomically claimed only while its device binding remains unchanged. The mapping is checked again immediately before Socket.IO emission; if it became invalid, the job is restored to `WAITING` and no fallback route is used.
+- Each device-bound PrintJob stores `printerWindowsQueueName`, an immutable snapshot of the exact Windows queue chosen when the job is created. The migration backfills existing device-bound jobs from their current verified PrinterDevice mapping so in-flight jobs retain a reportable identity.
+- Before dispatch, the backend requires the current PrinterDevice mapping to still match the PrintJob snapshot. A remap before dispatch cancels/fails the blocked job, records history, notifies watchers, and attempts an idempotent refund for a successful payment; it never redirects the already-paid job to a different queue.
+- After Agent dispatch, success/error/ambiguous/reconciliation reports are validated against the immutable PrintJob snapshot, not the PrinterDevice's mutable current mapping. An Admin remap therefore affects future jobs only and cannot make an already submitted job's legitimate report fail identity validation.
+- The job is atomically claimed only while its device binding and queue snapshot remain unchanged. The mapping is checked again immediately before Socket.IO emission; if it became invalid, no fallback route is used.
 - Legacy jobs with `printerDeviceId=null` retain the existing Machine room / `PRINTER_NAME` path.
 
 Agent dispatch:
@@ -90,7 +93,7 @@ Agent dispatch:
 - After document download/decryption and immediately before durable dispatch intent / Windows driver submission, the Agent requests a correlated backend authorization for the exact job, PrinterDevice and queue identity.
 - Backend authorization locks the `PrinterDevice` row and creates one bounded two-minute dispatch lease per physical device. The Agent renews the lease while awaiting the Windows driver submission and releases it after the spooler handoff succeeds. Failed/ambiguous handoff leaves the lease to expire conservatively.
 - Admin disable, enable and remap transactions acquire the same Machine/PrinterDevice row locks. A live dispatch lease blocks these mutations with HTTP 409; if Admin obtains the lock first, the final Agent authorization observes the new status/mapping and denies dispatch.
-- Spooler success, physical success/error/ambiguous, and reconciliation events carry the exact device identity. Backend accepts a device-bound outcome only when both the PrinterDevice ID and exact queue name match the database job. Legacy jobs cannot claim a child PrinterDevice.
+- Spooler success, physical success/error/ambiguous, and reconciliation events carry the exact device identity. Backend accepts a device-bound outcome only when both the PrinterDevice ID and exact queue name match the immutable queue snapshot on the database job. Legacy jobs cannot claim a child PrinterDevice.
 - Reconciliation receives backend-derived job-to-device bindings. A missing journal entry is treated as `NOT_DISPATCHED` only when the returned device binding matches; journal corruption, mismatch, or ambiguous dispatch remains fail-closed.
 
 Admin lifecycle controls:
