@@ -4,7 +4,7 @@
 
 **Scope:** One authenticated Windows x64 Agent, one Machine, and the approved queue-bound PrinterDevices on that PC (maximum 10 in the current protocol). This checklist is for Staging certification only.
 
-**Current code baseline:** \`feat/multi-printer-agent-device-dispatch\` at \`685a525d28423f4099f0a0048483a69e8ca110fc\`. GitHub Actions run \`44496278372\` completed successfully. CI is not physical certification.
+**Current code baseline:** `feat/multi-printer-agent-device-dispatch` at `685a525d28423f4099f0a0048483a69e8ca110fc`. GitHub Actions run `44496278372` completed successfully. CI is not physical certification.
 
 **Status:** NOT RUN — requires the client PC to be powered on, connected, and available. A PC that is off will correctly leave the Agent offline and customer printing unavailable.
 
@@ -15,7 +15,7 @@ Do not begin physical certification until all are true:
 - [ ] PRs #12, #13 and #15 have been reviewed and merged in dependency order: #12 -> #13 -> #15.
 - [ ] The resulting release candidate is deployed to **Staging**, and the required Prisma migrations have completed successfully there.
 - [ ] Backend and Windows Agent artifacts are built from the same reviewed release candidate; record their versions / commit SHA.
-- [ ] \`ENABLE_MULTI_PRINTER_DISPATCH=true\` is configured only in the isolated Staging environment for this controlled test.
+- [ ] `ENABLE_MULTI_PRINTER_DISPATCH=true` is configured only in the isolated Staging environment for this controlled test.
 - [ ] Production remains untouched; do not enable the feature flag in Production.
 - [ ] Staging Machine ID and its Agent authentication are verified. Do not reuse a test Machine ID or key without confirming its ownership.
 - [ ] The kiosk is configured to use the Staging backend, not Production.
@@ -38,7 +38,7 @@ On the actual Hyderabad Windows PC:
 - [ ] Confirm each intended Windows queue is discovered with the exact queue name, driver and port.
 - [ ] Explicitly approve only the queues intended for this test. Discovery alone is not approval.
 - [ ] Confirm each approved PrinterDevice is ACTIVE and bound to the correct Machine and exact Windows queue.
-- [ ] Confirm device health is fresh; do not proceed with \`AGENT OFFLINE\`, \`Connection: Unknown\`, stale telemetry, or a missing queue.
+- [ ] Confirm device health is fresh; do not proceed with `AGENT OFFLINE`, `Connection: Unknown`, stale telemetry, or a missing queue.
 
 ## 3. Dedicated QR and customer-session identity
 
@@ -49,7 +49,7 @@ For each approved physical printer:
 - [ ] Scan that printer's QR from a phone using mobile data or another internet connection (not the kiosk's LAN).
 - [ ] Confirm the customer page identifies the intended counter / printer.
 - [ ] Confirm the resolved Session is bound by the backend to that PrinterDevice.
-- [ ] Submit a controlled test document and verify the resulting PrintJob stores the same PrinterDevice ID and immutable \`printerWindowsQueueName\` snapshot.
+- [ ] Submit a controlled test document and verify the resulting PrintJob stores the same PrinterDevice ID and immutable `printerWindowsQueueName` snapshot.
 - [ ] Confirm client-supplied device identity cannot override the server-side Session binding.
 - [ ] Do not expose full public tokens, Machine Keys, payment secrets or customer documents in evidence.
 
@@ -84,7 +84,7 @@ Perform only in Staging, with no real customer jobs or live payments:
 - [ ] Confirm an ambiguous prior attempt blocks reprint until resolved. Any authorized reprint reason must contain at least 10 non-whitespace characters.
 - [ ] Confirm Admin disable/remap is blocked with conflict while a live dispatch lease exists; perform this only with a controlled test job and verify the lease has cleared before further changes.
 - [ ] Verify that a remap affects future jobs only: an already-dispatched job's report is checked against its immutable queue snapshot and cannot be redirected to the new queue.
-- [ ] Confirm no device-bound job silently falls back to the legacy \`PRINTER_NAME\` route.
+- [ ] Confirm no device-bound job silently falls back to the legacy `PRINTER_NAME` route.
 
 Stop testing immediately on wrong-printer output, duplicate physical output, false success without a physical print, identity mismatch, unexpected refund, or a stuck paid job. Preserve logs and job IDs; do not retry an ambiguous job.
 
