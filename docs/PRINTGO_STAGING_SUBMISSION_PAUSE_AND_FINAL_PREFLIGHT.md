@@ -258,3 +258,31 @@ This closes the operator-confirmation portion of the checklist, subject to the n
 4. Repeat the final DB/payment checks at the immediate pre-migration point within the approved window.
 
 **Decision:** keep Maintenance Mode enabled. The observed jobs/payments and operator confirmations are clear, but Staging migration/deploy and public reopening are still NOT AUTHORIZED. Production remains untouched.
+
+
+## Render Recovery screenshot evidence — 2026-11-19
+
+The operator supplied a screenshot of the Render Recovery page for `printgo-db-staging` (`dpg-dbqn7pifngtc7384j0hg-a`).
+
+Visible screenshot evidence:
+- Point-in-Time Recovery section states that the database can be restored from any timestamp in the past 3 days.
+- The page offers an upgrade to a Pro workspace to increase the recovery window to 7 days.
+- Export section states that database export files are retained for at least 7 days.
+- The export list shows:
+  - November 19, 2026 at 5:29 PM
+  - November 18, 2026 at 11:24 PM
+- The newest 5:29 PM export is the same logical export previously downloaded as `2026-11-19T11_59Z.dir.tar.gz`, whose local PostgreSQL 18.7 restore and verification passed.
+
+Official Render documentation corroborates the screenshot: Hobby workspace PITR is 3 days; Pro or higher is 7 days; upgrading does not retroactively backfill earlier PITR history. Logical exports are retained for 7 days. References:
+- https://render.com/docs/postgresql-backups
+- https://api-docs.render.com/reference/retrieve-postgres-recovery-info
+
+**Exact Recovery API value not captured:** the screenshot shows the 3-day window but does not show the precise `recoveryStatus` or `startsAt` timestamp. Render's documented read-only endpoint `GET /v1/postgres/{postgresId}/recovery` returns `recoveryStatus` and `startsAt`. The connected Render app tools expose Postgres metadata and read-only SQL but not this Recovery endpoint. Do not invent an exact start time from the screenshot.
+
+This is enough to evidence that PITR is presented as available for the past 3 days and that the latest logical export exists and passed a separate isolated restore drill. If a precise recovery boundary is required, capture the API's `recoveryStatus=AVAILABLE` and `startsAt` or the corresponding exact timestamp exposed in the UI.
+
+### Updated gate
+- Backup/export + isolated restore verification: PASS.
+- Screenshot evidence of 3-day PITR and >=7-day export retention: PASS.
+- Exact PITR `recoveryStatus` / `startsAt`: not captured; remains an optional precision evidence item, not inferred.
+- Staging migration/deploy: still NOT AUTHORIZED until the auto-deploy/branch collision and final candidate approval are resolved.
