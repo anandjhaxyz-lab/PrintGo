@@ -258,15 +258,21 @@ The current Render compute-plan documentation distinguishes `free` from the paid
 - Use the target's connection string locally, not in Git or chat. For a Render target, obtain its external database URL from the target resource's Info page. Use a local target when possible to avoid extra cloud resource cost.
 - Restore the archive directory using the following pattern after replacing the local target host/port/credentials:
   ```powershell
-  $Target = "postgresql://postgres:<LOCAL_PASSWORD>@127.0.0.1:5433/printgo_staging_restore_drill"
-  pg_restore --dbname=$Target --format=directory --verbose --no-owner --no-privileges $DumpDir
-  if ($LASTEXITCODE -ne 0) { throw "Restore failed; keep Staging unchanged and investigate." }
+  $SecurePassword = Read-Host "Local PostgreSQL 18 restore-drill password" -AsSecureString
+  $PasswordPtr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+  try {
+    $env:PGPASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($PasswordPtr)
+    $Target = "postgresql://postgres@127.0.0.1:5433/printgo_staging_restore_drill"
+    pg_restore --dbname=$Target --format=directory --verbose --no-owner --no-privileges $DumpDir
+    if ($LASTEXITCODE -ne 0) { throw "Restore failed; keep Staging unchanged and investigate." }
+  } finally {
+    Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($PasswordPtr)
+    Remove-Variable Target -ErrorAction SilentlyContinue
+    Remove-Variable SecurePassword -ErrorAction SilentlyContinue
+  }
   ```
-  Do not add `--clean` or `--if-exists` to the first restore into an empty drill DB. Those options drop matching destination objects.
-- Keep the target connection string local and remove it from the PowerShell session when finished:
-  ```powershell
-  Remove-Variable Target -ErrorAction SilentlyContinue
-  ```
+  This assumes a local PostgreSQL 18 server is listening on port 5433 and the empty drill database already exists. Do not paste a password or external connection URL into chat or save it in the script. Do not add `--clean` or `--if-exists` to the first restore into an empty drill DB. Those options drop matching destination objects.
 
 ### D. Verify the restored database
 
