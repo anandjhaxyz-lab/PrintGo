@@ -47,33 +47,41 @@ A read-only query of Staging's Prisma migration ledger showed the newest success
 
 20261118000011_add_cash_payment_mode_and_confirmation
 
-The ledger currently contains migrations through 20261118000011. The multi-printer PR stack adds at least these later migrations:
+The ledger currently contains migrations through 20261118000011. The stacked multi-printer PR chain includes these later migrations:
 
-1. 20261119000013_printer_discovery_approval — PR #12
-2. 20261119000014_printer_device_qr_uniqueness — PR #13
-3. 20261119000015_printer_device_dispatch_leases — PR #15
-4. 20261119000016_print_job_queue_snapshot — PR #15
+1. 20261119000012_add_printer_devices — PR #9
+2. 20261119000013_printer_discovery_approval — PR #12
+3. 20261119000014_printer_device_qr_uniqueness — PR #13
+4. 20261119000015_printer_device_dispatch_leases — PR #15
+5. 20261119000016_print_job_queue_snapshot — PR #15
 
-These later migrations were not present in the inspected Staging migration ledger. Before any migration, run npx prisma migrate status against the confirmed Staging database using the exact reviewed release candidate and verify the complete pending migration set. Do not assume the list above is exhaustive; Prisma must apply every pending migration in timestamp order.
+None of migrations 00012–00016 appeared in the inspected Staging migration ledger. PRs #9–#15 are still open Draft PRs and form the code dependency chain. Before any migration, run npx prisma migrate status against the confirmed Staging database using the exact reviewed and integrated release candidate. Verify the complete pending set, including any other migration directories in that candidate; Prisma must apply every pending migration in timestamp order.
 
 The current CI workflow applies migrations to a disposable PostgreSQL 15 database. The inspected Render Staging database is PostgreSQL 18. The Staging migration execution must therefore be treated as a separate environment gate; CI success alone does not establish that the live Staging database has been migrated.
 
 ## 3. Configuration discrepancies and deployment blockers
 
-### 3.1 Render Blueprint file is not aligned with live service settings
+### 3.1 Root render.yaml is a legacy standalone Blueprint, not the live Staging service configuration
 
-The checked-in render.yaml on the inspected feature branch currently specifies:
-- NODE_VERSION: ~18.0.0
-- Build command: npm install && npx prisma generate && npx prisma db push
-- Free-plan PostgreSQL and Redis resources.
+The live Render Staging backend was inspected directly. Its service configuration is:
+- Build: npm install && npx prisma generate
+- Pre-deploy: npx prisma migrate deploy
+- Start: npm start
+- Health check: /api/health
 
-The live Render Staging backend service instead has:
-- Build command: npm install && npx prisma generate
-- Pre-deploy command: npx prisma migrate deploy
-- Start command: npm start
-- Separately provisioned Staging PostgreSQL and Redis resources as listed above.
+The Staging service logs on 18 November 2026 explicitly show:
+- Using Node.js version 24.22.1 (default)
+- Starting pre-deploy: npx prisma migrate deploy
 
-**Do not deploy or reconfigure the existing Render services from the current render.yaml without a separate reconciliation review.** In particular, prisma db push must not replace the migration-ledger workflow for this release. CI currently tests with Node.js 20, while the Blueprint declares Node.js 18; reconcile the runtime version deliberately and verify it against the exact release candidate. Do not silently change the live service configuration as part of this runbook.
+Therefore, the live Staging service already uses Node 24.22.1 and Prisma migration deployment. Do not change those live settings merely to resolve a repository-template discrepancy.
+
+The root render.yaml originally declared Node 18 and used prisma db push. It also defines resource names printgo-backend, printgo-db and printgo-redis, which do not match the current live resource names printgo-backend-staging / printgo-backend-production, printgo-db-staging / printgo-production-db, and their separately provisioned Redis services. It is therefore a legacy standalone Blueprint template, not a safe representation of the existing Staging/Production service graph.
+
+Draft PR #17 proposes to correct that standalone template to Node 24.22.1, npm ci, and preDeployCommand: npx prisma migrate deploy, and aligns the backend CI job from Node 20.x to Node 24.x. PR #17 does not sync or update the live Render resources. The PR remains Draft and its Node 24 CI result must be verified before approval.
+
+**Do not sync the root render.yaml into the current Render workspace.** Render applies Blueprint configuration to matching named resources and can provision resources defined by the Blueprint; the existing names and ownership must be reconciled in a separate infrastructure review first. Do not use prisma db push for this release; retain the live Staging migration-ledger workflow.
+
+Official references: https://render.com/docs/blueprint-spec and https://render.com/docs/node-version
 
 ### 3.2 Staging auto-deploy branch
 
@@ -91,9 +99,9 @@ Production backend also auto-deploys on commits to fix/p1-production-blockers. N
 
 Do not start the deployment until every applicable gate is checked:
 
-- [ ] PR #12 reviewed and approved; merge only when explicitly authorized.
-- [ ] PR #13 reviewed and approved after #12 is integrated; merge only when explicitly authorized.
-- [ ] PR #15 reviewed and approved after #13 is integrated; latest code CI must pass for the exact head SHA.
+- [ ] PRs #9, #10, #11, #12, #13 and #15 are reviewed and approved in dependency order; merge only when explicitly authorized.
+- [ ] The exact stacked code merge chain is #9 -> #10 -> #11 -> #12 -> #13 -> #15; verify each PR base/head and CI after each dependency is integrated.
+- [ ] PR #17 (Render Blueprint / backend CI alignment) is reviewed separately; its Node 24 backend CI must pass on the exact head SHA before approval. It is based on PR #15 and does not alter live Render resources.
 - [ ] PR #16 documentation has been reviewed; it contains the physical certification checklist and this runbook.
 - [ ] Exact release candidate SHA is recorded for backend, frontend and Windows Agent. Do not mix artifacts from different commits.
 - [ ] Target Render service is positively identified as Staging; read the service name and URL again before every action.
@@ -110,7 +118,7 @@ If any gate is incomplete, stop and record the blocker. Do not merge, deploy, mi
 
 This section is an operator sequence to use only after the gates above have been approved.
 
-1. **Freeze the candidate.** Record the reviewed PR head SHAs and the final integrated release SHA. Confirm PR merge order #12 -> #13 -> #15. Keep Production branches and services untouched.
+1. **Freeze the candidate.** Record the reviewed PR head SHAs and the final integrated release SHA. Confirm code PR merge order #9 -> #10 -> #11 -> #12 -> #13 -> #15. Review PRs #16 and #17 separately after the code stack; do not treat either Draft PR as merge authorization. Keep Production branches and services untouched.
 2. **Prepare the Staging deployment target.** In Render, re-confirm printgo-backend-staging, its Staging URL, branch, build command, pre-deploy command, start command and health check. Explicitly manage the current auto-deploy-on-commit behavior so the candidate cannot deploy accidentally. Do not change a service branch or auto-deploy setting without approval.
 3. **Take and verify a Staging database backup.** Confirm the backup belongs to printgo_staging, not printgo-production_db. Record the backup identifier and timestamp in the release evidence.
 4. **Validate migration state.** Run npx prisma migrate status with the candidate's backend/prisma directory and the confirmed Staging DATABASE_URL. Compare the pending list with the migration set included in the reviewed release. Stop on drift, failed migrations, unexpected applied migrations, or any database target ambiguity.
@@ -183,4 +191,4 @@ Stop and escalate rather than continuing if any of these occur:
 - A paid job remains stuck, refund state is unclear, or a prior print outcome is ambiguous.
 - Any Production resource or Production credential is unexpectedly involved.
 
-**Current decision:** NOT READY TO DEPLOY. The reviewed multi-printer PR stack remains Draft, the Staging database migration ledger is behind the new multi-printer migration set, the Staging deployment branch is separate from the feature branch stack, and the client Windows PC is currently unavailable/offline. No deployment or environment change is authorized by this document.
+**Current decision:** NOT READY TO DEPLOY. PRs #9–#15 remain Draft and unmerged. PR #16 is the documentation Draft; PR #17 proposes the legacy Blueprint / backend CI alignment and still requires Node 24 CI verification. The Staging migration ledger is applied through 00011, while multi-printer migrations 00012–00016 are pending. The live Staging backend currently reports Node 24.22.1 and uses migrate deploy; its tracked branch is still separate from the multi-printer feature stack. The client Windows PC is currently unavailable/offline. No deployment, migration or Render environment change has been performed by this runbook.
