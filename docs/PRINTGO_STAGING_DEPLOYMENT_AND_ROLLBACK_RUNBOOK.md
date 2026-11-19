@@ -202,3 +202,100 @@ Stop and escalate rather than continuing if any of these occur:
 - Any Production resource or Production credential is unexpectedly involved.
 
 **Current decision:** NOT READY TO DEPLOY. PRs #9–#15 remain Draft and unmerged. PR #16 is the documentation Draft. PR #17 proposes the legacy Blueprint / backend CI alignment. CI run #44502424580 passed on commit 8fcc40b; later Blueprint-only commits 303f2f2 and 40dd141 passed local YAML parsing but do not have a fresh CI run or Render Blueprint validation. The Draft PR still requires review and validation. The Staging Admin and Customer frontends are also deployed at different SHAs from the backend, so all three must be aligned to the approved release candidate before functional rollout. The Staging migration ledger is applied through 00011, while multi-printer migrations 00012–00016 are pending. The live Staging backend currently reports Node 24.22.1 and uses migrate deploy; its tracked branch is still separate from the multi-printer feature stack. The client Windows PC is currently unavailable/offline. No deployment, migration or Render environment change has been performed by this runbook.
+
+
+## 9. Staging Postgres backup and restore drill (Windows operator procedure)
+
+**Do not merge/deploy/migrate until this drill is complete and the evidence is recorded.** This runbook section is specific to the current Staging DB inventory snapshot from 2026-11-19:
+- Render resource: `printgo-db-staging` / `dpg-dbqn7pifngtc7384j0hg-a`.
+- Database: `printgo_staging`.
+- Server: PostgreSQL 18.6.
+- Render compute plan: `0.1c-256mb` (legacy Basic-256 MB paid compute plan, not the `free` plan).
+- Configured disk: 1 GB.
+
+The current Render compute-plan documentation distinguishes `free` from the paid legacy plan `0.1c-256mb`. Paid Postgres supports PITR and on-demand logical exports; the Recovery page is the authority for the database's current state and workspace-tier PITR window. Render retains on-demand logical exports for 7 days, so download the file before relying on it as an off-platform backup. See https://render.com/docs/compute-plans and https://render.com/docs/postgresql-backups.
+
+### A. Create and download the logical export
+
+1. Open the exact Staging database resource in Render and select **Recovery**: https://dashboard.render.com/d/dpg-dbqn7pifngtc7384j0hg-a
+2. Confirm the page identifies `printgo-db-staging` and database `printgo_staging`; do not use the Production database.
+3. Note the PITR section and its earliest/latest available recovery timestamps. Capture the currently available restore window (workspace plan determines the window: 3 days on Hobby, 7 days on Pro-or-higher).
+4. Select **Create export**. Do not start a second export while one is in progress.
+5. Wait until the export is complete, then download the `.dir.tar.gz` archive. Do not rely only on Render's 7-day retained copy.
+6. Store the archive in access-controlled backup storage. Do not add it to GitHub, email it, or paste any connection string/password into chat.
+7. In PowerShell, record SHA-256 and file size:
+   ```powershell
+   $Backup = "D:\PrintGoBackups\printgo_staging_YYYY-MM-DDTHH_mmZ.dir.tar.gz"
+   Get-Item $Backup | Select-Object FullName, Length, LastWriteTimeUtc
+   Get-FileHash $Backup -Algorithm SHA256
+   ```
+
+### B. Verify archive structure before restoring
+
+1. Use PostgreSQL 18 client tools for this PostgreSQL 18.6 source (Render recommends matching the major client-tool version).
+2. Confirm `pg_restore --version` reports major version 18.
+3. Extract the archive into a new empty folder; do not extract over an earlier drill:
+   ```powershell
+   $Extract = "D:\PrintGoBackups\restore-drill-YYYYMMDD"
+   New-Item -ItemType Directory -Force -Path $Extract | Out-Null
+   tar -xzf $Backup -C $Extract
+   Get-ChildItem $Extract -Recurse -Filter toc.dat
+   ```
+4. The folder containing `toc.dat` is the directory-format archive root. Set it explicitly:
+   ```powershell
+   $DumpDir = (Get-ChildItem $Extract -Recurse -Filter toc.dat | Select-Object -First 1).Directory.FullName
+   if (-not $DumpDir) { throw "Archive TOC not found; do not restore this file." }
+   pg_restore --list $DumpDir | Out-File "$Extract\archive-contents.txt" -Encoding utf8
+   ```
+5. Check the contents listing for the expected application tables and `_prisma_migrations`. A successful listing is an archive-structure check, not yet proof of a successful restore.
+
+### C. Restore only into a separate empty, non-production PostgreSQL 18 database
+
+- Preferred destination: a dedicated local PostgreSQL 18 restore-drill instance/database on a separate port, or an explicitly approved temporary non-production PostgreSQL 18 database. Do not restore over the live Staging DB.
+- Do not use the existing PostgreSQL 16 installation as the restore destination for a PostgreSQL 18 dump unless PostgreSQL compatibility has separately been proven. Use matching PostgreSQL 18 server/client tools.
+- Creating a new Render database can incur ongoing charges. Do not create a cloud database for the drill without explicit cost approval.
+- Create a new empty database first (for example, `printgo_staging_restore_drill`). Never point the restore at a database with data that must be preserved.
+- Use the target's connection string locally, not in Git or chat. For a Render target, obtain its external database URL from the target resource's Info page. Use a local target when possible to avoid extra cloud resource cost.
+- Restore the archive directory using the following pattern after replacing the local target host/port/credentials:
+  ```powershell
+  $Target = "postgresql://postgres:<LOCAL_PASSWORD>@127.0.0.1:5433/printgo_staging_restore_drill"
+  pg_restore --dbname=$Target --format=directory --verbose --no-owner --no-privileges $DumpDir
+  if ($LASTEXITCODE -ne 0) { throw "Restore failed; keep Staging unchanged and investigate." }
+  ```
+  Do not add `--clean` or `--if-exists` to the first restore into an empty drill DB. Those options drop matching destination objects.
+- Keep the target connection string local and remove it from the PowerShell session when finished:
+  ```powershell
+  Remove-Variable Target -ErrorAction SilentlyContinue
+  ```
+
+### D. Verify the restored database
+
+On the separate restored database, run read-only checks and compare with the recorded pre-export Staging snapshot:
+```sql
+SELECT current_database(), version(), pg_size_pretty(pg_database_size(current_database()));
+SELECT migration_name, finished_at, rolled_back_at
+FROM public."_prisma_migrations"
+ORDER BY started_at;
+SELECT 'Machine' AS table_name, count(*)::bigint AS row_count FROM public."Machine"
+UNION ALL SELECT 'PrinterQr', count(*) FROM public."PrinterQr"
+UNION ALL SELECT 'Session', count(*) FROM public."Session"
+UNION ALL SELECT 'PrintJob', count(*) FROM public."PrintJob"
+UNION ALL SELECT 'PrinterStatus', count(*) FROM public."PrinterStatus"
+ORDER BY table_name;
+```
+Expected pre-export reference counts from the 2026-11-19 read-only Staging snapshot: Machine 1; PrinterQr 1; Session 84; PrintJob 9; PrinterStatus 3,957. These counts can differ if new legitimate Staging activity occurred between the snapshot and export; compare with the actual export-time snapshot, not blindly with the older numbers.
+Also verify that the restored `_prisma_migrations` ledger ends at the expected latest applied migration, table definitions/indexes are present, and sample records can be read. Record the restore output, archive SHA-256, target PostgreSQL version, verification timestamp and operator. Only then mark backup/restore readiness complete.
+
+### E. PITR notes
+
+PITR is not the same as a logical export. Render PITR recovery creates a new database instance at the selected historical time; it does not overwrite the original. The new recovery database is billable while it exists. Do not initiate PITR as part of this migration preflight; use it only for an approved recovery exercise or actual recovery. Review the Recovery page's current eligible time range before depending on PITR.
+
+## 10. Live schema compatibility follow-up (read-only, 2026-11-19)
+
+A second schema inspection confirmed the existing Staging columns used by migration 00012 are present in Machine, PrinterQr, Session, PrintJob and PrinterStatus. Existing Machine/QR/session/job/telemetry foreign keys and their delete actions are present. PostgreSQL 18.6 resolves `gen_random_uuid()` even though pgcrypto is not installed. The existing legacy active-per-Machine QR index is present and target multi-printer objects remain absent.
+
+The only Machine has a known printer model `EPSON L6460 Series` but its `connectionType` is NULL. Migration 00012 will preserve that NULL. Do not infer a Windows spooler queue name or connection type from the model; obtain it through Agent discovery and explicit Admin approval later.
+
+Session expiry check at 2026-11-19 11:33 UTC: all 84 Session rows had `expiresAt <= now()`, even though 5 were labelled `CONNECTED` and 75 `WAITING_FOR_MOBILE`. No row was unexpired. Migration 00012 does not alter session status. The Staging smoke-test owner must ensure expired sessions are not shown as live after deployment; do not mass-update historical Session statuses as part of migration preparation without separate approval.
+
+All database checks in this section were read-only. No service setting, DB data, backup, restore, migration or deployment was changed.
