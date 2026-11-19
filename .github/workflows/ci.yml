@@ -13,6 +13,7 @@ on:
       - feat/multi-printer-device-routing
       - feat/multi-printer-device-qr-session-binding
       - feat/multi-printer-agent-device-dispatch
+      - docs/hyderabad-windows-physical-certification
   pull_request:
     branches:
       - main
@@ -35,7 +36,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:15-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -76,6 +77,11 @@ jobs:
 
       - name: Verify Phase 1 Multi-Printer Legacy Backfill
         run: psql "$MIGRATION_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/multi_printer_phase1_backfill.test.sql
+        env:
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target
+
+      - name: Verify Full Multi-Printer Migration Chain (00012-00016)
+        run: psql "$MIGRATION_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/multi_printer_full_migration_chain.test.sql
         env:
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target
 
@@ -120,11 +126,12 @@ jobs:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
 
-      - name: Run Last-Moment Printer Dispatch Authorization Tests
-        run: npx jest tests/printer_device_dispatch_authorization.test.js --runInBand --forceExit
+      - name: Run Last-Moment Printer Dispatch Authorization & PostgreSQL Row-Lock Tests
+        run: npx jest tests/printer_device_dispatch_authorization.test.js tests/printer_device_lease_row_lock.integration.test.js --runInBand --forceExit
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
 
       - name: Run Admin Printer Disable/Remap Lease Tests
         run: npx jest tests/printer_device_admin.test.js --runInBand --forceExit
