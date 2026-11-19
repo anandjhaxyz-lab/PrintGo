@@ -141,6 +141,37 @@ describe('Backend device-bound PrintJob dispatch gate', () => {
     expect(room.emit).not.toHaveBeenCalledWith('physical_print_job', expect.any(Object));
   });
 
+  test('cancels and refunds a job when its stored Windows queue snapshot no longer matches the current mapping', async () => {
+    const job = makeDeviceJob({
+      paymentId: 'payment-snapshot',
+      payment: { id: 'payment-snapshot', status: 'SUCCESS' },
+      printerDevice: {
+        ...makeDeviceJob().printerDevice,
+        windowsPrinterName: 'Epson L6460 (Copy 1)'
+      }
+    });
+    prisma.printJob.findUnique.mockResolvedValueOnce(job);
+    const { io, room } = createIo();
+
+    await queueService.startPrintingProcess(job.shortId, io);
+
+    expect(prisma.printJob.updateMany).toHaveBeenCalledWith({
+      where: {
+        shortId: job.shortId,
+        status: 'WAITING',
+        printerDeviceId: 'device-epson'
+      },
+      data: { status: 'CANCELLED' }
+    });
+    expect(paymentsService.refundPayment).toHaveBeenCalledWith(
+      job.shortId,
+      null,
+      expect.stringContaining('PRINTER_QUEUE_SNAPSHOT_MISMATCH'),
+      expect.objectContaining({ preserveJobStatus: true })
+    );
+    expect(room.emit).not.toHaveBeenCalledWith('physical_print_job', expect.any(Object));
+  });
+
   test('cancels a paid job when its device is not ACTIVE or lacks approval evidence', async () => {
     const job = makeDeviceJob({
       paymentId: 'payment-2',
