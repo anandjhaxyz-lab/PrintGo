@@ -91,6 +91,7 @@ model Machine {
   sessions        Session[]
   printerQrs      PrinterQr[]
   printerDevices  PrinterDevice[]
+  printerDiscoveries PrinterDiscovery[]
   printPricingProfile PrintPricingProfile?
   advertisements  Advertisement[]
 
@@ -138,12 +139,47 @@ model PrinterDevice {
   sessions           Session[]
   printJobs          PrintJob[]
   printerStatuses    PrinterStatus[]
+  discovery          PrinterDiscovery?
 
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
   @@index([machineId, status])
   @@index([machineId, healthStatus])
+}
+
+model PrinterDiscovery {
+  id                 String   @id @default(uuid())
+  machineId          String
+  machine            Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  // Exact Windows queue name plus a normalized key for case-insensitive identity.
+  windowsPrinterName String
+  queueNameKey       String
+  driverName         String?
+  portName           String?
+  connectionType     String?
+  printerStatus      String?
+  detectedErrorState String?
+  workOffline        Boolean?
+  shared             Boolean?
+  network            Boolean?
+  isDefault          Boolean?
+
+  // Inventory presence is observational only; it never changes PrinterDevice lifecycle.
+  isPresent          Boolean  @default(true)
+  firstSeenAt        DateTime @default(now())
+  lastSeenAt         DateTime @default(now())
+
+  // Set only by an explicit Admin bind operation.
+  printerDeviceId    String?  @unique
+  printerDevice      PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([machineId, queueNameKey])
+  @@index([machineId, isPresent, lastSeenAt])
 }
 
 model PrinterQr {
