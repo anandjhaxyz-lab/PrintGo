@@ -2,6 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+const CURRENT_JOURNAL_VERSION = 2;
+
 function atomicRenameWithRetry(srcPath, destPath, maxRetries = 5, initialDelayMs = 25) {
   let lastError = null;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -50,7 +52,7 @@ class JobJournal {
     this.cleanupTempFiles();
     this.isCorrupted = false;
     this.corruptionReason = null;
-    this.version = 1;
+    this.version = CURRENT_JOURNAL_VERSION;
     this.installationInfo = null;
     this.data = this.load();
   }
@@ -125,7 +127,8 @@ class JobJournal {
   load() {
     this.isCorrupted = false;
     this.corruptionReason = null;
-    this.version = 1;
+    // Current writer is v2, but reading v0/v1 never rewrites the source file.
+    this.version = CURRENT_JOURNAL_VERSION;
 
     try {
       const journalExists = fs.existsSync(this.filePath);
@@ -174,21 +177,33 @@ class JobJournal {
       }
 
       const parsed = JSON.parse(raw);
-      if (typeof parsed !== 'object' || parsed === null) {
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         this.isCorrupted = true;
         this.corruptionReason = 'Journal root is not an object';
         return {};
       }
 
-      // Schema version check
+      // V1 journals are read in place. The file is upgraded to v2 only on a later
+      // ordinary atomic save, so startup does not mutate historic recovery evidence.
       if (parsed.version !== undefined) {
-        if (typeof parsed.version !== 'number' || parsed.version > 1) {
+        if (
+          typeof parsed.version !== 'number' ||
+          !Number.isInteger(parsed.version) ||
+          parsed.version < 0 ||
+          parsed.version > CURRENT_JOURNAL_VERSION
+        ) {
           this.isCorrupted = true;
           this.corruptionReason = `Unsupported journal schema version: ${parsed.version}`;
           return {};
         }
-        this.version = parsed.version;
-        return parsed.jobs && typeof parsed.jobs === 'object' ? parsed.jobs : {};
+
+        if (parsed.jobs === undefined || typeof parsed.jobs !== 'object' || parsed.jobs === null || Array.isArray(parsed.jobs)) {
+          this.isCorrupted = true;
+          this.corruptionReason = 'Journal jobs collection is malformed';
+          return {};
+        }
+
+        return parsed.jobs;
       }
 
       // Backwards compatibility with v0 format (direct key-value map of jobs)
@@ -210,7 +225,7 @@ class JobJournal {
   save() {
     const tempPath = `${this.filePath}.tmp.${Date.now()}_${crypto.randomUUID()}`;
     const payload = JSON.stringify({
-      version: this.version || 1,
+      version: CURRENT_JOURNAL_VERSION,
       jobs: this.data
     }, null, 2);
 
@@ -235,6 +250,64 @@ class JobJournal {
       console.error('🔥 Failed to persist job journal atomically:', err.message);
       throw new Error(`Durable journal write failed: ${err.message}`);
     }
+  }
+
+  validatePrinterBinding(details = {}) {
+    if (!details || typeof details !== 'object' || Array.isArray(details)) {
+      throw new Error('Invalid journal event details.');
+    }
+
+    const hasDeviceId = details.printerDeviceId !== undefined && details.printerDeviceId !== null;
+    const hasQueueName = details.windowsPrinterName !== undefined && details.windowsPrinterName !== null;
+    if (!hasDeviceId && !hasQueueName) return null;
+
+    const printerDeviceId = typeof details.printerDeviceId === 'string' ? details.printerDeviceId.trim() : '';
+    const windowsPrinterName = typeof details.windowsPrinterName === 'string' ? details.windowsPrinterName.trim() : '';
+
+    if (
+      !printerDeviceId ||
+      printerDeviceId.length > 128 ||
+      !/^[A-Za-z0-9_-]+$/.test(printerDeviceId) ||
+      !windowsPrinterName ||
+      windowsPrinterName.length > 256 ||
+      /[\u0000-\u001f\u007f]/.test(windowsPrinterName)
+    ) {
+      throw new Error('PrinterDeviceId and exact Windows queue name must be provided together.');
+    }
+
+    if (details.printerName && details.printerName !== windowsPrinterName) {
+      const error = new Error('Legacy printerName does not match windowsPrinterName.');
+      error.code = 'PRINTER_BINDING_MISMATCH';
+      throw error;
+    }
+
+    return { printerDeviceId, windowsPrinterName };
+  }
+
+  applyPrinterBinding(entry, details = {}) {
+    const binding = this.validatePrinterBinding(details);
+    if (!binding) return;
+
+    const existingId = entry.printerDeviceId || null;
+    const existingQueue = entry.windowsPrinterName || null;
+
+    if (
+      (existingId && existingId !== binding.printerDeviceId) ||
+      (existingQueue && existingQueue !== binding.windowsPrinterName)
+    ) {
+      const error = new Error('A journalled job cannot be rebound to a different physical printer.');
+      error.code = 'PRINTER_BINDING_MISMATCH';
+      throw error;
+    }
+
+    if ((!existingId || !existingQueue) && entry.state !== 'RECEIVED') {
+      const error = new Error('A legacy job cannot receive a new physical printer binding after dispatch has begun.');
+      error.code = 'PRINTER_BINDING_MISMATCH';
+      throw error;
+    }
+
+    entry.printerDeviceId = binding.printerDeviceId;
+    entry.windowsPrinterName = binding.windowsPrinterName;
   }
 
   isCorruptedEntry(entry) {
@@ -263,13 +336,16 @@ class JobJournal {
 
   recordReceived(jobId, details = {}) {
     if (!this.data[jobId]) {
-      this.data[jobId] = {
+      const entry = {
         jobId,
         state: 'RECEIVED',
         receivedAt: new Date().toISOString(),
         details,
         history: [{ state: 'RECEIVED', timestamp: new Date().toISOString() }]
       };
+      this.applyPrinterBinding(entry, details);
+      if (details.printerName) entry.printerName = details.printerName;
+      this.data[jobId] = entry;
       this.save();
     }
   }
@@ -279,9 +355,10 @@ class JobJournal {
       this.recordReceived(jobId, details);
     }
     const entry = this.data[jobId];
+    this.applyPrinterBinding(entry, details);
     entry.state = 'DISPATCH_INTENT';
     entry.dispatchIntentAt = new Date().toISOString();
-    entry.printerName = details.printerName || entry.printerName;
+    entry.printerName = details.printerName || details.windowsPrinterName || entry.printerName;
     entry.history.push({ state: 'DISPATCH_INTENT', timestamp: new Date().toISOString(), details });
     this.save();
   }
@@ -291,6 +368,7 @@ class JobJournal {
       this.recordReceived(jobId, details);
     }
     const entry = this.data[jobId];
+    this.applyPrinterBinding(entry, details);
     entry.state = 'SPOOLER_ACCEPTED';
     entry.spoolerAcceptedAt = new Date().toISOString();
     entry.history.push({ state: 'SPOOLER_ACCEPTED', timestamp: new Date().toISOString(), details });
@@ -307,6 +385,7 @@ class JobJournal {
       this.recordReceived(jobId, details);
     }
     const entry = this.data[jobId];
+    this.applyPrinterBinding(entry, details);
     entry.state = 'COMPLETED_LOCALLY';
     entry.completedAt = new Date().toISOString();
     entry.history.push({ state: 'COMPLETED_LOCALLY', timestamp: new Date().toISOString(), details });
