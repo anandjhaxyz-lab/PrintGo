@@ -251,15 +251,9 @@ class SpoolerMonitor {
               if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
               socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-            } else if (checkAttempts >= 3) {
-              // Fast spooling edge case: If the job cleared faster than our first check,
-              // check if spooler dispatch succeeded and printer has 0 errors
-              clearInterval(pollSpooler);
-              console.log(`ℹ️ Job ${jobId} cleared from spooler before queue capture. Confirming driver state...`);
-              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
-              socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
-              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             }
+            // A job never observed in the queue has no positive completion evidence.
+            // Keep polling; the bounded timeout below will report AMBIGUOUS, never SUCCESS.
             return;
           }
 
@@ -312,12 +306,9 @@ class SpoolerMonitor {
              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-          } else if (checkAttempts >= 3) {
-             clearInterval(pollSpooler);
-             if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
-             socket.emit('print_physical_success', { jobId, wasSeenInQueue: false, fastSpoolCleared: true, ...eventBinding });
-             if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
           }
+          // If CUPS never exposed this job, an empty queue is not completion proof.
+          // Leave the bounded timeout to report AMBIGUOUS rather than guessing SUCCESS.
         });
       }
     }, 2000); // 2 second interval avoids CPU/process starvation
