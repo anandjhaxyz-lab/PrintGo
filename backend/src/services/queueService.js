@@ -12,8 +12,11 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
   if (!job?.shortId || !job?.printerDeviceId || !['WAITING', 'PRINTING'].includes(expectedStatus)) {
     return false;
   }
-  if (!isValidJobTransition(expectedStatus, 'FAILED')) {
-    console.error(`Job ${job.shortId}: state machine rejected dispatch-failure transition from ${expectedStatus}.`);
+  // WAITING jobs have not entered the Agent/driver path and may only be
+  // CANCELLED; once claimed as PRINTING, the state machine allows FAILED.
+  const terminalStatus = expectedStatus === 'WAITING' ? 'CANCELLED' : 'FAILED';
+  if (!isValidJobTransition(expectedStatus, terminalStatus)) {
+    console.error(`Job ${job.shortId}: state machine rejected dispatch-block transition from ${expectedStatus} to ${terminalStatus}.`);
     return false;
   }
 
@@ -23,7 +26,7 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
       status: expectedStatus,
       printerDeviceId: job.printerDeviceId
     },
-    data: { status: 'FAILED' }
+    data: { status: terminalStatus }
   });
   if (updateResult.count !== 1) {
     console.warn(`Job ${job.shortId}: dispatch failure was not applied because its state/binding changed concurrently.`);
@@ -47,7 +50,7 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
   const statusEvent = {
     id: job.id,
     shortId: job.shortId,
-    status: 'FAILED',
+    status: terminalStatus,
     error: reason,
     code
   };
@@ -167,7 +170,7 @@ const processJob = async (shortId) => {
 
     const updatedJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true, printerDevice: true }
+      include: { document: true, printerDevice: true, payment: true }
     });
 
     // Re-check immediately before sending the Agent event. A concurrent Admin
