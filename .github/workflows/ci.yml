@@ -8,12 +8,14 @@ on:
       - develop
       - feature/printgo-production-readiness
       - work/printgo-selective-ads-20261117
+      - feat/multi-printer-agent-fleet
   pull_request:
     branches:
       - main
       - master
       - develop
       - feature/printgo-production-readiness
+      - feat/multi-printer-foundation
 
 jobs:
   # =========================================================================
@@ -167,3 +169,31 @@ jobs:
         env:
           VITE_API_URL: "https://printgo-backend-staging.onrender.com"
           VITE_APP_MODE: "kiosk"
+
+  # =========================================================================
+  # 3. PRINTER AGENT: Windows Discovery, Fleet Safety & Journal Recovery
+  # =========================================================================
+  printer-agent-test:
+    name: Printer Agent Fleet & Journal Tests
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./printer-agent
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: 'npm'
+          cache-dependency-path: printer-agent/package-lock.json
+
+      - name: Install Printer Agent dependencies
+        run: npm ci
+
+      - name: Run Printer Agent Jest Suites
+        run: npm test -- --runInBand
