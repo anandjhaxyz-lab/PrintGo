@@ -1,6 +1,7 @@
 const prisma = require('../../utils/prisma');
 const printerDiscoveryService = require('../../services/printerDiscovery.service');
 const printerQrService = require('../../services/printerQr.service');
+const printerDeviceAdminService = require('../../services/printerDeviceAdmin.service');
 
 const listPrinterDiscoveries = async (req, res, next) => {
   try {
@@ -48,4 +49,34 @@ const approvePrinterDiscovery = async (req, res, next) => {
   }
 };
 
-module.exports = { listPrinterDiscoveries, listApprovedPrinterDevices, approvePrinterDiscovery };
+const disablePrinterDevice = async (req, res, next) => {
+  try {
+    const result = await printerDeviceAdminService.disablePrinterDevice(
+      req.params.id, req.body || {}, req.user, prisma
+    );
+    res.status(200).json({
+      success: true,
+      message: result.alreadyDisabled ? 'Printer device is already disabled.' : 'Printer device disabled successfully.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const remapPrinterDevice = async (req, res, next) => {
+  try {
+    const result = await printerDeviceAdminService.remapPrinterDevice(
+      req.params.id, req.body || {}, req.user, prisma
+    );
+    res.status(200).json({
+      success: true,
+      message: 'Printer device mapping updated successfully.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { listPrinterDiscoveries, listApprovedPrinterDevices, approvePrinterDiscovery, disablePrinterDevice, remapPrinterDevice };
