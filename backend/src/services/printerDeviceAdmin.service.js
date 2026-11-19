@@ -99,15 +99,26 @@ async function remapPrinterDevice(printerDeviceId, data = {}, user, prisma) {
   }
 
   return prisma.$transaction(async (tx) => {
-    const discoveryReference = await tx.printerDiscovery.findUnique({
-      where: { id: discoveryId },
-      select: { machineId: true }
-    });
+    const [deviceReference, discoveryReference] = await Promise.all([
+      tx.printerDevice.findUnique({
+        where: { id: printerDeviceId },
+        select: { machineId: true }
+      }),
+      tx.printerDiscovery.findUnique({
+        where: { id: discoveryId },
+        select: { machineId: true }
+      })
+    ]);
+    if (!deviceReference) throw new AppError('Printer device not found.', 404);
     if (!discoveryReference) throw new AppError('Selected Windows printer discovery was not found.', 404);
+    if (deviceReference.machineId !== discoveryReference.machineId) {
+      throw new AppError('A printer can only be remapped to a Windows queue discovered on the same Machine.', 409);
+    }
 
-    // Match the approval workflow lock order: Discovery -> Machine -> Device.
+    // All Admin flows acquire Machine first. The row lock then serializes queue
+    // reassignment and prevents concurrent approvals/remaps from deadlocking.
+    await lockMachineAndDevice(tx, deviceReference.machineId, printerDeviceId);
     await tx.$queryRaw`SELECT "id" FROM "PrinterDiscovery" WHERE "id" = ${discoveryId} FOR UPDATE`;
-    await lockMachineAndDevice(tx, discoveryReference.machineId, printerDeviceId);
 
     const [device, discovery] = await Promise.all([
       tx.printerDevice.findUnique({
