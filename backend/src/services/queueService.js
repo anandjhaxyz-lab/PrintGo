@@ -138,6 +138,13 @@ const processJob = async (shortId) => {
       ) {
         blockedCode = 'PRINTER_DEVICE_UNAVAILABLE';
         blockedReason = 'The selected physical printer is no longer approved, active or correctly mapped. Please contact shop staff.';
+      } else if (
+        typeof dbJob.printerWindowsQueueName !== 'string' ||
+        !dbJob.printerWindowsQueueName.trim() ||
+        dbJob.printerWindowsQueueName !== device.windowsPrinterName
+      ) {
+        blockedCode = 'PRINTER_QUEUE_SNAPSHOT_MISMATCH';
+        blockedReason = 'The printer queue mapping changed after this job was created. This job was not submitted to a different queue; please create a new print job.';
       }
 
       if (blockedCode) {
@@ -185,7 +192,10 @@ const processJob = async (shortId) => {
         device.status === 'ACTIVE' &&
         device.approvedAt &&
         typeof device.windowsPrinterName === 'string' &&
-        device.windowsPrinterName.trim()
+        device.windowsPrinterName.trim() &&
+        typeof updatedJob.printerWindowsQueueName === 'string' &&
+        updatedJob.printerWindowsQueueName.trim() &&
+        updatedJob.printerWindowsQueueName === device.windowsPrinterName
       );
       if (!deviceStillValid) {
         await failBlockedDeviceDispatch(
@@ -219,7 +229,7 @@ const processJob = async (shortId) => {
           iv: updatedJob.iv,
           ...(updatedJob.printerDeviceId ? {
             printerDeviceId: updatedJob.printerDeviceId,
-            windowsPrinterName: updatedJob.printerDevice.windowsPrinterName
+            windowsPrinterName: updatedJob.printerWindowsQueueName
           } : {})
         };
         
