@@ -184,3 +184,36 @@ All queries in this follow-up were read-only. No Staging or Production data, set
 The previously queried Staging database plan is `0.1c-256mb`. Render's current compute plan table identifies `free` as a separate plan ID; `0.1c-256mb` is the paid legacy Basic-256 MB plan. Accordingly, Render-managed PITR and on-demand logical exports are expected to be available for this Staging DB. This eligibility conclusion is based on the plan ID returned by Render plus the current official plan documentation; the actual Recovery page must still confirm the configured recovery window and export state. Workspace tier controls the PITR retention window. Logical exports are retained by Render for seven days and must be downloaded for longer-term retention.
 
 Reference: https://render.com/docs/compute-plans and https://render.com/docs/postgresql-backups.
+
+
+## Final migration source-review and backup status update — 2026-11-19
+
+This status supersedes earlier paragraphs in this document that described backup/restore evidence as outstanding.
+
+### Backup and paused-traffic evidence now completed
+- Render Recovery screenshot for `printgo-db-staging` shows PITR available for the past 3 days; Pro workspace upgrade extends the window to 7 days.
+- Export section states exports are retained for at least 7 days; the list showed exports for 2026-11-19 5:29 PM and 2026-11-18 11:24 PM.
+- The newest logical export was downloaded as `2026-11-19T11_59Z.dir.tar.gz`, archive-validated, restored into a separate local PostgreSQL 18.7 database, and verified. Restored core counts: Machine 1; PrinterQr 1; Session 84; PrintJob 9; PrinterStatus 4,011. Latest successful ledger entry was 00011. Zero unvalidated constraints.
+- Render Maintenance Mode was enabled and independently confirmed from service metadata and event history.
+- Post-maintenance read-only Staging snapshot: PrintJob 9 all COMPLETED, non-terminal 0; Payment 9 all SUCCESS; PaymentEvent 0; Refund 0; ReconciliationRecord 0; 84/84 Sessions expired by timestamp; one ACTIVE QR; zero checked orphan references.
+- Operator confirmed Cashfree Dashboard has zero Pending/Processing orders and the client Windows spooler is idle. These are operator confirmations, not independently queried external system evidence.
+- Render Recovery screenshot does not show exact `recoveryStatus` or `startsAt`; do not claim an exact PITR boundary.
+- Staging Auto-Deploy is now disabled and independently verified: `autoDeploy=no`, `autoDeployTrigger=off`; event `auto_deploy_disabled` at `2026-11-19T13:58:26.361858Z`. Maintenance Mode remains enabled; pre-deploy remains `npx prisma migrate deploy`.
+
+### Migration source-level re-review
+The exact source SQL for 00012–00016 was fetched again from the current candidate branch:
+- 00012 creates one logical default device per Machine; it deliberately leaves `windowsPrinterName` NULL and sets status `DISCOVERY_REQUIRED` / health `UNKNOWN`; it backfills existing QR/session/job/status links without rewriting existing QR public codes or guessing spooler queue names.
+- 00013 adds persistent discovery inventory with explicit Admin review state; discovery does not itself approve a device. `approvedPrinterDeviceId` remains a nullable text history pointer (no FK), as already documented.
+- 00014 replaces the old active-per-Machine QR index with a legacy NULL-device-only index while retaining the per-device ACTIVE QR index.
+- 00015 adds one lease row per PrinterDevice, unique request ID, and cascading device FK.
+- 00016 adds nullable immutable `PrintJob.printerWindowsQueueName` and backfills only from a nonblank queue name already recorded on PrinterDevice.
+
+**Critical operational invariant:** because 00012 creates legacy placeholder devices with NULL `windowsPrinterName`, 00016 cannot create a queue snapshot for legacy jobs unless a real queue mapping has been approved and present. Drain/reconcile all existing non-terminal/ambiguous jobs before migration; do not infer a Windows queue name from `Machine.printerModel`.
+
+### Deployment-path containment
+- Live Staging backend Auto-Deploy is OFF. A merge will not automatically deploy, but a manual deployment will still execute configured `npx prisma migrate deploy`.
+- Candidate PR #18 is still Draft/unmerged and includes migrations 00012–00016 plus backend, frontend and Agent implementation.
+- PR #17 is a separate Draft/unmerged change limited to `render.yaml` and CI. Its Blueprint file explicitly describes a legacy standalone topology and warns it is not the live `printgo-backend-staging` service. Do not sync its Blueprint to the current workspace as part of this rollout.
+
+### Current decision
+Backup/restore, paused-traffic DB preflight, PITR-window screenshot evidence, automatic deployment containment and isolated PostgreSQL tests are PASS for their documented scope. Migration/deployment is **still NOT AUTHORIZED**: the complete implementation stack remains Draft and lacks submitted PR reviews; a named release approval / exact candidate SHA and exact candidate `npx prisma migrate status` against Staging in a secret-safe execution context are outstanding. Keep Maintenance Mode ON. No Staging migration/deploy or Production action has been performed.
