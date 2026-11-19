@@ -331,16 +331,9 @@ const setupSockets = (io) => {
         return;
       }
 
-      // Consume this jobId from active request to prevent replay attacks
-      active.jobIds.delete(jobId);
-
-      // Never automatically reset jobs when Agent reports anything other than NOT_DISPATCHED
-      if (status !== 'NOT_DISPATCHED') {
-        logger.info(`Job ${jobId} reported status "${status}". Not eligible for automatic NOT_DISPATCHED re-dispatch.`);
-        return;
-      }
-
-      // 3, 4, 5. Database-level verification & atomic transition from PRINTING -> WAITING
+      // Do not consume the one-shot reconciliation slot until the authenticated
+      // Agent has proven the exact DB job/device binding and Machine ownership.
+      let reportIdentityValidated = false;
       let transitionSuccess = false;
       try {
         await prisma.$transaction(async (tx) => {
@@ -355,13 +348,20 @@ const setupSockets = (io) => {
           }
 
           // Device-bound and legacy jobs must report the exact expected printer identity.
-          if (!verifyPrinterDeviceReport(job, report)) return;
+          if (!verifyPrinterDeviceReport(job, report)) {
+            logger.warn(`Reconciliation rejected: PrinterDevice identity mismatch for job ${jobId}`);
+            return;
+          }
 
-          // 3. Verify exact machine ownership
+          // Verify exact Machine ownership before consuming the correlated request.
           if (job.machineId !== socket.machineId) {
             logger.warn(`Reconciliation security rejection: Job ${jobId} belongs to machine ${job.machineId}, but reported by ${socket.machineId}`);
             return;
           }
+          reportIdentityValidated = true;
+
+          // Valid non-NOT_DISPATCHED reports consume the slot but never trigger a reprint.
+          if (status !== 'NOT_DISPATCHED') return;
 
           // Must be currently in PRINTING status
           if (job.status !== 'PRINTING') {
@@ -393,6 +393,18 @@ const setupSockets = (io) => {
         }, { maxWait: 5000, timeout: 10000 });
       } catch (txErr) {
         logger.error(`Transaction error during reconciliation reset for job ${jobId}:`, txErr);
+        return;
+      }
+
+      if (!reportIdentityValidated) {
+        // Leave the request slot available so a valid report can still reconcile it.
+        return;
+      }
+      active.jobIds.delete(jobId);
+
+      // Never automatically reset jobs when Agent reports anything other than NOT_DISPATCHED.
+      if (status !== 'NOT_DISPATCHED') {
+        logger.info(`Job ${jobId} reported status "${status}". Not eligible for automatic NOT_DISPATCHED re-dispatch.`);
         return;
       }
 
