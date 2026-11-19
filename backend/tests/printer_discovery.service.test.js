@@ -84,6 +84,10 @@ describe('Printer discovery persistence and approval', () => {
     const result = await approvePrinterDiscovery('discovery-a', { displayName: 'Epson Counter' }, superadmin, prisma);
 
     expect(result).toEqual({ device, alreadyApproved: false });
+    expect(tx.$queryRaw.mock.calls.map(([strings]) => strings.join(''))).toEqual([
+      expect.stringContaining('FROM "Machine"'),
+      expect.stringContaining('FROM "PrinterDiscovery"')
+    ]);
     expect(tx.printerDevice.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         machineId: 'machine-a',
