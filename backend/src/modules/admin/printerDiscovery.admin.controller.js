@@ -64,6 +64,21 @@ const disablePrinterDevice = async (req, res, next) => {
   }
 };
 
+const enablePrinterDevice = async (req, res, next) => {
+  try {
+    const result = await printerDeviceAdminService.enablePrinterDevice(
+      req.params.id, req.body || {}, req.user, prisma
+    );
+    res.status(200).json({
+      success: true,
+      message: result.alreadyEnabled ? 'Printer device is already active.' : 'Printer device enabled successfully.',
+      data: result
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const remapPrinterDevice = async (req, res, next) => {
   try {
     const result = await printerDeviceAdminService.remapPrinterDevice(
@@ -79,4 +94,4 @@ const remapPrinterDevice = async (req, res, next) => {
   }
 };
 
-module.exports = { listPrinterDiscoveries, listApprovedPrinterDevices, approvePrinterDiscovery, disablePrinterDevice, remapPrinterDevice };
+module.exports = { listPrinterDiscoveries, listApprovedPrinterDevices, approvePrinterDiscovery, disablePrinterDevice, enablePrinterDevice, remapPrinterDevice };
