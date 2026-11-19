@@ -120,6 +120,12 @@ jobs:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
 
+      - name: Run Multi-Printer Reconciliation Identity Tests
+        run: npx jest tests/printer_device_reconciliation_slot.test.js --runInBand --forceExit
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
+
       - name: Run Phase 3T Supervised Demo Payment Access Lock Suite (12 Tests)
         run: node tests/phase3t_demo_access_lock.test.js
         env:
