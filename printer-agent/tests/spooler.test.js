@@ -55,6 +55,22 @@ describe('SpoolerMonitor', () => {
   });
 
   describe('checkPrinterStatus', () => {
+    it('includes PrinterDeviceId only for a device-scoped monitor', () => {
+      const deviceMonitor = new SpoolerMonitor({
+        execFile: mockExecFile,
+        printerName: 'Epson L6460',
+        printerDeviceId: 'device-123',
+        platform: 'win32'
+      });
+
+      deviceMonitor.emitStatus(mockSocket, false, '', 'USB');
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        printerName: 'Epson L6460',
+        printerDeviceId: 'device-123',
+        isError: false
+      }));
+    });
     it('should emit status OK when printer is healthy', () => {
       mockExecFile.mockImplementation((cmd, args, a3, a4) => {
         const callback = typeof a3 === 'function' ? a3 : a4;
