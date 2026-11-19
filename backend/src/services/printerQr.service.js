@@ -255,7 +255,11 @@ const generatePrinterQr = async (machineId, data = {}, user = null) => {
       if (err.code === 'P2002') {
         const target = err.meta && (err.meta.target || JSON.stringify(err.meta));
         const targetStr = typeof target === 'string' ? target : JSON.stringify(target);
-        if (targetStr.includes('machineId') || targetStr.includes('printer_qrs_machine_id_active_unique')) {
+        if (
+          targetStr.includes('machineId') ||
+          targetStr.includes('printer_qrs_machine_id_active_unique') ||
+          targetStr.includes('printer_qrs_machine_id_legacy_active_unique')
+        ) {
           throw new AppError('An active dedicated QR already exists for this printer. Use replace to rotate.', 409);
         }
         // If publicCode collided (astronomically rare), retry
@@ -508,6 +512,9 @@ const replacePrinterQr = async (id, data = {}, user = null) => {
     }
     if (existingQr.printerDeviceId) {
       const device = await tx.printerDevice.findUnique({ where: { id: existingQr.printerDeviceId } });
+      if (!device || device.machineId !== existingQr.machineId) {
+        throw new AppError('This QR code has an invalid physical printer mapping.', 403);
+      }
       if (!isLegacyPlaceholderDevice(device)) {
         if (!isMultiPrinterDispatchEnabled()) {
           throw new AppError('Device-specific QR rotation is locked until per-printer Agent dispatch is enabled.', 503);
@@ -760,8 +767,8 @@ const getPublicPrinterQrInfo = async (publicCode) => {
     throw new AppError('This QR code is not bound to a registered printer.', 400);
   }
   const legacyPlaceholderDevice = qr.printerDeviceId && isLegacyPlaceholderDevice(qr.printerDevice);
-  if (qr.printerDeviceId && !qr.printerDevice) {
-    throw new AppError('This QR code references a missing physical printer mapping.', 403);
+  if (qr.printerDeviceId && (!qr.printerDevice || qr.printerDevice.machineId !== qr.machineId)) {
+    throw new AppError('This QR code references an invalid physical printer mapping.', 403);
   }
   if (qr.printerDeviceId && !legacyPlaceholderDevice && !isMultiPrinterDispatchEnabled()) {
     throw new AppError('This physical printer QR is not active yet. Please contact shop staff.', 503);

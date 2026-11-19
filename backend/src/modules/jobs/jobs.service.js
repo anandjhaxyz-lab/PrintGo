@@ -134,8 +134,10 @@ const createJob = async (jobData) => {
           isDefault: true
         }
       });
+      if (!device || device.machineId !== resolvedMachineId) {
+        throw new AppError('Session physical printer mapping does not belong to the session Machine.', 403);
+      }
       const isLegacyPlaceholder = Boolean(
-        device &&
         device.isDefault === true &&
         device.status === 'DISCOVERY_REQUIRED' &&
         !device.approvedAt &&
@@ -146,8 +148,6 @@ const createJob = async (jobData) => {
       // placeholder. Preserve those legacy sessions as Machine-scoped jobs.
       if (!isLegacyPlaceholder) {
         if (
-          !device ||
-          device.machineId !== resolvedMachineId ||
           device.status !== 'ACTIVE' ||
           !device.approvedAt ||
           !device.windowsPrinterName?.trim()
