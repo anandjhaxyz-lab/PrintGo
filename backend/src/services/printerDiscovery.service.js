@@ -165,7 +165,7 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
       throw new AppError('displayName must be a non-empty label of at most 120 characters.', 400);
     }
 
-    await tx.$queryRaw`SELECT "id" FROM "Machine" WHERE "id" = ${discovery.machineId} FOR UPDATE`;
+    // Machine row is already locked before locking this discovery record.
 
     const mappedQueue = await tx.printerDevice.findFirst({
       where: {
