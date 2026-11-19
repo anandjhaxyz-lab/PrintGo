@@ -71,6 +71,10 @@ describe('Admin printer device disable/remap controls', () => {
 
     expect(result.alreadyDisabled).toBe(false);
     expect(f.tx.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(f.tx.$queryRaw.mock.calls.map(([strings]) => strings.join(''))).toEqual([
+      expect.stringContaining('FROM "Machine"'),
+      expect.stringContaining('FROM "PrinterDevice"')
+    ]);
     expect(f.tx.printerDevice.update).toHaveBeenCalledWith({
       where: { id: 'device-a' },
       data: { status: 'DISABLED', healthStatus: 'UNKNOWN' },
@@ -263,6 +267,11 @@ describe('Admin printer device disable/remap controls', () => {
     expect(result.device.windowsPrinterName).toBe('Epson L6460 (Copy 1)');
     expect(result.device.status).toBe('ACTIVE');
     expect(f.tx.$queryRaw).toHaveBeenCalledTimes(3);
+    expect(f.tx.$queryRaw.mock.calls.map(([strings]) => strings.join(''))).toEqual([
+      expect.stringContaining('FROM "Machine"'),
+      expect.stringContaining('FROM "PrinterDevice"'),
+      expect.stringContaining('FROM "PrinterDiscovery"')
+    ]);
     expect(f.tx.printerDevice.update).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'device-a' },
       data: expect.objectContaining({
