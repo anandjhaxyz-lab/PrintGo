@@ -46,7 +46,8 @@ describe('SpoolerMonitor', () => {
     
     monitor = new SpoolerMonitor({ 
       execFile: mockExecFile, 
-      printerName: 'TestPrinter' 
+      printerName: 'TestPrinter',
+      platform: 'win32'
     });
     
     fs.existsSync.mockReturnValue(true);
