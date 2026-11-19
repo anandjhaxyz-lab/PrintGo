@@ -7,7 +7,8 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const {
   handlePrinterAgentHello,
-  handlePrinterInventoryReport
+  handlePrinterInventoryReport,
+  handlePrinterDeviceTelemetry
 } = require('./services/printerAgentProtocol.service');
 
 const setupSockets = (io) => {
@@ -223,64 +224,10 @@ const setupSockets = (io) => {
     });
 
     socket.on('printer_status_update', async (status) => {
-      // Per-device telemetry is stored separately from legacy Machine-wide
-      // PrinterStatus. This avoids one child printer's health affecting the
-      // current single-QR customer availability path before Phase 3 routing.
+      // Keep child-printer health separate from the legacy Machine-wide
+      // PrinterStatus stream until device-bound QR/session routing ships.
       if (status?.printerDeviceId) {
-        if (
-          socket.userType !== 'printer' ||
-          !socket.machineId ||
-          socket.agentProtocol?.supportsMultiPrinter !== true ||
-          typeof status.printerDeviceId !== 'string'
-        ) {
-          logger.warn('Rejected device telemetry from a non-printer or unauthenticated socket');
-          return;
-        }
-
-        try {
-          const device = await prisma.printerDevice.findFirst({
-            where: {
-              id: status.printerDeviceId,
-              machineId: socket.machineId
-            },
-            select: { id: true }
-          });
-
-          if (!device) {
-            logger.warn(`Rejected printer telemetry: device ${status.printerDeviceId} does not belong to Machine ${socket.machineId}`);
-            return;
-          }
-
-          const message = String(status.errorMessage || '').toLowerCase();
-          let healthStatus = 'UNKNOWN';
-          if (status.isError === false) {
-            healthStatus = 'ONLINE';
-          } else if (status.isError === true && (message.includes('out of paper') || message.includes('paper out'))) {
-            healthStatus = 'PAPER_OUT';
-          } else if (status.isError === true && (message.includes('paper jam') || message.includes('jam'))) {
-            healthStatus = 'JAMMED';
-          } else if (status.isError === true && (message.includes('offline') || message.includes('unplugged'))) {
-            healthStatus = 'OFFLINE';
-          } else if (status.isError === true) {
-            healthStatus = 'ERROR';
-          }
-
-          const lastTelemetryAt = new Date();
-          await prisma.printerDevice.update({
-            where: { id: device.id },
-            data: { healthStatus, lastTelemetryAt }
-          });
-
-          io.to('admins').emit('printer_device_status_update', {
-            ...status,
-            machineId: socket.machineId,
-            printerDeviceId: device.id,
-            healthStatus,
-            lastTelemetryAt: lastTelemetryAt.toISOString()
-          });
-        } catch (err) {
-          logger.error(`Error saving telemetry for PrinterDevice ${status.printerDeviceId}:`, err);
-        }
+        await handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status });
         return;
       }
 
