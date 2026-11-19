@@ -159,6 +159,28 @@ describe('Printer Agent protocol — negotiation and machine isolation', () => {
     }));
   });
 
+  test('a malformed renegotiation clears a previously granted fleet capability', async () => {
+    const socket = {
+      userType: 'printer',
+      machineId: 'machine-a',
+      agentProtocol: { supportsMultiPrinter: true },
+      emit: jest.fn()
+    };
+    const result = await handlePrinterAgentHello({
+      socket,
+      prisma: { printerDevice: { findMany: jest.fn() } },
+      logger: { error: jest.fn() },
+      payload: { protocolVersion: 99 }
+    });
+
+    expect(result).toEqual(expect.objectContaining({ accepted: false, code: 'UNSUPPORTED_PROTOCOL_VERSION' }));
+    expect(socket.agentProtocol).toBeNull();
+    expect(socket.emit).toHaveBeenCalledWith('printer_agent_hello_ack', expect.objectContaining({
+      accepted: false,
+      code: 'UNSUPPORTED_PROTOCOL_VERSION'
+    }));
+  });
+
   test('fails closed when more than ten queue-bound devices are registered', async () => {
     const prisma = {
       printerDevice: {
