@@ -93,10 +93,13 @@ Official references: https://render.com/docs/blueprint-spec and https://render.c
 
 The live Staging backend currently auto-deploys on commits to feature/printgo-production-readiness. The multi-printer code is held in stacked feature branches and is not the currently deployed Staging commit.
 
-Before placing any release candidate on a branch watched by the Staging service:
+**Critical merge interaction:** PR #9 currently targets feature/printgo-production-readiness, which is the exact branch watched by the live Staging backend with auto-deploy enabled. Merging PR #9 as it is currently targeted will therefore trigger a Staging backend deployment of the partially integrated stack. Do not merge PR #9 until the deployment path has been deliberately isolated or the Staging auto-deploy behavior has been explicitly controlled and approved.
+
+Before any code merge or release candidate is placed on a branch watched by Staging:
 - Review the exact target branch and commit SHA.
-- Account for the current auto-deploy setting. A commit pushed to the watched Staging branch can deploy automatically.
-- Obtain explicit release approval before changing branch settings, auto-deploy settings, or pushing to that branch.
+- Prevent an unintended partial deploy by either using an isolated integration/release branch not watched by Render, or explicitly disabling Staging auto-deploy before the first stacked merge and later performing one reviewed manual deploy.
+- Obtain explicit release approval before changing branch settings, auto-deploy settings, or pushing to the watched branch.
+- Do not assume a Draft PR merge is harmless just because the migration is additive.
 - Do not use the Production branch or Production services as a shortcut.
 
 Production backend also auto-deploys on commits to fix/p1-production-blockers. Never push the multi-printer candidate to that branch as part of Staging testing.
