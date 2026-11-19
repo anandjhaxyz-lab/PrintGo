@@ -138,6 +138,7 @@ router.get('/printer-discoveries', restrictTo('SUPERADMIN', 'FRANCHISEE'), print
 router.get('/printer-devices', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.listApprovedPrinterDevices);
 router.post('/printer-discoveries/:id/approve', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.approvePrinterDiscovery);
 router.post('/printer-devices/:id/disable', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.disablePrinterDevice);
+router.post('/printer-devices/:id/enable', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.enablePrinterDevice);
 router.post('/printer-devices/:id/remap', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.remapPrinterDevice);
 
 router.get('/printer-qrs', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.listPrinterQrs);
