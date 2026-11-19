@@ -122,3 +122,65 @@ Certification passes only when:
 **Outstanding issues / exclusions:** ____________________
 
 A Staging certification pass is not Production authorization. Production rollout requires a separate reviewed deployment plan, explicit approval, Production migration verification, and a controlled rollout decision.
+
+
+---
+
+## Appendix A — Client PC offline diagnosis (19-Nov-2026)
+
+**Diagnostic result:** The PC was **powered on and awake** when inspected. The immediate cause of the Staging Agent offline state was the local Node.js Agent process being stopped, not a confirmed PC power-off or printer hardware failure.
+
+Evidence recorded in the read-only diagnostic report:
+
+- PC: \`DESKTOP-QB6Q3BC\`.
+- Agent process: zero running \`node.exe\` processes.
+- Scheduled Task: \`\PrintGo_Printer_Agent\` was \`Ready\`, not \`Running\`.
+- Task action: \`C:\Program Files\nodejs\node.exe index.js\`.
+- Working directory: \`D:\PrintGo-S3K\printer-agent\`.
+- Run-as identity: \`desktop-qb6q3bc\lenovo\`, interactive logon.
+- Last Task Scheduler result: \`3221225786\` / \`0xC000013A\` at \`19-Nov-2026 02:11:41 IST\`.
+- Last successful Agent telemetry / spooler interaction: \`19-Nov-2026 05:33:00 IST\`.
+- Staging Socket.IO polling and upgrade handshake returned HTTP 200.
+- The Windows Print Spooler was running. \`EPSON L6460 Series\` was Normal/Ready, \`WorkOffline=False\`, on USB port \`USB019\`; the spooler queue had zero jobs.
+- The Agent's configured backend was the Staging host \`printgo-backend-staging.onrender.com\`. The report found no Production endpoint reference in the inspected Agent configuration.
+
+**Interpretation:** \`0xC000013A\` is consistent with an interactive process being interrupted (for example, Ctrl+C or its console being closed). The diagnostic evidence does not prove who or what initiated the interruption. The logon-only trigger explains why the task remained stopped while the user session stayed logged in; no automatic recovery trigger was configured.
+
+### A.1 Important installation mismatch
+
+The inspected client PC uses a Scheduled Task named \`PrintGo_Printer_Agent\` from \`D:\PrintGo-S3K\printer-agent\`. The current repository's \`printer-agent/INSTALLATION.md\` describes a PM2-managed process named \`PrintGo_Agent\` and PM2 Windows startup. These are different installation/startup configurations.
+
+**Do not blindly rerun \`setup_kiosk.bat\`, install PM2 over the existing task, replace the task principal, or change the working directory during incident recovery.** First identify the deployed S3K build and preserve the current installation identity, journal, keys, task principal, action and Staging configuration.
+
+### A.2 Recovery — only after explicit operator approval
+
+The diagnostic run was read-only. No service, task or process was started or modified. The following recovery step remains **NOT EXECUTED** until the PC owner authorizes it:
+
+1. Confirm the physical print tray is clear and check the last known job \`f60ca5d8\` is acknowledged in the Staging ledger.
+2. Confirm there is still no Agent process and that the existing task identity/configuration is the intended Staging installation.
+3. With owner approval, start the existing task without changing its command, working directory, run-as identity, keys or journal:
+
+   \`\`\`powershell
+   Start-ScheduledTask -TaskName 'PrintGo_Printer_Agent'
+   \`\`\`
+
+4. Verify the task is Running, exactly one intended \`node.exe index.js\` process exists under \`D:\PrintGo-S3K\printer-agent\`, and the Agent reconnects to Staging.
+5. Wait for a **fresh** heartbeat (not the old 05:33 timestamp). Confirm Admin Staging changes to ONLINE, printer telemetry becomes fresh, and the customer QR page no longer reports \`Printer Temporarily Offline\`.
+6. Confirm no old job was automatically reprinted and no new job was created as a side effect of Agent recovery.
+
+If the task immediately exits again, stop. Capture the new task result and sanitized Agent stdout/stderr before changing its definition.
+
+### A.3 Permanent startup recovery — separate approved maintenance change
+
+After the single controlled start has been verified:
+
+- Back up/export the existing Task Scheduler task XML and record its current trigger, action, run-as identity, working directory and settings.
+- Configure Task Scheduler **restart on failure** (for example, restart after 1 minute with a bounded/high retry count) while preserving the existing interactive user context and Staging configuration.
+- Keep \`Multiple instances\` set to \`Do not start a new instance\`; do not allow a second Agent to start alongside the existing one.
+- Ensure the task does not have a short execution time limit that would terminate the long-running Agent.
+- Add persistent, access-controlled, rotating stdout/stderr logs only after confirming the deployed S3K build's supported logging method. Do not write secrets or document contents to logs.
+- Test one controlled Agent restart and one Windows reboot during a maintenance window; verify there is still exactly one Agent process and the journal / installation marker / RSA keys remain unchanged.
+- Document an operator-controlled maintenance pause so an intentional shutdown is not immediately undone by an automatic watchdog.
+
+**Do not force-reprovision, delete \`jobs.journal.json\`, delete \`.installation_marker\`, replace \`keys\`, or generate a new Machine identity for this incident.** The report found the existing identity and journal present; the issue is the stopped process.
+
