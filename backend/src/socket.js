@@ -84,19 +84,31 @@ const setupSockets = (io) => {
               machineId: socket.machineId,
               status: 'PRINTING'
             },
-            select: { shortId: true }
+            select: {
+              shortId: true,
+              printerDeviceId: true,
+              printerDevice: { select: { windowsPrinterName: true } }
+            }
           });
           
           if (stuckJobs.length > 0) {
             const jobIds = stuckJobs.map(j => j.shortId);
             const requestId = `rec_${socket.machineId}_${Date.now()}_${crypto.randomUUID()}`;
+            const jobBindings = Object.fromEntries(stuckJobs.map((job) => [
+              job.shortId,
+              job.printerDeviceId ? {
+                printerDeviceId: job.printerDeviceId,
+                windowsPrinterName: job.printerDevice?.windowsPrinterName || null
+              } : null
+            ]));
             socket.activeReconciliation = {
               requestId,
               jobIds: new Set(jobIds),
+              jobBindings,
               createdAt: Date.now()
             };
             logger.info(`Requesting reconciliation [ReqID: ${requestId}] for ${jobIds.length} active PRINTING job(s) from machine ${socket.machineId}: ${jobIds.join(', ')}`);
-            socket.emit('reconcile_active_jobs', { requestId, jobIds });
+            socket.emit('reconcile_active_jobs', { requestId, jobIds, jobBindings });
           }
         } catch (e) {
           logger.error('Error recovering stuck jobs for printer:', e);
@@ -282,7 +294,32 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('job_reconciliation_report', async ({ requestId, jobId, status }) => {
+    // For device-bound jobs, every Agent outcome must carry the exact database
+    // PrinterDevice ID and Windows queue name. Legacy jobs must not carry a child ID.
+    const verifyPrinterDeviceReport = (job, report, eventName) => {
+      const reportedDeviceId = report && typeof report === 'object' ? report.printerDeviceId || null : null;
+      const reportedQueueName = report && typeof report === 'object' ? report.windowsPrinterName || null : null;
+      if (job?.printerDeviceId) {
+        const expectedQueueName = job.printerDevice?.windowsPrinterName || null;
+        if (
+          reportedDeviceId !== job.printerDeviceId ||
+          !expectedQueueName ||
+          reportedQueueName !== expectedQueueName
+        ) {
+          logger.warn(`Rejected ${eventName} for job ${job.shortId}: Agent PrinterDevice binding does not match the database job mapping.`);
+          return false;
+        }
+        return true;
+      }
+      if (reportedDeviceId || reportedQueueName) {
+        logger.warn(`Rejected ${eventName} for legacy job ${job?.shortId}: unexpected PrinterDevice binding was reported.`);
+        return false;
+      }
+      return true;
+    };
+
+    socket.on('job_reconciliation_report', async (report) => {
+      const { requestId, jobId, status } = report || {};
       // 1. Verify authenticated Agent identity and printer type
       if (socket.userType !== 'printer' || !socket.machineId) {
         logger.warn(`Unauthorized or non-printer socket attempted reconciliation report`);
@@ -320,13 +357,16 @@ const setupSockets = (io) => {
         await prisma.$transaction(async (tx) => {
           const job = await tx.printJob.findUnique({
             where: { shortId: jobId },
-            include: { payment: true }
+            include: { payment: true, printerDevice: true }
           });
 
           if (!job) {
             logger.warn(`Reconciliation failed: Job ${jobId} not found`);
             return;
           }
+
+          // Device-bound and legacy jobs must report the exact expected printer identity.
+          if (!verifyPrinterDeviceReport(job, report, 'job_reconciliation_report')) return;
 
           // 3. Verify exact machine ownership
           if (job.machineId !== socket.machineId) {
@@ -377,11 +417,20 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_spooler_success', async ({ jobId }) => {
-      // Only printer agents should report spooler results
-      if (socket.userType !== 'printer') return;
-      logger.info(`Print spooler accepted job ${jobId}. Awaiting physical completion...`);
-      // P3-001: We do NOT mark it COMPLETED here anymore. It stays PRINTING until physical success.
+    socket.on('print_spooler_success', async (report) => {
+      if (socket.userType !== 'printer' || !socket.machineId) return;
+      const jobId = report?.jobId;
+      try {
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { printerDevice: true }
+        });
+        if (!currentJob || currentJob.machineId !== socket.machineId) return;
+        if (!verifyPrinterDeviceReport(currentJob, report, 'print_spooler_success')) return;
+        logger.info(`Print spooler accepted job ${jobId}. Awaiting physical completion...`);
+      } catch (error) {
+        logger.error(`Failed to verify spooler acceptance for job ${jobId}:`, error);
+      }
     });
 
     socket.on('print_physical_success', async (payload) => {
@@ -389,11 +438,14 @@ const setupSockets = (io) => {
       const jobId = typeof payload === 'object' ? payload.jobId : payload;
       logger.info(`Physical print success reported for job ${jobId}`);
       try {
-        const currentJob = await prisma.printJob.findUnique({ 
-          where: { shortId: jobId }, 
-          include: { document: true } 
+        const normalizedReport = typeof payload === 'object' && payload !== null ? payload : { jobId };
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { document: true, printerDevice: true }
         });
         if (!currentJob) return;
+
+        if (!verifyPrinterDeviceReport(currentJob, normalizedReport, 'print_physical_success')) return;
 
         // P0: Enforce Machine Ownership
         if (currentJob.machineId !== socket.machineId) {
@@ -438,11 +490,16 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_physical_ambiguous', async ({ jobId, reason, wasSeenInQueue }) => {
+    socket.on('print_physical_ambiguous', async (report) => {
       if (socket.userType !== 'printer' || !socket.machineId) return;
+      const { jobId, reason, wasSeenInQueue } = report || {};
       logger.warn(`Job ${jobId} physical outcome ambiguous: ${reason}. Keeping status as PRINTING for operator reconciliation.`);
       try {
-        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { printerDevice: true }
+        });
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report, 'print_physical_ambiguous')) return;
         if (currentJob) {
           // Machine ownership guard
           if (currentJob.machineId !== socket.machineId) {
@@ -463,11 +520,16 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_physical_error', async ({ jobId, error }) => {
-      if (socket.userType !== 'printer') return;
+    socket.on('print_physical_error', async (report) => {
+      if (socket.userType !== 'printer' || !socket.machineId) return;
+      const { jobId, error } = report || {};
       logger.error(`Physical print error for job ${jobId}: ${error}`);
       try {
-        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { printerDevice: true }
+        });
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report, 'print_physical_error')) return;
         if (!currentJob || !isValidJobTransition(currentJob.status, 'FAILED')) return;
 
         // P0: Enforce Machine Ownership
@@ -493,15 +555,20 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_spooler_error', async ({ jobId, error }) => {
-      if (socket.userType !== 'printer') {
+    socket.on('print_spooler_error', async (report) => {
+      if (socket.userType !== 'printer' || !socket.machineId) {
         logger.warn(`Non-printer socket ${socket.id} tried to report spooler error`);
         return;
       }
+      const { jobId, error } = report || {};
       logger.error(`Print spooler failed for job ${jobId}: ${error}`);
       try {
         // Validate state transition before updating
-        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { printerDevice: true }
+        });
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report, 'print_spooler_error')) return;
         if (!currentJob || !isValidJobTransition(currentJob.status, 'FAILED')) {
           logger.warn(`Ignoring spooler error for job ${jobId}: invalid transition from ${currentJob?.status}`);
           return;
