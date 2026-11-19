@@ -1,3 +1,5 @@
+const { recordPrinterDiscoveryInventory } = require('./printerDiscovery.service');
+
 const AGENT_PROTOCOL_VERSION = 1;
 const MAX_REGISTERED_PRINTERS = 10;
 const MAX_DISCOVERED_QUEUES = 50;
@@ -263,7 +265,7 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
   }
 }
 
-function handlePrinterInventoryReport({ socket, io, logger, payload }) {
+async function handlePrinterInventoryReport({ socket, io, logger, prisma, payload }) {
   if (socket?.userType !== 'printer' || !socket.machineId) {
     return { accepted: false, code: 'UNAUTHORIZED_AGENT' };
   }
@@ -278,6 +280,7 @@ function handlePrinterInventoryReport({ socket, io, logger, payload }) {
 
   try {
     const discoveredPrinters = validateDiscoveredPrinterInventory(payload);
+    await recordPrinterDiscoveryInventory(prisma, socket.machineId, discoveredPrinters);
     const report = {
       machineId: socket.machineId,
       machineName: socket.machineName || null,
@@ -285,8 +288,8 @@ function handlePrinterInventoryReport({ socket, io, logger, payload }) {
       discoveredPrinters
     };
 
-    // Inventory is advisory and forwarded to Admin sockets; it never approves,
-    // binds, creates or changes PrinterDevice records.
+    // Persist for Admin review only. Agent inventory never creates, approves,
+    // binds, activates or modifies PrinterDevice records.
     io.to('admins').emit('printer_inventory_report', report);
     socket.emit('printer_inventory_report_ack', {
       accepted: true,

@@ -1,0 +1,28 @@
+const prisma = require('../../utils/prisma');
+const printerDiscoveryService = require('../../services/printerDiscovery.service');
+
+const listPrinterDiscoveries = async (req, res, next) => {
+  try {
+    const result = await printerDiscoveryService.listPrinterDiscoveries(req.user, req.query, prisma);
+    res.status(200).json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const approvePrinterDiscovery = async (req, res, next) => {
+  try {
+    const result = await printerDiscoveryService.approvePrinterDiscovery(
+      req.params.id, req.body || {}, req.user, prisma
+    );
+    res.status(result.alreadyApproved ? 200 : 201).json({
+      success: true,
+      message: result.alreadyApproved ? 'Printer was already approved.' : 'Printer approved and registered successfully.',
+      data: { device: result.device, alreadyApproved: result.alreadyApproved }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { listPrinterDiscoveries, approvePrinterDiscovery };

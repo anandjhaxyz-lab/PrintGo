@@ -33,6 +33,7 @@ import {
   PrinterQrLedgerModal
 } from './PrinterQrModals';
 import { PrinterAdSuppressionModal } from './PrinterAdSuppressionModal';
+import { PrinterFleetApprovalPanel } from './PrinterFleetApprovalPanel';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
@@ -258,6 +259,7 @@ export const PrintersView = ({
 
   return (
     <div>
+      <PrinterFleetApprovalPanel currentUser={currentUser} />
       {/* Global Alerts */}
       {globalSuccess && (
         <div
