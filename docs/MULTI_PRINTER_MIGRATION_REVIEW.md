@@ -1,6 +1,6 @@
 # Multi-Printer Prisma Migration Review
 
-**Review status: NOT READY TO APPLY TO STAGING**  
+**Review status: NOT READY TO APPLY TO STAGING — verified backup export/restore evidence outstanding**  
 **Scope:** migrations `20261119000012` through `20261119000016`, the preceding legacy QR index migration `20261110000007`, the Prisma schema, the Phase 1 SQL fixture, and the relevant job/lease service paths.  
 **Reviewed ref:** `docs/hyderabad-windows-physical-certification`  
 **Review mode:** source and test inspection only. No migration was executed and no Staging or Production data/settings were changed.
@@ -37,13 +37,13 @@ The backfill updates several existing tables and creates indexes/foreign keys. T
 
 ### 00014 — `printer_device_qr_uniqueness`
 
-**Assessment: intended index transition is correct; direct migration regression test is still needed.**
+**Assessment: intended index transition is correct; isolated PostgreSQL regression test passed.**
 
 - The dropped index name exactly matches the index created in 00007.
 - After 00012 has mapped legacy QR records to a default device, the new device-level partial unique index enforces at most one ACTIVE QR per non-NULL `printerDeviceId`.
 - The replacement legacy partial unique index enforces at most one ACTIVE QR per Machine only for rows whose `printerDeviceId IS NULL`. This allows multiple active QR codes on one Machine when they belong to different physical PrinterDevices, while retaining the legacy one-per-Machine rule for unbound QR rows.
 
-**Verification added:** the full-chain SQL fixture applies 00012, 00013 and 00014 in order and directly verifies: two different device-bound ACTIVE QRs on one Machine are allowed; a second ACTIVE QR for the same device is rejected; a second ACTIVE legacy (NULL-device) QR for one Machine is rejected; REVOKED/REPLACED rows do not block a new ACTIVE row; and a device-bound QR can coexist with one legacy NULL-device QR on the same Machine. This runs against a real disposable PostgreSQL server in CI, not only mocked QR service tests. The fixture's migration step passed on PostgreSQL 18 in CI run #44511811143.
+**Verification added and passed:** the full-chain SQL fixture applies 00012–00016 in order and directly verifies: two different device-bound ACTIVE QRs on one Machine are allowed; a second ACTIVE QR for the same device is rejected; a second ACTIVE legacy (NULL-device) QR for one Machine is rejected; REVOKED/REPLACED rows do not block a new ACTIVE row; and a device-bound QR can coexist with one legacy NULL-device QR on the same Machine. CI run #44514644520 on candidate SHA `d0b149d` passed the full-chain step, and the later docs-head CI run #44514898034 also passed the same step on PostgreSQL 18.
 
 **Rollback warning:** once multiple ACTIVE device QR codes exist on a Machine, the original one-ACTIVE-QR-per-Machine index cannot be recreated until the extra device QR codes have been revoked/replaced or otherwise reconciled. A simple application rollback does not restore the old database invariant.
 
@@ -55,7 +55,7 @@ The backfill updates several existing tables and creates indexes/foreign keys. T
 - The service locks the PrinterDevice row before acquiring, renewing, or releasing a lease. It considers a lease active only while it is unreleased and unexpired; a released/expired row can be overwritten by a later acquisition. The current service TTL is two minutes.
 - `ON DELETE CASCADE` removes the ephemeral lease row if its PrinterDevice is deleted. `jobShortId` is not a foreign key, so the lease table is operational coordination state, not a durable job audit ledger.
 
-The full-chain fixture verifies the database primary-key and unique-requestId constraints, including rejection of a second lease row for one device and requestId reuse across devices. Existing backend suites also run the Admin lease and dispatch authorization tests. This migration fixture is not a multi-connection row-lock stress test; retain that as a separate concurrency/soak check if dispatch traffic/load warrants it.
+The full-chain fixture verifies the database primary-key and unique-requestId constraints, including rejection of a second lease row for one device and requestId reuse across devices. The new `backend/tests/printer_device_lease_row_lock.integration.test.js` uses two independent PrismaClient connections to verify same-device row-lock serialization and concurrent locks on different device rows. It refuses any database URL other than localhost/127.0.0.1 database `printgo_disposable_target`. CI runs #44514644520 and #44514898034 passed this integration test, together with the Admin lease and dispatch authorization suites. This is a focused concurrency regression check, not a high-volume load/soak test.
 
 ### 00016 — `print_job_queue_snapshot`
 
@@ -77,17 +77,17 @@ The existing job snapshot tests cover creation from an approved device and Machi
 
 ## Required gates before any Staging migration
 
-- [ ] Verified current Staging backup and a tested restore/rollback plan.
-- [ ] Read-only preflight of Machine, PrinterQr, Session, PrintJob, PrinterStatus counts and duplicate/NULL identity cases.
+- [ ] Verified current Staging logical export downloaded outside Render and a tested restore into a separate empty/non-production database; confirm PITR recovery window in the Recovery page.
+- [x] Read-only preflight snapshot of Machine, PrinterQr, Session, PrintJob, PrinterStatus counts, duplicate ACTIVE QR check and orphan Machine/QR references completed on 2026-11-19. Repeat after submissions are paused immediately before migration.
 - [ ] No unresolved non-terminal/in-flight legacy PrintJobs; drain or reconcile them before 00012.
-- [x] Isolated PostgreSQL CI fixture applies the complete ordered set 00012–00016 to a representative pre-migration schema (full workflow #44511811143 passed on PostgreSQL 18; backend, frontend and Agent jobs all succeeded).
+- [x] Isolated PostgreSQL CI fixture applies the complete ordered set 00012–00016 to a representative pre-migration schema (full workflow #44514644520 and docs-head workflow #44514898034 passed on PostgreSQL 18; backend, frontend and Agent jobs all succeeded).
 - [x] Explicit 00014 partial-index transition tests described above pass in the isolated PostgreSQL fixture.
-- [x] Lease primary-key / requestId uniqueness and queue snapshot NULL/blank/known-name backfill assertions pass in the isolated PostgreSQL fixture.
+- [x] Lease primary-key / requestId uniqueness, two-connection row-lock concurrency, and queue snapshot NULL/blank/known-name backfill assertions pass in CI.
 - [x] Existing queue snapshot/report service tests remain in the backend CI workflow.
-- [ ] Repeat a live Staging PrintJob status query immediately before any migration after new submissions are paused; the 2026-11-19 count of 9 COMPLETED jobs is only a point-in-time observation.
+- [ ] Repeat the live Staging preflight immediately before any migration after new submissions are paused; the 2026-11-19 snapshot is point-in-time only.
 - [ ] Staging-only deploy approval, smoke-test owner, and Production isolation reconfirmed.
 
-**Final decision:** review found no direct deletion of customer QR tokens or historical job/payment rows in 00012–00016. The new disposable PostgreSQL fixture now validates the complete ordered chain and the key 00014/00015/00016 invariants; it passed its migration step on PostgreSQL 18 in CI run #44511811143. This closes the previous SQL-fixture coverage gap. The 00013 exact-case index is intentionally retained for Prisma schema alignment, with the extra index overhead documented. The historical-job queue-snapshot issue is safe only if the final pre-migration drain/reconciliation check confirms no unresolved non-terminal/in-flight legacy PrintJobs. The 2026-11-19 live Staging query saw 9 COMPLETED and no other statuses, but that must be repeated immediately before migration after pausing new submissions. A verified Staging backup/restore point and approved deployment window are still mandatory. Keep the Staging candidate Draft; no migration has been run on Staging or Production.
+**Final decision:** source review and isolated PostgreSQL migration/row-lock test gates passed. The latest full workflows #44514644520 and #44514898034 passed. However, live migration remains blocked pending a downloaded Staging logical export and a tested restore into a separate empty/non-production database, final post-pause data preflight, confirmed maintenance window and explicit rollout approval. Keep the Staging candidate Draft; no migration has been run on Staging or Production.
 
 
 ## Live Staging PrintJob preflight snapshot (2026-11-19)
@@ -103,3 +103,49 @@ Result at query time:
 This satisfies the *current point-in-time* non-terminal-job count preflight. It does not remove the need to repeat the same read-only check immediately before any migration, after stopping/pausing new submissions for the release window. The result may change as soon as new jobs arrive. It also does not close the separate 00014 PostgreSQL index-transition test gap or the complete migration/lease/snapshot test gates above.
 
 The query was read-only; no Staging or Production data was changed.
+
+
+## Backup and live schema preflight update (2026-11-19)
+
+### Render database metadata (read-only)
+
+- Render resource: `printgo-db-staging` (`dpg-dbqn7pifngtc7384j0hg-a`), database `printgo_staging`.
+- Status: `available`; PostgreSQL `18.6`; region Singapore.
+- Compute plan: `0.1c-256mb`; configured storage: 1 GB; current database size: approximately 11 MB.
+- High availability: disabled.
+- IP allow list: `0.0.0.0/0` (all IPv4 addresses). This was observed, not changed. Review access restrictions separately against the backend's actual egress/network requirements.
+- Render Staging backend `printgo-backend-staging` remains on branch `feature/printgo-production-readiness`, auto-deploy enabled, with pre-deploy command `npx prisma migrate deploy`. Its latest listed live deployment was commit `cb4859550276bc73f1d4d3c07fc9fe011560878e`. A merge/push to the watched branch can therefore automatically deploy and apply all pending Prisma migrations.
+
+### Live migration ledger and schema state
+
+Read-only queries at 2026-11-19 11:30 UTC found:
+- `_prisma_migrations` latest successful entry: `20261118000011_add_cash_payment_mode_and_confirmation`.
+- No incomplete or rolled-back migration rows.
+- None of migrations `20261119000012` through `20261119000016` are recorded.
+- The target tables `PrinterDevice`, `PrinterDiscovery`, `PrinterDeviceDispatchLease` and target column `PrintJob.printerWindowsQueueName` are not present.
+- Existing legacy unique index `printer_qrs_machine_id_active_unique` is present.
+
+### Current data snapshot
+
+- `Machine`: 1 row.
+- `PrinterQr`: 1 row; 1 ACTIVE row, linked to the existing Machine.
+- `Session`: 84 rows (5 CONNECTED, 4 EXPIRED, 75 WAITING_FOR_MOBILE). All have a valid Machine reference. 47 do not reference a QR row; the 00012 Machine-default-device fallback will cover these where the Machine ID is present.
+- `PrintJob`: 9 rows; all 9 COMPLETED; 0 non-completed jobs at query time.
+- `PrinterStatus`: 3,957 rows, all attached to the one existing Machine.
+- Orphan reference checks for `PrinterQr.machineId`, `Session.machineId`, `Session.printerQrId`, `PrintJob.machineId`, and `PrinterStatus.machineId`: 0 each.
+- No Machine has more than one ACTIVE legacy QR.
+
+All of the above is a point-in-time read-only observation. No writes, migration commands, backup/restore, service maintenance mode, or deploy actions were performed.
+
+### Backup readiness — not yet verified
+
+The Render Postgres tool connection used for this review exposes database metadata and read-only SQL, but does not expose an action to create/download a logical export or initiate/validate a restore. The live dashboard's Recovery page must therefore be used for the backup evidence:
+1. Open the Staging DB dashboard, then its **Recovery** page.
+2. Confirm the available Point-in-Time Recovery window shown for this database/workspace.
+3. Use **Create export** and wait for the export to complete.
+4. Download the resulting `.dir.tar.gz` archive to secure storage outside the Render database/service.
+5. Restore that archive into a separate empty/non-production PostgreSQL database, then verify row counts, schema and representative records before declaring the restore tested. Do not restore over the live Staging database.
+
+Render documentation says paid Postgres databases have PITR; the recovery window is 3 days for Hobby workspaces and 7 days for Pro-or-higher workspaces. Logical exports are retained for 7 days on Render and must be downloaded for longer retention. Free compute databases do not support Render-managed backups. The actual workspace tier and the currently displayed backup/export state were not surfaced by the Render API query, so verify both on the Recovery page.
+
+**Migration hold remains in effect:** even after backup/restore is proven, repeat the data preflight after new customer submissions have been paused. The currently live backend auto-deploys and runs `prisma migrate deploy`, so do not merge the candidate or change the watched branch until the approved Staging rollout window and partial-stack deployment guard are ready.
