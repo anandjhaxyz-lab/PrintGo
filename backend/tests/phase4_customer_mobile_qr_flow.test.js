@@ -849,7 +849,9 @@ async function runTestSuite() {
 
   // Case 19: Device-specific customer QR -> DB Session -> DB PrintJob binding.
   // The same Machine has two physical printers and therefore two independent active customer QRs.
+  const previousMultiPrinterFlag = process.env.ENABLE_MULTI_PRINTER_DISPATCH;
   await test('Case 19: Device QR binds its exact PrinterDevice through Session and PrintJob', async () => {
+    process.env.ENABLE_MULTI_PRINTER_DISPATCH = 'true';
     await prisma.printerQr.updateMany({
       where: { machineId: machineA.id, printerDeviceId: { not: null }, status: 'ACTIVE' },
       data: { status: 'REVOKED', revokedReason: 'Resetting Phase 4 device QR fixture' }
@@ -982,6 +984,8 @@ async function runTestSuite() {
     );
     assert(replacement.newQr.printerDeviceId === device.id, 'Replacement QR must remain bound to the same physical PrinterDevice');
     assert(replacement.newQr.machineId === machineA.id, 'Replacement QR must preserve the parent Machine binding');
+    if (previousMultiPrinterFlag === undefined) delete process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    else process.env.ENABLE_MULTI_PRINTER_DISPATCH = previousMultiPrinterFlag;
   });
 
   console.log('\n======================================================================');

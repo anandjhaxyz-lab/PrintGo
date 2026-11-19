@@ -8,6 +8,7 @@ const API_URL = import.meta.env.VITE_API_URL || '';
 export const PrinterFleetApprovalPanel = ({ currentUser }) => {
   const [discoveries, setDiscoveries] = useState([]);
   const [devices, setDevices] = useState([]);
+  const [deviceQrEnabled, setDeviceQrEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState(null);
   const [error, setError] = useState('');
@@ -26,6 +27,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       ]);
       setDiscoveries(discoveryResponse.data?.data?.discoveries || []);
       setDevices(deviceResponse.data?.data?.devices || []);
+      setDeviceQrEnabled(deviceResponse.data?.data?.deviceQrEnabled === true);
     } catch (loadError) {
       setError(loadError.response?.data?.error || loadError.message || 'Could not load printer fleet information.');
     } finally {
@@ -229,7 +231,11 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
                 <div style={{ marginTop: '0.35rem', fontSize: '0.7rem', color: '#64748b' }}>
                   {device.connectionType || 'Unknown connection'} · {device.portName || 'Port not reported'}
                 </div>
-                {device.activeQr ? (
+                {!deviceQrEnabled ? (
+                  <div style={{ marginTop: '0.75rem', padding: '8px 9px', borderRadius: '8px', background: '#fffbeb', color: '#92400e', fontSize: '0.7rem', lineHeight: 1.45 }}>
+                    Device QR activation is locked until per-printer Agent dispatch is released. This prevents a scan from reaching the legacy single-printer route.
+                  </div>
+                ) : device.activeQr ? (
                   <button
                     type="button"
                     onClick={() => showDeviceQr(device)}

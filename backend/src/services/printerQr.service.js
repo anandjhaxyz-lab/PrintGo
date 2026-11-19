@@ -9,6 +9,8 @@ const { isDemoPaymentPermitted, isDemoAccessCodeRequired } = require('../utils/d
 const { DEFAULT_PAYMENT_MODE } = require('../constants/paymentModes');
 const { getMachineAvailability } = require('./printerAvailability.service');
 
+const isMultiPrinterDispatchEnabled = () => process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true';
+
 /**
  * Validates that an IP or hostname is not private/loopback in production.
  */
@@ -126,6 +128,9 @@ const verifyPrinterDeviceAccess = async (printerDeviceId, user = null) => {
  * Multiple ACTIVE device QRs may coexist on one Machine; only one is allowed per Device.
  */
 const generatePrinterDeviceQr = async (printerDeviceId, data = {}, user = null) => {
+  if (!isMultiPrinterDispatchEnabled()) {
+    throw new AppError('Device-specific customer QR activation is locked until per-printer Agent dispatch is enabled.', 503);
+  }
   const device = await verifyPrinterDeviceAccess(printerDeviceId, user);
   const existingActive = await prisma.printerQr.findFirst({
     where: { printerDeviceId: device.id, status: 'ACTIVE' }
@@ -199,6 +204,7 @@ const generatePrinterQr = async (machineId, data = {}, user = null) => {
   const existingActive = await prisma.printerQr.findFirst({
     where: {
       machineId: machine.id,
+      printerDeviceId: null,
       status: 'ACTIVE'
     }
   });
@@ -483,6 +489,9 @@ const replacePrinterQr = async (id, data = {}, user = null) => {
     if (existingQr.status === 'REPLACED') {
       throw new AppError('This QR code has already been replaced', 400);
     }
+    if (existingQr.printerDeviceId && !isMultiPrinterDispatchEnabled()) {
+      throw new AppError('Device-specific QR rotation is locked until per-printer Agent dispatch is enabled.', 503);
+    }
     if (existingQr.printerDeviceId) {
       const device = await tx.printerDevice.findUnique({ where: { id: existingQr.printerDeviceId } });
       if (!device || device.machineId !== existingQr.machineId || device.status !== 'ACTIVE' || !device.approvedAt || !device.windowsPrinterName) {
@@ -587,6 +596,9 @@ const resolvePrinterQr = async (publicCode) => {
 
     if (lockedQr.status !== 'ACTIVE') {
       throw new AppError('This printer QR code is currently inactive.', 403);
+    }
+    if (lockedQr.printerDeviceId && !isMultiPrinterDispatchEnabled()) {
+      throw new AppError('This physical printer QR is not active yet. Please contact shop staff.', 503);
     }
 
     if (!lockedQr.machineId || !lockedQr.machine_id) {
@@ -710,6 +722,9 @@ const getPublicPrinterQrInfo = async (publicCode) => {
 
   if (qr.status === 'REVOKED' || qr.status === 'REPLACED') {
     throw new AppError(`This printer QR code has been ${qr.status.toLowerCase()}. Please scan the updated QR flyer on the printer counter.`, 410);
+  }
+  if (qr.printerDeviceId && !isMultiPrinterDispatchEnabled()) {
+    throw new AppError('This physical printer QR is not active yet. Please contact shop staff.', 503);
   }
 
   if (!qr.machineId || !qr.machine) {

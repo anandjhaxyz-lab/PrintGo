@@ -20,7 +20,14 @@ const listApprovedPrinterDevices = async (req, res, next) => {
         ? { ...device.activeQr, targetUrl: printerQrService.getPublicQrUrl(device.activeQr.publicCode) }
         : null
     }));
-    res.status(200).json({ success: true, data: { ...result, devices } });
+    res.status(200).json({
+      success: true,
+      data: {
+        ...result,
+        devices,
+        deviceQrEnabled: process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true'
+      }
+    });
   } catch (error) {
     next(error);
   }
