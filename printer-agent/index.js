@@ -594,6 +594,9 @@ const processPhysicalPrintJob = async (jobData) => {
   let printFilePath = localFilePath;
   let targetPrinterName = PRINTER_NAME;
   let targetSpoolerMonitor = spoolerMonitor;
+  let dispatchLeaseAuthorization = null;
+  let stopDispatchLeaseRenewal = null;
+  let driverSubmissionAccepted = false;
 
   try {
     if (deviceBound) {
@@ -755,11 +758,16 @@ const processPhysicalPrintJob = async (jobData) => {
           // The initial fleet refresh can become stale while a large document is
           // downloading/decrypting. Re-authorize the exact DB job/device/queue
           // immediately before durable dispatch intent and driver submission.
-          await dispatchAuthorizer.authorize({
+          const leaseIdentity = {
             jobId: jobData.jobId,
             printerDeviceId: jobData.printerDeviceId,
             windowsPrinterName: targetPrinterName
-          });
+          };
+          dispatchLeaseAuthorization = await dispatchAuthorizer.authorize(leaseIdentity);
+          stopDispatchLeaseRenewal = dispatchAuthorizer.startLeaseRenewal(
+            dispatchLeaseAuthorization,
+            leaseIdentity
+          );
         }
         journal.recordDispatchIntent(jobData.jobId, {
           ...deviceBinding,
@@ -767,6 +775,19 @@ const processPhysicalPrintJob = async (jobData) => {
           settings: jobData.settings
         });
         await ptp.print(printFilePath, printOptions);
+        driverSubmissionAccepted = true;
+        if (stopDispatchLeaseRenewal) {
+          stopDispatchLeaseRenewal();
+          stopDispatchLeaseRenewal = null;
+        }
+        if (dispatchLeaseAuthorization) {
+          dispatchAuthorizer.releaseLease(dispatchLeaseAuthorization, {
+            jobId: jobData.jobId,
+            printerDeviceId: jobData.printerDeviceId,
+            windowsPrinterName: targetPrinterName
+          });
+          dispatchLeaseAuthorization = null;
+        }
         journal.recordSpoolerAccepted(jobData.jobId, deviceBinding);
       } else {
         // Linux CUPS Support (Raspberry Pi)
@@ -816,6 +837,12 @@ const processPhysicalPrintJob = async (jobData) => {
 
 
   } catch (error) {
+    if (stopDispatchLeaseRenewal) {
+      // Keep the backend lease until its short expiry if driver handoff failed or
+      // became ambiguous. Do not release a lease on an uncertain print outcome.
+      stopDispatchLeaseRenewal();
+      stopDispatchLeaseRenewal = null;
+    }
     console.error(`❌ ERROR processing Job ${jobData.jobId}:`, error.message);
     const journalEntry = journal.getJob(jobData.jobId);
     const mayHaveReachedDriver = journalEntry && [
