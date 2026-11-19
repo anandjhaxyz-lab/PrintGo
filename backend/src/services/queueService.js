@@ -3,6 +3,82 @@ const { connection } = require('./redisClient');
 const prisma = require('../utils/prisma');
 const { isValidJobTransition } = require('../utils/stateMachine');
 
+/**
+ * A queue item must never disappear while leaving a paid device-bound job in
+ * WAITING. If authorization fails before Agent dispatch, terminally fail the
+ * job, record the reason, notify watchers, and refund a successful payment.
+ */
+const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
+  if (!job?.shortId || !job?.printerDeviceId || !['WAITING', 'PRINTING'].includes(expectedStatus)) {
+    return false;
+  }
+  if (!isValidJobTransition(expectedStatus, 'FAILED')) {
+    console.error(`Job ${job.shortId}: state machine rejected dispatch-failure transition from ${expectedStatus}.`);
+    return false;
+  }
+
+  const updateResult = await prisma.printJob.updateMany({
+    where: {
+      shortId: job.shortId,
+      status: expectedStatus,
+      printerDeviceId: job.printerDeviceId
+    },
+    data: { status: 'FAILED' }
+  });
+  if (updateResult.count !== 1) {
+    console.warn(`Job ${job.shortId}: dispatch failure was not applied because its state/binding changed concurrently.`);
+    return false;
+  }
+
+  const errorDetails = `Device dispatch refused [${code}]: ${reason}`;
+  try {
+    await prisma.printHistory.create({
+      data: {
+        printJobId: job.id,
+        success: false,
+        errorDetails,
+        completedAt: new Date()
+      }
+    });
+  } catch (historyError) {
+    console.error(`Job ${job.shortId}: could not write dispatch refusal history:`, historyError.message);
+  }
+
+  const statusEvent = {
+    id: job.id,
+    shortId: job.shortId,
+    status: 'FAILED',
+    error: reason,
+    code
+  };
+  if (globalIo) {
+    if (job.machineId) globalIo.to(`machine_${job.machineId}`).emit('job_status_changed', statusEvent);
+    globalIo.to(`job_${job.shortId}`).emit('job_status_changed', statusEvent);
+    globalIo.to('admins').emit('job_status_changed', statusEvent);
+  }
+
+  if (job.paymentId && job.payment?.status === 'SUCCESS') {
+    try {
+      const paymentsService = require('../modules/payments/payments.service');
+      await paymentsService.refundPayment(
+        job.shortId,
+        null,
+        `Automatic refund: physical printer dispatch was blocked (${code}). ${reason}`,
+        {
+          initiatedBy: 'SYSTEM',
+          preserveJobStatus: true,
+          idempotencyKey: `device_dispatch_blocked_${job.id}_${job.paymentId}`
+        }
+      );
+    } catch (refundError) {
+      console.error(`Job ${job.shortId}: automatic refund failed after dispatch refusal:`, refundError.message);
+    }
+  }
+
+  console.warn(`Job ${job.shortId} was marked FAILED because device dispatch was refused [${code}].`);
+  return true;
+};
+
 const isProductionRuntime = process.env.NODE_ENV === 'production';
 const isRedisRequired = isProductionRuntime || process.env.QUEUE_REDIS_REQUIRED === 'true';
 
@@ -34,7 +110,7 @@ const processJob = async (shortId) => {
   try {
     const dbJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true, printerDevice: true }
+      include: { document: true, printerDevice: true, payment: true }
     });
     if (!dbJob) return;
 
@@ -43,11 +119,12 @@ const processJob = async (shortId) => {
     // Legacy Machine-QR jobs (printerDeviceId=null) retain the original route.
     if (dbJob.printerDeviceId) {
       const device = dbJob.printerDevice;
+      let blockedCode = null;
+      let blockedReason = null;
       if (process.env.ENABLE_MULTI_PRINTER_DISPATCH !== 'true') {
-        console.warn(`Job ${shortId}: multi-printer dispatch feature gate is disabled; no physical dispatch was attempted.`);
-        return;
-      }
-      if (
+        blockedCode = 'DISPATCH_FEATURE_DISABLED';
+        blockedReason = 'Multi-printer dispatch is disabled. Please contact shop staff for assistance.';
+      } else if (
         !device ||
         device.id !== dbJob.printerDeviceId ||
         device.machineId !== dbJob.machineId ||
@@ -56,7 +133,12 @@ const processJob = async (shortId) => {
         typeof device.windowsPrinterName !== 'string' ||
         !device.windowsPrinterName.trim()
       ) {
-        console.error(`Job ${shortId}: PrinterDevice mapping is not approved, active and queue-bound to its Machine. Dispatch refused.`);
+        blockedCode = 'PRINTER_DEVICE_UNAVAILABLE';
+        blockedReason = 'The selected physical printer is no longer approved, active or correctly mapped. Please contact shop staff.';
+      }
+
+      if (blockedCode) {
+        await failBlockedDeviceDispatch(dbJob, 'WAITING', blockedCode, blockedReason);
         return;
       }
     }
@@ -103,15 +185,12 @@ const processJob = async (shortId) => {
         device.windowsPrinterName.trim()
       );
       if (!deviceStillValid) {
-        await prisma.printJob.updateMany({
-          where: {
-            shortId,
-            status: 'PRINTING',
-            printerDeviceId: updatedJob.printerDeviceId
-          },
-          data: { status: 'WAITING' }
-        });
-        console.error(`Job ${shortId}: PrinterDevice became unavailable before dispatch; restored job to WAITING. No fallback printer used.`);
+        await failBlockedDeviceDispatch(
+          updatedJob,
+          'PRINTING',
+          'PRINTER_DEVICE_CHANGED_BEFORE_DISPATCH',
+          'The selected physical printer changed or became unavailable before Agent dispatch. Please contact shop staff.'
+        );
         return;
       }
     }
