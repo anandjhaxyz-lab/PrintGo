@@ -1,8 +1,8 @@
 # PrintGo Multi-Printer — Backend / Agent Protocol Integration
 
-**Status:** Protocol integration development slice  
-**Branch:** `feat/multi-printer-backend-agent-protocol`  
-**Parent:** `feat/multi-printer-agent-fleet`  
+**Status:** Phase 4C — device-bound Agent dispatch and per-printer FIFO implementation (Draft / CI verification pending)  
+**Branch:** `feat/multi-printer-agent-device-dispatch`  
+**Parent:** `feat/multi-printer-device-qr-session-binding` (stacked Draft PR #13)  
 **Protocol version:** 1  
 **Scope:** One authenticated Windows x64 Agent / one Machine / up to 10 queue-bound PrinterDevices  
 **Physical certification:** Pending access to the client's Windows PC in Hyderabad  
@@ -70,31 +70,38 @@ Backend:
 - Broadcasts `printer_device_status_update` to Admin sockets.
 - Does not write these per-device readings into the legacy Machine-wide PrinterStatus stream. This prevents one child printer from changing the current legacy customer availability calculation before device-bound QR/session routing is implemented.
 
-## 6. Explicitly deferred
+## 6. Phase 4C — device-bound dispatch and per-printer lanes
 
-- No multi-printer print dispatch: existing `physical_print_job` still follows the legacy `PRINTER_NAME` path.
-- No device-bound Session or PrintJob routing.
-- No durable per-device BullMQ lanes or concurrency changes.
-- No Admin UI persistence/approval flow.
-- No customer QR changes.
-- No Branch or multi-city functionality.
-- No OTA update or local Agent install.
+This implementation extends the already-stacked device QR/session/job binding from PR #13. It does not enable that flow by default.
 
-These items require the later device-bound routing and Admin UI gate. The registry handshake alone must not be interpreted as enabling multi-printer production printing.
+Backend dispatch:
+- The existing durable BullMQ publisher remains at global concurrency 1 to preserve deterministic event publication order.
+- A PrintJob with `printerDeviceId` is dispatchable only when `ENABLE_MULTI_PRINTER_DISPATCH=true`, and a fresh database read confirms the exact child device belongs to the same Machine, is `ACTIVE`, has `approvedAt`, and has a non-empty exact Windows queue name.
+- The device identity and queue name sent to the Agent are read from the database, never from the customer payload.
+- The job is atomically claimed only while its device binding remains unchanged. The mapping is checked again immediately before Socket.IO emission; if it became invalid, the job is restored to `WAITING` and no fallback route is used.
+- Legacy jobs with `printerDeviceId=null` retain the existing Machine room / `PRINTER_NAME` path.
+
+Agent dispatch:
+- Every device-bound job requests a fresh registry over the authenticated Machine socket before selecting a local queue. The Agent validates the Machine-bound registry, rediscovers local Windows queues, and refreshes its FleetManager before dispatch.
+- A device-bound job requires Windows x64 multi-printer negotiation and an exact match between database `printerDeviceId` / queue name and the Agent's approved local registry. Missing, disabled, unapproved, stale or mismatched mappings fail closed; they never fall back to `PRINTER_NAME`.
+- Agent lanes are keyed by normalized physical Windows queue name. Jobs targeting one physical queue are submitted to its driver in FIFO order; independent queues can prepare and submit concurrently. Legacy `PRINTER_NAME` and a child device mapped to that same queue share a lane.
+- Each device continues to use its own `SpoolerMonitor` for spooler outcome observation.
+- Spooler success, physical success/error/ambiguous, and reconciliation events carry the exact device identity. Backend accepts a device-bound outcome only when both the PrinterDevice ID and exact queue name match the database job. Legacy jobs cannot claim a child PrinterDevice.
+- Reconciliation receives backend-derived job-to-device bindings. A missing journal entry is treated as `NOT_DISPATCHED` only when the returned device binding matches; journal corruption, mismatch, or ambiguous dispatch remains fail-closed.
+
+The PR does not turn on `ENABLE_MULTI_PRINTER_DISPATCH` and does not change any deployed environment variables. Physical certification on the client's Hyderabad Windows PC remains a separate gate.
 
 ## 7. Tests and validation
 
 Automated tests cover:
-- Protocol and journal compatibility checks.
-- Windows x64 capability negotiation and unsupported-platform fallback.
-- Authenticated Machine scoping even when the payload includes a different Machine ID.
-- Safe registry DTO and maximum fleet size.
-- Cross-Machine response rejection in the Agent.
-- Inventory validation, duplicate prevention and negotiation/authentication gate.
-- Device telemetry identity tagging.
+- Protocol negotiation, Agent journal compatibility and authenticated Machine scoping.
+- Registry refresh authorization, request ID validation, fresh queue-bound registry contents and failure handling.
+- Agent FIFO ordering for the same physical queue, cross-queue concurrency, queue failure isolation, legacy/device queue collision protection, and maximum supported Windows queue-name length.
+- Backend rejection of wrong PrinterDevice IDs, wrong exact queue names, incomplete bindings, and child-device claims on legacy jobs.
+- Agent fleet validation and fail-closed printer identity checks remain part of the existing Agent test suite.
 
-CI runs on disposable test infrastructure only. Passing CI does not certify real Windows queue/driver behavior.
+CI runs on disposable GitHub Actions infrastructure only. It does not run a real Windows spooler or physical printer. Passing CI does not certify real driver behavior.
 
 ## 8. Safety boundary
 
-This branch is a Draft PR layered on the separate Phase 2 Draft PR. No Staging DB migration, Render deployment, Production change, client PC access, Agent OTA update or physical print test is authorized or performed. Physical verification must happen on the client's actual Windows PC in Hyderabad after reviewed protocol and release gates.
+This branch is intended as a Draft PR stacked directly on PR #13. No PR is merged by this work. No Staging or Production database migration, Render configuration/deployment, Production change, Agent OTA update, installation on a client PC, or physical print test is authorized or performed. Physical verification must happen on the client's actual Windows PC in Hyderabad after separate approval and reviewed release gates.
