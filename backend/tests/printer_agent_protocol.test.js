@@ -4,7 +4,8 @@ const {
   getPrinterDeviceRegistry,
   validateDiscoveredPrinterInventory,
   handlePrinterAgentHello,
-  handlePrinterInventoryReport
+  handlePrinterInventoryReport,
+  handlePrinterDeviceTelemetry
 } = require('../src/services/printerAgentProtocol.service');
 
 function windowsHello(overrides = {}) {
@@ -191,6 +192,102 @@ describe('Printer Agent protocol — negotiation and machine isolation', () => {
     };
     await expect(getPrinterDeviceRegistry(prisma, 'machine-a'))
       .rejects.toEqual(expect.objectContaining({ code: 'FLEET_LIMIT_EXCEEDED' }));
+  });
+});
+
+describe('Printer Agent protocol — per-device telemetry isolation', () => {
+  test('updates health only for a PrinterDevice owned by the authenticated Machine', async () => {
+    const socket = {
+      userType: 'printer',
+      machineId: 'machine-a',
+      agentProtocol: { supportsMultiPrinter: true }
+    };
+    const prisma = {
+      printerDevice: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'device-a' }),
+        update: jest.fn().mockResolvedValue({})
+      }
+    };
+    const adminRoom = { emit: jest.fn() };
+    const io = { to: jest.fn(() => adminRoom) };
+
+    const result = await handlePrinterDeviceTelemetry({
+      socket,
+      io,
+      prisma,
+      logger: { warn: jest.fn() },
+      status: {
+        printerDeviceId: 'device-a',
+        printerName: 'Epson L6460',
+        isError: true,
+        errorMessage: 'Out of Paper',
+        connectionType: 'USB',
+        telemetry: { portName: 'USB001' }
+      }
+    });
+
+    expect(result).toEqual({
+      accepted: true,
+      printerDeviceId: 'device-a',
+      healthStatus: 'PAPER_OUT'
+    });
+    expect(prisma.printerDevice.findFirst).toHaveBeenCalledWith({
+      where: { id: 'device-a', machineId: 'machine-a' },
+      select: { id: true }
+    });
+    expect(prisma.printerDevice.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'device-a' },
+      data: expect.objectContaining({ healthStatus: 'PAPER_OUT', lastTelemetryAt: expect.any(Date) })
+    }));
+    expect(io.to).toHaveBeenCalledWith('admins');
+    expect(adminRoom.emit).toHaveBeenCalledWith('printer_device_status_update', expect.objectContaining({
+      machineId: 'machine-a',
+      printerDeviceId: 'device-a',
+      healthStatus: 'PAPER_OUT',
+      telemetry: { connectionType: 'USB', portName: 'USB001' }
+    }));
+  });
+
+  test('rejects a device that belongs to a different Machine and does not update or broadcast', async () => {
+    const socket = {
+      userType: 'printer',
+      machineId: 'machine-a',
+      agentProtocol: { supportsMultiPrinter: true }
+    };
+    const prisma = {
+      printerDevice: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn()
+      }
+    };
+    const io = { to: jest.fn() };
+
+    const result = await handlePrinterDeviceTelemetry({
+      socket,
+      io,
+      prisma,
+      logger: { warn: jest.fn() },
+      status: { printerDeviceId: 'device-owned-by-b', isError: false }
+    });
+
+    expect(result).toEqual({ accepted: false, code: 'DEVICE_MACHINE_MISMATCH' });
+    expect(prisma.printerDevice.update).not.toHaveBeenCalled();
+    expect(io.to).not.toHaveBeenCalled();
+  });
+
+  test('rejects device telemetry from an Agent without negotiated fleet capability', async () => {
+    const socket = { userType: 'printer', machineId: 'machine-a' };
+    const prisma = { printerDevice: { findFirst: jest.fn(), update: jest.fn() } };
+    const result = await handlePrinterDeviceTelemetry({
+      socket,
+      io: { to: jest.fn() },
+      prisma,
+      logger: { warn: jest.fn() },
+      status: { printerDeviceId: 'device-a', isError: false }
+    });
+
+    expect(result).toEqual({ accepted: false, code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' });
+    expect(prisma.printerDevice.findFirst).not.toHaveBeenCalled();
   });
 });
 
