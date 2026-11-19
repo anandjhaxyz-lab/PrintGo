@@ -162,6 +162,9 @@ socket.on('printer_registered_success', (data) => {
 });
 
 socket.on('printer_agent_hello_ack', (ack) => {
+  if (ack && typeof ack.machineId === 'string') {
+    registeredMachineId = ack.machineId;
+  }
   if (!ack || ack.accepted !== true) {
     fleetProtocolAccepted = false;
     console.warn(`⚠️ Multi-printer protocol not negotiated: ${ack?.reason || ack?.code || 'backend did not accept hello'}`);
