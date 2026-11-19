@@ -10,6 +10,7 @@ const {
   handlePrinterInventoryReport,
   handlePrinterDeviceTelemetry
 } = require('./services/printerAgentProtocol.service');
+const { verifyPrinterDeviceReport } = require('./services/printerDeviceJobBinding.service');
 
 const setupSockets = (io) => {
   // WebSocket Authentication Middleware
@@ -294,30 +295,6 @@ const setupSockets = (io) => {
       }
     });
 
-    // For device-bound jobs, every Agent outcome must carry the exact database
-    // PrinterDevice ID and Windows queue name. Legacy jobs must not carry a child ID.
-    const verifyPrinterDeviceReport = (job, report, eventName) => {
-      const reportedDeviceId = report && typeof report === 'object' ? report.printerDeviceId || null : null;
-      const reportedQueueName = report && typeof report === 'object' ? report.windowsPrinterName || null : null;
-      if (job?.printerDeviceId) {
-        const expectedQueueName = job.printerDevice?.windowsPrinterName || null;
-        if (
-          reportedDeviceId !== job.printerDeviceId ||
-          !expectedQueueName ||
-          reportedQueueName !== expectedQueueName
-        ) {
-          logger.warn(`Rejected ${eventName} for job ${job.shortId}: Agent PrinterDevice binding does not match the database job mapping.`);
-          return false;
-        }
-        return true;
-      }
-      if (reportedDeviceId || reportedQueueName) {
-        logger.warn(`Rejected ${eventName} for legacy job ${job?.shortId}: unexpected PrinterDevice binding was reported.`);
-        return false;
-      }
-      return true;
-    };
-
     socket.on('job_reconciliation_report', async (report) => {
       const { requestId, jobId, status } = report || {};
       // 1. Verify authenticated Agent identity and printer type
@@ -366,7 +343,7 @@ const setupSockets = (io) => {
           }
 
           // Device-bound and legacy jobs must report the exact expected printer identity.
-          if (!verifyPrinterDeviceReport(job, report, 'job_reconciliation_report')) return;
+          if (!verifyPrinterDeviceReport(job, report)) return;
 
           // 3. Verify exact machine ownership
           if (job.machineId !== socket.machineId) {
@@ -426,7 +403,7 @@ const setupSockets = (io) => {
           include: { printerDevice: true }
         });
         if (!currentJob || currentJob.machineId !== socket.machineId) return;
-        if (!verifyPrinterDeviceReport(currentJob, report, 'print_spooler_success')) return;
+        if (!verifyPrinterDeviceReport(currentJob, report)) return;
         logger.info(`Print spooler accepted job ${jobId}. Awaiting physical completion...`);
       } catch (error) {
         logger.error(`Failed to verify spooler acceptance for job ${jobId}:`, error);
@@ -445,7 +422,7 @@ const setupSockets = (io) => {
         });
         if (!currentJob) return;
 
-        if (!verifyPrinterDeviceReport(currentJob, normalizedReport, 'print_physical_success')) return;
+        if (!verifyPrinterDeviceReport(currentJob, normalizedReport)) return;
 
         // P0: Enforce Machine Ownership
         if (currentJob.machineId !== socket.machineId) {
@@ -499,7 +476,7 @@ const setupSockets = (io) => {
           where: { shortId: jobId },
           include: { printerDevice: true }
         });
-        if (currentJob && !verifyPrinterDeviceReport(currentJob, report, 'print_physical_ambiguous')) return;
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report)) return;
         if (currentJob) {
           // Machine ownership guard
           if (currentJob.machineId !== socket.machineId) {
@@ -529,7 +506,7 @@ const setupSockets = (io) => {
           where: { shortId: jobId },
           include: { printerDevice: true }
         });
-        if (currentJob && !verifyPrinterDeviceReport(currentJob, report, 'print_physical_error')) return;
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report)) return;
         if (!currentJob || !isValidJobTransition(currentJob.status, 'FAILED')) return;
 
         // P0: Enforce Machine Ownership
@@ -568,7 +545,7 @@ const setupSockets = (io) => {
           where: { shortId: jobId },
           include: { printerDevice: true }
         });
-        if (currentJob && !verifyPrinterDeviceReport(currentJob, report, 'print_spooler_error')) return;
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report)) return;
         if (!currentJob || !isValidJobTransition(currentJob.status, 'FAILED')) {
           logger.warn(`Ignoring spooler error for job ${jobId}: invalid transition from ${currentJob?.status}`);
           return;
