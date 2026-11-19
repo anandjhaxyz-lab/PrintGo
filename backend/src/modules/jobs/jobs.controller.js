@@ -73,11 +73,38 @@ const createJob = async (req, res, next) => {
 
 const updateJobStatus = async (req, res, next) => {
   try {
-    const { status } = req.body;
+    const { status, reason, evidence, physicalConfirmation, physicalVerificationConfirmed, spoolerEmptyOnly } = req.body;
     const { id } = req.params;
     
-    const job = await jobsService.updateJobStatus(id, status, req.user);
-    req.app.get('io').emit('job_status_changed', job);
+    const job = await jobsService.updateJobStatus(id, status, req.user, {
+      reason: reason || evidence,
+      physicalConfirmation: physicalConfirmation ?? physicalVerificationConfirmed,
+      physicalVerificationConfirmed,
+      spoolerEmptyOnly,
+      ipAddress: req.ip
+    });
+    req.app.get('io')?.emit('job_status_changed', job);
+    res.json({ success: true, job });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const resolveAmbiguity = async (req, res, next) => {
+  try {
+    const { outcome, reason, evidence, physicalConfirmation, physicalVerificationConfirmed, spoolerEmptyOnly } = req.body;
+    const { id } = req.params;
+
+    const job = await jobsService.resolveAmbiguousJob(id, {
+      outcome,
+      reason: reason || evidence,
+      physicalConfirmation: physicalConfirmation ?? physicalVerificationConfirmed,
+      physicalVerificationConfirmed,
+      spoolerEmptyOnly,
+      ipAddress: req.ip
+    }, req.user);
+
+    req.app.get('io')?.emit('job_status_changed', job);
     res.json({ success: true, job });
   } catch (error) {
     next(error);
@@ -220,5 +247,6 @@ module.exports = {
   getJob,
   createJob,
   updateJobStatus,
+  resolveAmbiguity,
   exportJobsCsv
 };

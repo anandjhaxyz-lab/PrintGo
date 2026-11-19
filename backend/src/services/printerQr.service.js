@@ -118,8 +118,10 @@ const verifyPrinterDeviceAccess = async (printerDeviceId, user = null) => {
     }
   });
   if (!device || !device.machine) throw new AppError('Target physical printer was not found', 404);
-  if (user && user.role !== 'SUPERADMIN' && device.machine.companyId !== user.companyId) {
-    throw new AppError('Access denied: You do not have permission to manage this physical printer', 403);
+  if (user && user.role !== 'SUPERADMIN') {
+    if (!user.companyId || !device.machine?.companyId || device.machine.companyId !== user.companyId) {
+      throw new AppError('Access denied: You do not have permission to manage this physical printer', 403);
+    }
   }
   if (device.machine.status !== 'ACTIVE') {
     throw new AppError('Cannot create a customer QR for a suspended or inactive Machine', 409);
@@ -294,6 +296,9 @@ const listPrinterQrs = async (user, query = {}) => {
 
   // Role scoping: non-superadmin users only see QRs for their company's machines
   if (user && user.role !== 'SUPERADMIN') {
+    if (!user.companyId) {
+      return { qrs: [], total: 0, page: Math.max(1, Number(page)), totalPages: 0 };
+    }
     where.machine = { companyId: user.companyId };
   }
 
@@ -371,7 +376,18 @@ const getPrinterQrById = async (id, user = null) => {
         select: { id: true, name: true, location: true, status: true, printerModel: true, companyId: true }
       },
       printerDevice: {
-        select: { id: true, machineId: true, displayName: true, printerModel: true, windowsPrinterName: true, status: true, approvedAt: true, isDefault: true }
+        select: {
+          id: true,
+          machineId: true,
+          displayName: true,
+          printerModel: true,
+          windowsPrinterName: true,
+          status: true,
+          approvedAt: true,
+          isDefault: true,
+          healthStatus: true,
+          lastTelemetryAt: true
+        }
       },
       sessions: {
         take: 20,
@@ -751,7 +767,18 @@ const getPublicPrinterQrInfo = async (publicCode) => {
         select: { id: true, name: true, location: true, status: true, printerModel: true, paymentMode: true }
       },
       printerDevice: {
-        select: { id: true, machineId: true, displayName: true, printerModel: true, windowsPrinterName: true, status: true, approvedAt: true, isDefault: true }
+        select: {
+          id: true,
+          machineId: true,
+          displayName: true,
+          printerModel: true,
+          windowsPrinterName: true,
+          status: true,
+          approvedAt: true,
+          isDefault: true,
+          healthStatus: true,
+          lastTelemetryAt: true
+        }
       }
     }
   });
@@ -789,9 +816,40 @@ const getPublicPrinterQrInfo = async (publicCode) => {
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
   const availability = await getMachineAvailability(qr.machine.id, prisma);
-  const isReady = availability ? availability.isReady : false;
-  const hardwareStatus = availability ? availability.status : 'UNKNOWN';
-  const statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
+  let isReady = availability ? availability.isReady : false;
+  let hardwareStatus = availability ? availability.status : 'UNKNOWN';
+  let statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
+  let lastTelemetryAt = null;
+
+  if (qr.printerDevice && !legacyPlaceholderDevice) {
+    lastTelemetryAt = qr.printerDevice.lastTelemetryAt ? qr.printerDevice.lastTelemetryAt.toISOString() : null;
+    const devHealth = qr.printerDevice.healthStatus || 'UNKNOWN';
+    if (!availability || !availability.agentOnline) {
+      hardwareStatus = 'AGENT_OFFLINE';
+      isReady = false;
+      statusMessage = 'Printer Agent Offline';
+    } else if (devHealth === 'ONLINE') {
+      hardwareStatus = 'ONLINE';
+      isReady = true;
+      statusMessage = 'Printer Ready';
+    } else if (devHealth === 'PAPER_OUT') {
+      hardwareStatus = 'PAPER_OUT';
+      isReady = false;
+      statusMessage = 'Out of Paper';
+    } else if (devHealth === 'JAMMED') {
+      hardwareStatus = 'JAMMED';
+      isReady = false;
+      statusMessage = 'Paper Jam';
+    } else if (devHealth === 'OFFLINE') {
+      hardwareStatus = 'OFFLINE';
+      isReady = false;
+      statusMessage = 'Physical Printer Offline';
+    } else {
+      hardwareStatus = 'ERROR';
+      isReady = false;
+      statusMessage = 'Printer Error';
+    }
+  }
 
   return {
     success: true,
@@ -807,6 +865,9 @@ const getPublicPrinterQrInfo = async (publicCode) => {
       isOnline: isReady,
       hardwareStatus,
       statusMessage,
+      lastTelemetryAt,
+      deviceHealth: qr.printerDevice && !legacyPlaceholderDevice ? qr.printerDevice.healthStatus : null,
+      printerDeviceId: qr.printerDevice && !legacyPlaceholderDevice ? qr.printerDevice.id : null,
       agentOnline: availability ? availability.agentOnline : false,
       paperStatus: availability ? availability.paperStatus : 'UNKNOWN',
       tonerStatus: availability ? availability.tonerStatus : 'UNKNOWN',

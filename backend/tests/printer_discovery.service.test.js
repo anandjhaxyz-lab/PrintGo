@@ -201,4 +201,52 @@ describe('Printer discovery persistence and approval', () => {
     expect(result).toEqual({ device, alreadyApproved: true });
     expect(tx.printerDevice.create).not.toHaveBeenCalled();
   });
+
+  test('safely transfers default status from existing placeholder to new approved printer without unique violation', async () => {
+    const { prisma, tx, device } = makeApprovalFixture();
+    const legacyPlaceholder = {
+      id: 'placeholder-legacy-1',
+      machineId: 'machine-a',
+      isDefault: true,
+      status: 'DISCOVERY_REQUIRED',
+      windowsPrinterName: null
+    };
+    tx.printerDevice.update = jest.fn().mockResolvedValue({ ...legacyPlaceholder, isDefault: false });
+    // First findFirst checks for mappedQueue (returns null), second checks for existingDefault (returns placeholder)
+    tx.printerDevice.findFirst = jest.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(legacyPlaceholder);
+
+    const result = await approvePrinterDiscovery('discovery-a', { displayName: 'Epson Counter', isDefault: true }, superadmin, prisma);
+
+    expect(result).toEqual({ device, alreadyApproved: false });
+    // Proves legacy placeholder had its default status set to false before creating new device
+    expect(tx.printerDevice.update).toHaveBeenCalledWith({
+      where: { id: 'placeholder-legacy-1' },
+      data: { isDefault: false }
+    });
+    expect(tx.printerDevice.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        isDefault: true
+      })
+    }));
+    // Proves PRINTER_DEVICE_DEFAULT_TRANSFERRED audit log was created
+    expect(tx.activityLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        action: 'PRINTER_DEVICE_DEFAULT_TRANSFERRED',
+        details: expect.stringContaining('placeholder-legacy-1')
+      })
+    }));
+  });
+
+  test('strictly rejects null/null company equality for non-superadmin', async () => {
+    const { prisma, tx } = makeApprovalFixture({
+      discovery: { machine: { id: 'machine-a', name: 'Null Co Shop', status: 'ACTIVE', companyId: null } }
+    });
+    const nullUser = { id: 'user-null', role: 'FRANCHISEE', companyId: null };
+
+    await expect(approvePrinterDiscovery('discovery-a', {}, nullUser, prisma))
+      .rejects.toMatchObject({ statusCode: 403 });
+    expect(tx.printerDevice.create).not.toHaveBeenCalled();
+  });
 });

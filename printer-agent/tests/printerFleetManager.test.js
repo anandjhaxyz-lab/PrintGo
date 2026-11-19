@@ -123,6 +123,36 @@ describe('PrinterFleetManager', () => {
     expect(manager.resolveForPrint('device-online').windowsPrinterName).toBe('Online Queue');
   });
 
+  test('blocks dispatch eligibility when printer is marked WorkOffline or has error state', async () => {
+    const offlinePrinter = {
+      ...discovered('Offline Printer'),
+      workOffline: true
+    };
+    const errorPrinter = {
+      ...discovered('Error Printer'),
+      detectedErrorState: 4
+    };
+    const manager = new PrinterFleetManager({
+      discoverPrinters: async () => [offlinePrinter, errorPrinter],
+      getDeviceRegistry: async () => [
+        activeDevice('device-offline', 'Offline Printer'),
+        activeDevice('device-error', 'Error Printer')
+      ],
+      monitorFactory: () => ({ checkPrinterStatus: jest.fn() })
+    });
+
+    const devices = await manager.refresh();
+    const offlineDev = devices.find((d) => d.id === 'device-offline');
+    const errorDev = devices.find((d) => d.id === 'device-error');
+
+    expect(offlineDev.canPrint).toBe(false);
+    expect(offlineDev.reason).toBe('PRINTER_OFFLINE');
+    expect(errorDev.canPrint).toBe(false);
+    expect(errorDev.reason).toBe('PRINTER_ERROR_STATE');
+    expect(() => manager.resolveForPrint('device-offline')).toThrow();
+    expect(() => manager.resolveForPrint('device-error')).toThrow();
+  });
+
   test('rejects duplicate registered queue bindings and more than ten devices', async () => {
     const duplicateManager = new PrinterFleetManager({
       discoverPrinters: async () => [discovered('Queue A')],

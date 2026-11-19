@@ -29,11 +29,14 @@ class PrinterDispatchAuthorizer {
       ? options.requestIdFactory
       : () => crypto.randomUUID();
     this.pending = new Map();
+    this.activeRenewals = new Map();
     this.closed = false;
 
     this.onResult = (payload) => this.handleResult(payload);
+    this.onRenewalResult = (payload) => this.handleRenewalResult(payload);
     this.onDisconnect = () => this.rejectAll('Agent disconnected during dispatch authorization.');
     socket.on('printer_device_dispatch_authorization_result', this.onResult);
+    socket.on('printer_device_dispatch_lease_renewal_result', this.onRenewalResult);
     socket.on('disconnect', this.onDisconnect);
   }
 
@@ -123,13 +126,65 @@ class PrinterDispatchAuthorizer {
     }
 
     const payload = { requestId, jobId, printerDeviceId, windowsPrinterName };
+    const renewalState = {
+      requestId,
+      jobId,
+      printerDeviceId,
+      windowsPrinterName,
+      lastSentAt: null,
+      lastAckAt: null,
+      lastExpiresAt: authorization?.leaseExpiresAt || null,
+      renewed: true,
+      lastError: null
+    };
+    this.activeRenewals.set(requestId, renewalState);
+
     const timer = setInterval(() => {
       if (this.closed || this.socket.connected === false) return;
+      renewalState.lastSentAt = Date.now();
       this.socket.emit('printer_device_dispatch_lease_renewal', payload);
     }, intervalMs);
     if (typeof timer.unref === 'function') timer.unref();
 
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      this.activeRenewals.delete(requestId);
+    };
+  }
+
+  handleRenewalResult(payload) {
+    const requestId = typeof payload?.requestId === 'string' ? payload.requestId : '';
+    const renewalState = this.activeRenewals.get(requestId);
+    if (!renewalState) return;
+
+    if (
+      payload.jobId !== renewalState.jobId ||
+      payload.printerDeviceId !== renewalState.printerDeviceId ||
+      payload.windowsPrinterName !== renewalState.windowsPrinterName ||
+      (renewalState.leaseId && payload.leaseId && payload.leaseId !== renewalState.leaseId)
+    ) {
+      renewalState.renewed = false;
+      renewalState.lastError = 'IDENTITY_MISMATCH';
+      return;
+    }
+
+    const isExpired = renewalState.lastExpiresAt && Date.now() > new Date(renewalState.lastExpiresAt).getTime();
+    if (isExpired) {
+      renewalState.renewed = false;
+      renewalState.lastError = 'LEASE_EXPIRED';
+      return;
+    }
+
+    renewalState.lastAckAt = Date.now();
+    if (payload.renewed === true) {
+      renewalState.renewed = true;
+      renewalState.lastExpiresAt = payload.expiresAt || null;
+      renewalState.leaseId = payload.leaseId || null;
+      renewalState.lastError = null;
+    } else {
+      renewalState.renewed = false;
+      renewalState.lastError = payload.code || 'RENEWAL_DENIED';
+    }
   }
 
   releaseLease(authorization, input = {}) {
@@ -148,6 +203,8 @@ class PrinterDispatchAuthorizer {
         'A valid dispatch authorization and exact job/device/queue identity are required to release a lease.'
       );
     }
+
+    this.activeRenewals.delete(requestId);
 
     if (!this.closed && this.socket.connected !== false) {
       this.socket.emit('printer_device_dispatch_lease_release', {
@@ -202,9 +259,11 @@ class PrinterDispatchAuthorizer {
 
   close() {
     this.closed = true;
+    this.activeRenewals.clear();
     this.rejectAll('Dispatch authorization client closed.');
     if (typeof this.socket.off === 'function') {
       this.socket.off('printer_device_dispatch_authorization_result', this.onResult);
+      this.socket.off('printer_device_dispatch_lease_renewal_result', this.onRenewalResult);
       this.socket.off('disconnect', this.onDisconnect);
     }
   }

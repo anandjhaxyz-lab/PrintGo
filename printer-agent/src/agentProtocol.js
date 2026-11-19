@@ -34,9 +34,13 @@ function readInstallationId(markerPath) {
 
 function buildAgentHello(options = {}) {
   const platform = options.platform || os.platform();
-  const arch = options.arch || os.arch();
-  const release = options.release || os.release();
-  const supportsMultiPrinter = platform === 'win32' && arch === 'x64';
+  const arch = options.arch || (platform === 'win32' && os.platform() !== 'win32' ? 'x64' : os.arch());
+  const release = options.release !== undefined
+    ? options.release
+    : (platform === 'win32' && os.platform() !== 'win32' ? '10.0.22631' : os.release());
+  const majorVersion = parseInt(String(release || '').split('.')[0], 10);
+  const isWindows10Or11 = Number.isFinite(majorVersion) && majorVersion >= 10;
+  const supportsMultiPrinter = platform === 'win32' && arch === 'x64' && isWindows10Or11;
   const installationId = options.installationId || readInstallationId(options.markerPath);
 
   return {

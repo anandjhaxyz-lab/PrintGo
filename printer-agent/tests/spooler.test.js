@@ -114,6 +114,35 @@ describe('SpoolerMonitor', () => {
       }));
     });
 
+    it('should emit missing or renamed queue error when PowerShell returns empty output', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, '   \r\n');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: 'Printer Queue Missing or Renamed',
+        printerName: 'TestPrinter'
+      }));
+    });
+
+    it('should emit query error when PowerShell fails with an error', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(new Error('PowerShell execution failed'));
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: expect.stringContaining('PowerShell execution failed')
+      }));
+    });
+
     it('should detect USB connection for USB019 or USB-prefixed port', () => {
       mockExecFile.mockImplementation((cmd, args, a3, a4) => {
         const callback = typeof a3 === 'function' ? a3 : a4;

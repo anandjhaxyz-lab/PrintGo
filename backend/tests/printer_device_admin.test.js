@@ -398,4 +398,117 @@ describe('Admin printer device disable/remap controls', () => {
     }, superadmin, duplicate.prisma)).rejects.toMatchObject({ statusCode: 409 });
     expect(duplicate.tx.printerDevice.update).not.toHaveBeenCalled();
   });
+
+  test('blocks disable when an expired-but-unreleased lease remains unresolved', async () => {
+    const expiredUnreleasedLease = {
+      printerDeviceId: 'device-a',
+      requestId: 'req-expired',
+      jobShortId: 'JOB_STUCK_PRINTING',
+      expiresAt: new Date(Date.now() - 60000), // Expired 1 min ago
+      releasedAt: null
+    };
+    const f = fixtures({ lease: expiredUnreleasedLease });
+    f.tx.printerDevice.findUnique
+      .mockResolvedValueOnce({ machineId: 'machine-a' })
+      .mockResolvedValueOnce(f.device);
+    f.tx.printJob = {
+      findUnique: jest.fn().mockResolvedValue({ id: 'job-1', shortId: 'JOB_STUCK_PRINTING', status: 'PRINTING' })
+    };
+
+    await expect(disablePrinterDevice('device-a', {
+      reason: 'Attempting maintenance on stuck queue'
+    }, superadmin, f.prisma)).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'DEVICE_UNRESOLVED_DISPATCH_LEASE',
+      unresolvedJobShortId: 'JOB_STUCK_PRINTING'
+    });
+    expect(f.tx.printerDevice.update).not.toHaveBeenCalled();
+  });
+
+  test('allows operator recovery of expired stuck lease when forceReconcileLease is provided', async () => {
+    const expiredUnreleasedLease = {
+      printerDeviceId: 'device-a',
+      requestId: 'req-expired-2',
+      jobShortId: 'JOB_STUCK_PRINTING_2',
+      expiresAt: new Date(Date.now() - 60000),
+      releasedAt: null
+    };
+    const f = fixtures({ lease: expiredUnreleasedLease });
+    f.tx.printerDevice.findUnique
+      .mockResolvedValueOnce({ machineId: 'machine-a' })
+      .mockResolvedValueOnce(f.device);
+    f.tx.printJob = {
+      findUnique: jest.fn().mockResolvedValue({ id: 'job-2', shortId: 'JOB_STUCK_PRINTING_2', status: 'PRINTING' })
+    };
+    f.tx.printerDeviceDispatchLease.update = jest.fn().mockResolvedValue({});
+
+    const result = await disablePrinterDevice('device-a', {
+      reason: 'Operator verified spooler is clear and forcing recovery',
+      forceReconcileLease: true
+    }, superadmin, f.prisma);
+
+    expect(result.alreadyDisabled).toBe(false);
+    expect(f.tx.printerDeviceDispatchLease.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { printerDeviceId: 'device-a' },
+      data: expect.objectContaining({ releasedAt: expect.any(Date) })
+    }));
+    expect(f.tx.activityLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: 'admin-a',
+        machineId: 'machine-a',
+        action: 'DISPATCH_LEASE_FORCE_RECONCILED',
+        details: JSON.stringify({
+          printerDeviceId: 'device-a',
+          jobShortId: 'JOB_STUCK_PRINTING_2',
+          requestId: 'req-expired-2',
+          operatorReason: 'Operator verified spooler is clear and forcing recovery'
+        })
+      })
+    });
+    // Job status must remain unmutated (never marked COMPLETED without evidence)
+    expect(f.tx.printJob?.update).toBeUndefined();
+    expect(f.tx.printerDevice.update).toHaveBeenCalled();
+  });
+
+  test('rejects operator recovery when reason has fewer than 10 non-whitespace characters', async () => {
+    const f = fixtures();
+    await expect(disablePrinterDevice('device-a', {
+      reason: '   12345   ', // 5 non-whitespace chars
+      forceReconcileLease: true
+    }, superadmin, f.prisma)).rejects.toMatchObject({
+      statusCode: 400
+    });
+    expect(f.prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  test('strictly rejects null/null company equality on device admin operations', async () => {
+    const f = fixtures({
+      device: { machine: { id: 'machine-a', name: 'Null Co Shop', status: 'ACTIVE', companyId: null } }
+    });
+    f.tx.printerDevice.findUnique
+      .mockResolvedValueOnce({ machineId: 'machine-a' })
+      .mockResolvedValueOnce(f.device);
+    const nullUser = { id: 'null-user', role: 'FRANCHISEE', companyId: null };
+
+    await expect(disablePrinterDevice('device-a', {
+      reason: 'Valid operator reason 12345'
+    }, nullUser, f.prisma)).rejects.toMatchObject({
+      statusCode: 403
+    });
+    expect(f.tx.printerDevice.update).not.toHaveBeenCalled();
+  });
+
+  test('rejects unauthorized non-admin user attempting force-reconciliation', async () => {
+    const f = fixtures();
+    const nonAdminUser = { id: 'regular-user', role: 'CUSTOMER' };
+
+    await expect(disablePrinterDevice('device-a', {
+      reason: 'Malicious or unauthorized force reconciliation',
+      forceReconcileLease: true
+    }, nonAdminUser, f.prisma)).rejects.toMatchObject({
+      statusCode: 403,
+      message: expect.stringContaining('Only an authorized Admin can manage physical printer devices')
+    });
+    expect(f.prisma.$transaction).not.toHaveBeenCalled();
+  });
 });

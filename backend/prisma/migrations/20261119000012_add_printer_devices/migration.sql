@@ -90,12 +90,20 @@ WHERE pq."machineId" = pd."machineId"
 
 -- Prefer the QR record that originally created a Session, then use its
 -- Machine's default primary device only when the QR association is absent.
+-- Enforce machine match so inconsistent historical QR references cannot map across machines.
 UPDATE "Session" s
 SET "printerDeviceId" = pq."printerDeviceId"
 FROM "PrinterQr" pq
 WHERE s."printerQrId" = pq."id"
+  AND s."machineId" = pq."machineId"
   AND pq."printerDeviceId" IS NOT NULL
-  AND s."printerDeviceId" IS NULL;
+  AND s."printerDeviceId" IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM "PrinterDevice" pd
+      WHERE pd."id" = pq."printerDeviceId"
+        AND pd."machineId" = s."machineId"
+  );
 
 UPDATE "Session" s
 SET "printerDeviceId" = pd."id"

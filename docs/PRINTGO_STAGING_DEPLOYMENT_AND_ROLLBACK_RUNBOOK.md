@@ -4,11 +4,20 @@
 **Purpose:** Controlled Staging rollout of the multi-printer feature after code review and physical-readiness gates.  
 **Status:** RUNBOOK ONLY — no deployment, migration, branch switch, environment-variable change, or feature-flag change has been performed.
 
-## 1. Current live deployment inventory (read-only inspection)
+## 1. Current live deployment inventory (latest verified configuration)
 
-The following values were inspected from the connected Render workspace. They are an inventory snapshot, not instructions to modify services.
+The verified live Render Staging configuration (as of 19 November 2026 containment verification) is:
+- **Backend Service:** `printgo-backend-staging` (`srv-dbqpapon74is73csbc80`)
+- **Render Maintenance Mode:** **ON** (`enabled=true`)
+- **Auto-Deploy:** **OFF** (`autoDeploy=no`, `autoDeployTrigger=off`, Event `evt-dbvg10jm8hqs739sn640`)
+- **Build Command:** `npm install && npx prisma generate`
+- **Pre-Deploy Command:** `npx prisma migrate deploy` (remains active; runs on any manual deploy)
+- **Start Command:** `npm start`
+- **Tracked Branch:** `feature/printgo-production-readiness`
 
-### Backend services
+> **Note on Historical Snapshots:** The inventory table below records the earlier point-in-time configuration snapshot before the manual deploy containment action was executed. It is preserved for audit trail purposes.
+
+### Backend services (historical pre-containment snapshot)
 
 | Environment | Render service | Current tracked branch | Auto-deploy | Build / pre-deploy / start | Health path |
 |---|---|---|---|---|---|
@@ -89,18 +98,21 @@ Draft PR #17 proposes to correct that standalone template to Node 24.22.1, npm c
 
 Official references: https://render.com/docs/blueprint-spec and https://render.com/docs/node-version
 
-### 3.2 Staging auto-deploy branch
+### 3.2 Staging auto-deploy status (containment verified)
 
-The live Staging backend currently auto-deploys on commits to feature/printgo-production-readiness. The multi-printer code is held in stacked feature branches and is not the currently deployed Staging commit.
+**Historical Observation:** The live Staging backend previously auto-deployed on commits to `feature/printgo-production-readiness`.
 
-**Critical merge interaction:** PR #9 currently targets feature/printgo-production-readiness, which is the exact branch watched by the live Staging backend with auto-deploy enabled. Merging PR #9 as it is currently targeted will therefore trigger a Staging backend deployment of the partially integrated stack. Do not merge PR #9 until the deployment path has been deliberately isolated or the Staging auto-deploy behavior has been explicitly controlled and approved.
+**Current Verified State:**
+- Auto-deploy has been **disabled** on Render (`autoDeploy=no`, `autoDeployTrigger=off`, Event ID `evt-dbvg10jm8hqs739sn640`).
+- Maintenance Mode is **enabled** (`enabled=true`).
+- Pre-deploy command remains `npx prisma migrate deploy`. Any manual deployment will execute pending Prisma migrations.
+- Automatic deployment containment is **PASS**. Merging PR branches will NOT trigger automatic deployment.
 
-Before any code merge or release candidate is placed on a branch watched by Staging:
-- Review the exact target branch and commit SHA.
-- Prevent an unintended partial deploy by either using an isolated integration/release branch not watched by Render, or explicitly disabling Staging auto-deploy before the first stacked merge and later performing one reviewed manual deploy.
-- Obtain explicit release approval before changing branch settings, auto-deploy settings, or pushing to the watched branch.
-- Do not assume a Draft PR merge is harmless just because the migration is additive.
-- Do not use the Production branch or Production services as a shortcut.
+**Operational Requirement:**
+A manual deployment must only be triggered after:
+1. Complete code review and approval of the candidate.
+2. Verified `npx prisma migrate status` check against Staging DB from a trusted context.
+3. Explicit release operator authorization.
 
 Production backend also auto-deploys on commits to fix/p1-production-blockers. Never push the multi-printer candidate to that branch as part of Staging testing.
 

@@ -163,6 +163,12 @@ class PrinterFleetManager {
         reason = 'WINDOWS_QUEUE_NOT_BOUND';
       } else if (!discoveredPrinter) {
         reason = 'WINDOWS_QUEUE_NOT_PRESENT';
+      } else if (discoveredPrinter.workOffline === true) {
+        canPrint = false;
+        reason = 'PRINTER_OFFLINE';
+      } else if (Number.isFinite(discoveredPrinter.detectedErrorState) && discoveredPrinter.detectedErrorState !== 0) {
+        canPrint = false;
+        reason = 'PRINTER_ERROR_STATE';
       }
 
       if (canPrint) {

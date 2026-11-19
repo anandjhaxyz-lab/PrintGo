@@ -47,9 +47,9 @@ router.post('/dispatch-job', restrictTo('SUPERADMIN'), async (req, res, next) =>
   }
 });
 
-router.post('/reconcile-job', restrictTo('SUPERADMIN'), async (req, res, next) => {
+router.post('/reconcile-job', restrictTo('SUPERADMIN', 'FRANCHISEE'), async (req, res, next) => {
   try {
-    const { shortId, outcome = 'COMPLETED', evidence = 'Physical verification confirmed' } = req.body;
+    const { shortId, outcome = 'COMPLETED', evidence = 'Physical verification confirmed', reason, physicalConfirmation = true, spoolerEmptyOnly } = req.body;
     if (!shortId) return res.status(400).json({ success: false, error: 'shortId is required' });
 
     // Historical guard: job ab36197e must NEVER be modified
@@ -58,38 +58,30 @@ router.post('/reconcile-job', restrictTo('SUPERADMIN'), async (req, res, next) =
     }
 
     const prisma = require('../../utils/prisma');
-    const job = await prisma.printJob.findUnique({
+    const existingJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true, machine: true }
+      include: { machine: true }
     });
-
-    if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+    if (!existingJob) return res.status(404).json({ success: false, error: 'Job not found' });
 
     // Idempotency: if already matching target status, return cleanly
-    if (job.status === outcome) {
+    if (existingJob.status === outcome) {
       return res.json({ 
         success: true, 
         message: `Job ${shortId} already has status ${outcome}`, 
-        job,
+        job: existingJob,
         reconciled: false 
       });
     }
 
-    const updatedJob = await prisma.printJob.update({
-      where: { shortId },
-      data: { status: outcome },
-      include: { document: true }
-    });
-
-    // Record audit trail in PrintHistory
-    const history = await prisma.printHistory.create({
-      data: {
-        printJobId: job.id,
-        success: outcome === 'COMPLETED',
-        errorDetails: `Operator reconciliation: ${evidence}`,
-        completedAt: new Date()
-      }
-    });
+    const jobsService = require('../jobs/jobs.service');
+    const updatedJob = await jobsService.resolveAmbiguousJob(shortId, {
+      outcome,
+      reason: reason || evidence,
+      physicalConfirmation: physicalConfirmation,
+      spoolerEmptyOnly,
+      ipAddress: req.ip
+    }, req.user);
 
     req.app.get('io')?.emit('job_status_changed', updatedJob);
 
@@ -97,7 +89,6 @@ router.post('/reconcile-job', restrictTo('SUPERADMIN'), async (req, res, next) =
       success: true,
       message: `Job ${shortId} reconciled to ${outcome}`,
       job: updatedJob,
-      historyId: history.id,
       reconciled: true
     });
   } catch (e) {

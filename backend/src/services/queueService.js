@@ -57,6 +57,10 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
   if (globalIo) {
     if (job.machineId) globalIo.to(`machine_${job.machineId}`).emit('job_status_changed', statusEvent);
     globalIo.to(`job_${job.shortId}`).emit('job_status_changed', statusEvent);
+    if (job.machine?.companyId) {
+      globalIo.to(`company_${job.machine.companyId}`).emit('job_status_changed', statusEvent);
+    }
+    globalIo.to('superadmins').emit('job_status_changed', statusEvent);
     globalIo.to('admins').emit('job_status_changed', statusEvent);
   }
 
@@ -75,6 +79,53 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
       );
     } catch (refundError) {
       console.error(`Job ${job.shortId}: automatic refund failed after dispatch refusal:`, refundError.message);
+      try {
+        const idempotencyKey = `device_dispatch_blocked_${job.id}_${job.paymentId}`;
+        const existingFailed = await prisma.refund.findFirst({
+          where: {
+            OR: [
+              { idempotencyKey },
+              { paymentId: job.paymentId, printJobId: job.id }
+            ]
+          }
+        });
+        let failedRefundId = existingFailed?.id;
+        if (!existingFailed) {
+          const refundRecord = await prisma.refund.create({
+            data: {
+              idempotencyKey,
+              paymentId: job.paymentId,
+              printJobId: job.id,
+              gatewayRefundId: `ref_blocked_${job.shortId}_${Date.now()}`,
+              amount: job.payment?.amount || 0,
+              currency: job.payment?.currency || 'INR',
+              reason: `Automatic refund failed after physical printer dispatch blocked (${code}): ${reason}`,
+              status: 'FAILED',
+              failureReason: refundError.message,
+              retryEligible: true,
+              initiatedBy: 'SYSTEM'
+            }
+          });
+          failedRefundId = refundRecord.id;
+        }
+        await prisma.reconciliationRecord.create({
+          data: {
+            paymentId: job.paymentId,
+            refundId: failedRefundId || null,
+            printJobId: job.id,
+            status: 'PENDING_RECONCILIATION',
+            discrepancyType: 'FAILED_AUTOMATIC_REFUND',
+            details: JSON.stringify({
+              code,
+              reason,
+              error: refundError.message,
+              jobShortId: job.shortId
+            })
+          }
+        }).catch(() => {});
+      } catch (recordError) {
+        console.error(`Failed to record persistent refund failure for job ${job.shortId}:`, recordError.message);
+      }
     }
   }
 

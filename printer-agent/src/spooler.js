@@ -86,9 +86,16 @@ class SpoolerMonitor {
         this.isCheckingStatus = false;
         if (error) {
           console.error(`Error querying printer status: ${error.message}`);
+          this.emitStatus(socket, true, `Query Error: ${error.message}`, 'Unknown');
           return;
         }
-        
+
+        const rawOutput = (stdout || '').trim();
+        if (!rawOutput) {
+          this.emitStatus(socket, true, 'Printer Queue Missing or Renamed', 'Unknown');
+          return;
+        }
+
         let isError = false;
         let errorMessage = '';
 
@@ -101,6 +108,9 @@ class SpoolerMonitor {
         } else if (stdout.includes('DetectedErrorState : 5') || stdout.includes('ErrorState: 5') || stdout.includes('Jam')) {
           isError = true;
           errorMessage = 'Paper Jam';
+        } else if (/DetectedErrorState\s*:\s*[1-9]/.test(stdout)) {
+          isError = true;
+          errorMessage = 'Printer Error';
         }
 
         // Extract PortName and classify connection
@@ -126,7 +136,16 @@ class SpoolerMonitor {
 
         this.execFile('lpstat', ['-p', this.printerName], { timeout: 8000 }, (error, stdout) => {
           this.isCheckingStatus = false;
-          if (error) return;
+          if (error) {
+            this.emitStatus(socket, true, `Query Error: ${error.message}`, connectionType);
+            return;
+          }
+
+          const rawOutput = (stdout || '').trim();
+          if (!rawOutput) {
+            this.emitStatus(socket, true, 'Printer Queue Missing or Renamed', connectionType);
+            return;
+          }
 
           let isError = false;
           let errorMessage = '';

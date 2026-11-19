@@ -21,11 +21,13 @@ async function lockMachineAndDevice(tx, machineId, printerDeviceId) {
   await tx.$queryRaw`SELECT "id" FROM "PrinterDevice" WHERE "id" = ${printerDeviceId} FOR UPDATE`;
 }
 
-async function assertNoActiveDispatchLease(tx, printerDeviceId, now = new Date()) {
+async function assertNoActiveDispatchLease(tx, printerDeviceId, options = {}, now = new Date(), user = null, machineId = null) {
   const lease = await tx.printerDeviceDispatchLease.findUnique({
     where: { printerDeviceId }
   });
-  if (lease && !lease.releasedAt && lease.expiresAt > now) {
+  if (!lease || lease.releasedAt) return;
+
+  if (lease.expiresAt > now) {
     const error = new AppError(
       `This printer is currently submitting job ${lease.jobShortId}. Try again after the Agent releases its dispatch lease.`,
       409
@@ -34,11 +36,55 @@ async function assertNoActiveDispatchLease(tx, printerDeviceId, now = new Date()
     error.leaseExpiresAt = lease.expiresAt;
     throw error;
   }
+
+  // The lease expired without release. Check if the previous job is still non-terminal.
+  const job = await tx.printJob.findUnique({
+    where: { shortId: lease.jobShortId },
+    select: { id: true, shortId: true, status: true }
+  });
+
+  const isTerminal = !job || ['COMPLETED', 'FAILED', 'CANCELLED'].includes(job.status);
+  if (!isTerminal) {
+    if (options.forceReconcileLease === true) {
+      const operatorReason = validateReason(options.reason);
+      // Explicit operator recovery path
+      await tx.printerDeviceDispatchLease.update({
+        where: { printerDeviceId },
+        data: { releasedAt: now }
+      });
+      if (tx.activityLog?.create) {
+        await tx.activityLog.create({
+          data: {
+            userId: user?.id || null,
+            machineId: machineId || null,
+            action: 'DISPATCH_LEASE_FORCE_RECONCILED',
+            details: JSON.stringify({
+              printerDeviceId,
+              jobShortId: lease.jobShortId,
+              requestId: lease.requestId,
+              operatorReason
+            })
+          }
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    const error = new AppError(
+      `This printer has an unreleased dispatch lease for job ${lease.jobShortId} that expired without a confirmed outcome. Explicit operator reconciliation is required.`,
+      409
+    );
+    error.code = 'DEVICE_UNRESOLVED_DISPATCH_LEASE';
+    error.unresolvedJobShortId = lease.jobShortId;
+    throw error;
+  }
 }
 
 async function verifyCompanyAccess(device, user) {
-  if (user.role !== 'SUPERADMIN' && device.machine?.companyId !== user.companyId) {
-    throw new AppError('Access denied: this printer belongs to another company.', 403);
+  if (user.role !== 'SUPERADMIN') {
+    if (!user.companyId || !device.machine?.companyId || device.machine.companyId !== user.companyId) {
+      throw new AppError('Access denied: this printer belongs to another company.', 403);
+    }
   }
 }
 
@@ -60,7 +106,7 @@ async function disablePrinterDevice(printerDeviceId, data = {}, user, prisma) {
     });
     if (!device) throw new AppError('Printer device not found.', 404);
     await verifyCompanyAccess(device, user);
-    await assertNoActiveDispatchLease(tx, printerDeviceId);
+    await assertNoActiveDispatchLease(tx, printerDeviceId, data, new Date(), user, device.machineId);
 
     if (device.status === 'DISABLED') {
       return { device, alreadyDisabled: true };
@@ -108,7 +154,7 @@ async function enablePrinterDevice(printerDeviceId, data = {}, user, prisma) {
     });
     if (!device) throw new AppError('Printer device not found.', 404);
     await verifyCompanyAccess(device, user);
-    await assertNoActiveDispatchLease(tx, printerDeviceId);
+    await assertNoActiveDispatchLease(tx, printerDeviceId, data, new Date(), user, device.machineId);
 
     if (device.status === 'ACTIVE') {
       return { device, alreadyEnabled: true };
@@ -229,7 +275,7 @@ async function remapPrinterDevice(printerDeviceId, data = {}, user, prisma) {
       throw new AppError('The selected discovery is stale. Reconnect the Agent and refresh Windows inventory.', 409);
     }
 
-    await assertNoActiveDispatchLease(tx, printerDeviceId);
+    await assertNoActiveDispatchLease(tx, printerDeviceId, data, new Date(), user, device.machineId);
 
     const mappedQueue = await tx.printerDevice.findFirst({
       where: {

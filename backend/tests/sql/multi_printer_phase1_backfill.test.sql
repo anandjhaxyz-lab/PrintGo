@@ -1,8 +1,16 @@
 \set ON_ERROR_STOP on
 
+BEGIN;
+
+DO $$
+BEGIN
+  IF current_database() <> 'printgo_disposable_target' THEN
+    RAISE EXCEPTION 'SAFETY CHECK FAILED: Refusing to execute migration test against database "%". Script can only run against "printgo_disposable_target".', current_database();
+  END IF;
+END $$;
+
 -- Isolated pre-migration schema with representative legacy single-printer rows.
 DROP SCHEMA IF EXISTS multi_printer_migration_test CASCADE;
-BEGIN;
 CREATE SCHEMA multi_printer_migration_test;
 SET LOCAL search_path TO multi_printer_migration_test, public;
 
@@ -78,7 +86,8 @@ INSERT INTO "PrinterQr" ("id", "publicCode", "label", "status", "machineId") VAL
 
 INSERT INTO "Session" ("id", "code", "status", "machineId", "printerQrId", "paymentMode", "expiresAt") VALUES
   ('session-a', 'SESSIONA12345', 'WAITING_FOR_MOBILE', 'machine-a', 'qr-a', 'CASH_AT_COUNTER', CURRENT_TIMESTAMP + INTERVAL '1 hour'),
-  ('session-b', 'SESSIONB12345', 'WAITING_FOR_MOBILE', 'machine-b', NULL, 'CASHFREE_ONLINE', CURRENT_TIMESTAMP + INTERVAL '1 hour');
+  ('session-b', 'SESSIONB12345', 'WAITING_FOR_MOBILE', 'machine-b', NULL, 'CASHFREE_ONLINE', CURRENT_TIMESTAMP + INTERVAL '1 hour'),
+  ('session-inconsistent', 'SESSIONBAD1', 'WAITING_FOR_MOBILE', 'machine-a', 'qr-b', 'CASH_AT_COUNTER', CURRENT_TIMESTAMP + INTERVAL '1 hour');
 
 INSERT INTO "PrintJob" ("id", "shortId", "status", "cost", "machineId", "paymentMode") VALUES
   ('job-a', 'JOBA1234', 'COMPLETED', 12.50, 'machine-a', 'CASH_AT_COUNTER'),
@@ -130,8 +139,12 @@ BEGIN
   SELECT COUNT(*) INTO mapped_session_count
   FROM "Session"
   WHERE "printerDeviceId" IS NOT NULL;
-  IF mapped_session_count <> 2 THEN
+  IF mapped_session_count <> 3 THEN
     RAISE EXCEPTION 'Expected QR-linked and Machine-fallback sessions mapped; got %', mapped_session_count;
+  END IF;
+
+  IF (SELECT "printerDeviceId" FROM "Session" WHERE "id" = 'session-inconsistent') = (SELECT "printerDeviceId" FROM "PrinterQr" WHERE "id" = 'qr-b') THEN
+    RAISE EXCEPTION 'FAIL-CLOSED VIOLATION: Session associated with PrinterDevice of a different Machine!';
   END IF;
 
   IF (SELECT "paymentMode" FROM "Session" WHERE "id" = 'session-a') <> 'CASH_AT_COUNTER'

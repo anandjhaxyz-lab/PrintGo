@@ -420,6 +420,10 @@ const refundOrder = async (req, res, next) => {
       if (updatedJob.machineId) {
         io.to(`machine_${updatedJob.machineId}`).emit('job_status_changed', updatedJob);
       }
+      if (updatedJob.machine?.companyId) {
+        io.to(`company_${updatedJob.machine.companyId}`).emit('job_status_changed', updatedJob);
+      }
+      io.to('superadmins').emit('job_status_changed', updatedJob);
       io.to('admins').emit('job_status_changed', updatedJob);
       io.to(`job_${updatedJob.shortId}`).emit('job_status_changed', updatedJob);
     }
@@ -586,6 +590,10 @@ const demoPayment = async (req, res, next) => {
         io.to(req.session.sessionId).emit('kiosk_payment_success', { jobId: job.shortId });
       }
       io.to(`job_${job.shortId}`).emit('kiosk_payment_success', { jobId: job.shortId });
+      if (updatedJob.machine?.companyId) {
+        io.to(`company_${updatedJob.machine.companyId}`).emit('job_status_changed', updatedJob);
+      }
+      io.to('superadmins').emit('job_status_changed', updatedJob);
       io.to('admins').emit('job_status_changed', updatedJob);
     }
 

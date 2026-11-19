@@ -6,7 +6,14 @@ jest.mock('../src/utils/prisma', () => ({
     findUnique: jest.fn(),
     updateMany: jest.fn()
   },
-  printHistory: { create: jest.fn() }
+  printHistory: { create: jest.fn() },
+  refund: {
+    findFirst: jest.fn(),
+    create: jest.fn()
+  },
+  reconciliationRecord: {
+    create: jest.fn()
+  }
 }));
 
 jest.mock('../src/services/redisClient', () => ({ connection: null }));
@@ -65,6 +72,9 @@ describe('Backend device-bound PrintJob dispatch gate', () => {
     process.env.ENABLE_MULTI_PRINTER_DISPATCH = 'true';
     prisma.printJob.updateMany.mockResolvedValue({ count: 1 });
     prisma.printHistory.create.mockResolvedValue({ id: 'history-1' });
+    prisma.refund.findFirst.mockResolvedValue(null);
+    prisma.refund.create.mockResolvedValue({ id: 'refund-failed-1', status: 'FAILED' });
+    prisma.reconciliationRecord.create.mockResolvedValue({ id: 'rec-1' });
     paymentsService.refundPayment.mockResolvedValue({ status: 'REFUNDED' });
   });
 
@@ -266,5 +276,67 @@ describe('Backend device-bound PrintJob dispatch gate', () => {
     expect(emitted).toBeDefined();
     expect(emitted[1].printerDeviceId).toBeUndefined();
     expect(emitted[1].windowsPrinterName).toBeUndefined();
+  });
+
+  test('persists a durable FAILED Refund and ReconciliationRecord when automatic refund fails', async () => {
+    process.env.ENABLE_MULTI_PRINTER_DISPATCH = 'false';
+    const refundError = new Error('Gateway network timeout during automatic refund');
+    paymentsService.refundPayment.mockRejectedValueOnce(refundError);
+
+    const job = makeDeviceJob({
+      paymentId: 'payment-failed-refund',
+      payment: { id: 'payment-failed-refund', amount: 25, currency: 'INR', status: 'SUCCESS' }
+    });
+    prisma.printJob.findUnique
+      .mockResolvedValueOnce(job)
+      .mockResolvedValueOnce(job);
+
+    const { io, room } = createIo();
+    await queueService.startPrintingProcess(job.shortId, io);
+
+    // Job is cancelled due to feature gate
+    expect(prisma.printJob.updateMany).toHaveBeenCalledWith({
+      where: {
+        shortId: job.shortId,
+        status: 'WAITING',
+        printerDeviceId: job.printerDeviceId
+      },
+      data: { status: 'CANCELLED' }
+    });
+
+    // Refund was attempted
+    expect(paymentsService.refundPayment).toHaveBeenCalledWith(
+      job.shortId,
+      null,
+      expect.stringContaining('DISPATCH_FEATURE_DISABLED'),
+      expect.objectContaining({ preserveJobStatus: true })
+    );
+
+    // Durable failed refund is persisted with retryEligible = true and preserved failureReason
+    expect(prisma.refund.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        paymentId: 'payment-failed-refund',
+        printJobId: job.id,
+        status: 'FAILED',
+        retryEligible: true,
+        failureReason: refundError.message,
+        initiatedBy: 'SYSTEM'
+      })
+    });
+
+    // Durable reconciliation record is created with FAILED_AUTOMATIC_REFUND
+    expect(prisma.reconciliationRecord.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        paymentId: 'payment-failed-refund',
+        refundId: 'refund-failed-1',
+        printJobId: job.id,
+        status: 'PENDING_RECONCILIATION',
+        discrepancyType: 'FAILED_AUTOMATIC_REFUND',
+        details: expect.stringContaining('Gateway network timeout')
+      })
+    });
+
+    // Physical print job was blocked
+    expect(room.emit).not.toHaveBeenCalledWith('physical_print_job', expect.any(Object));
   });
 });

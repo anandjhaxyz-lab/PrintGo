@@ -133,20 +133,34 @@ async function authorizePrinterDeviceDispatch({ socket, prisma, request = {} }) 
       const existingLease = await tx.printerDeviceDispatchLease.findUnique({
         where: { printerDeviceId }
       });
-      const isActiveLease = Boolean(
-        existingLease &&
-        !existingLease.releasedAt &&
-        existingLease.expiresAt > now
-      );
-      if (isActiveLease && (
+      if (existingLease && (
         existingLease.requestId !== requestId ||
         existingLease.jobShortId !== jobId
       )) {
-        return {
-          allowed: false,
-          code: 'DEVICE_DISPATCH_IN_PROGRESS',
-          leaseExpiresAt: existingLease.expiresAt
-        };
+        if (existingLease.expiresAt > now && !existingLease.releasedAt) {
+          return {
+            allowed: false,
+            code: 'DEVICE_DISPATCH_IN_PROGRESS',
+            leaseExpiresAt: existingLease.expiresAt
+          };
+        }
+
+        // Unresolved job protection: A released, expired or force-reconciled lease
+        // MUST NOT allow subsequent dispatch to a new job while the previous physical print
+        // outcome remains unresolved. Independent verification of the PrintJob terminal state is required.
+        if (existingLease.jobShortId) {
+          const prevJob = await tx.printJob.findUnique({
+            where: { shortId: existingLease.jobShortId },
+            select: { status: true }
+          });
+          if (prevJob && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(prevJob.status)) {
+            return {
+              allowed: false,
+              code: 'DEVICE_UNRESOLVED_DISPATCH_LEASE',
+              unresolvedJobShortId: existingLease.jobShortId
+            };
+          }
+        }
       }
 
       await tx.printerDeviceDispatchLease.upsert({
@@ -219,7 +233,7 @@ async function renewPrinterDeviceDispatchLease({ socket, prisma, request = {} })
         data: { expiresAt }
       });
       return updated.count === 1
-        ? { renewed: true, requestId: identity.requestId, expiresAt }
+        ? { renewed: true, requestId: identity.requestId, leaseId: lease.id, expiresAt }
         : { renewed: false, code: 'DISPATCH_LEASE_NOT_ACTIVE' };
     });
   } catch (error) {
