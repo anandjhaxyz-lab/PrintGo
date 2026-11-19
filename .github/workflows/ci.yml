@@ -79,6 +79,11 @@ jobs:
         env:
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target
 
+      - name: Verify Full Multi-Printer Migration Chain (00012-00016)
+        run: psql "$MIGRATION_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/multi_printer_full_migration_chain.test.sql
+        env:
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target
+
       - name: Validate Backend Runtime Syntax
         run: node --check src/server.js && node --check src/socket.js && node --check src/modules/jobs/jobs.service.js && node --check src/services/printerDeviceJobBinding.service.js && node --check src/services/printerDeviceAdmin.service.js && node --check src/services/printerDiscovery.service.js && node --check src/modules/admin/printerDiscovery.admin.controller.js && node --check src/services/printerAgentProtocol.service.js && node --check src/services/redisClient.js && node --check src/services/queueService.js && node --check src/services/uploadWorker.js && node --check src/modules/upload/upload.controller.js && node --check src/modules/upload/upload.service.js && node --check src/utils/uploadPaths.js
 
