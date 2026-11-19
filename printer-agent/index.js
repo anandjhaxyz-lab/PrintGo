@@ -21,6 +21,7 @@ const SpoolerMonitor = require('./src/spooler');
 const JobJournal = require('./src/journal');
 const { PrinterFleetManager } = require('./src/printerFleetManager');
 const { PrinterDeviceQueue } = require('./src/printerDeviceQueue');
+const { PrinterDispatchAuthorizer } = require('./src/dispatchAuthorization');
 const { discoverWindowsPrinters } = require('./src/windowsPrinterDiscovery');
 const {
   buildAgentHello,
@@ -90,6 +91,7 @@ const socket = io(BACKEND_URL, {
   transports: ['websocket'],
   auth: { machineKey: MACHINE_KEY }
 });
+const dispatchAuthorizer = new PrinterDispatchAuthorizer(socket);
 
 // Persistent RSA Keypair for E2EE across restarts
 const keysDir = path.join(__dirname, 'keys');
@@ -749,6 +751,16 @@ const processPhysicalPrintJob = async (jobData) => {
         }
         
         console.log(`⚙️  Windows Print options:`, JSON.stringify(printOptions));
+        if (deviceBound) {
+          // The initial fleet refresh can become stale while a large document is
+          // downloading/decrypting. Re-authorize the exact DB job/device/queue
+          // immediately before durable dispatch intent and driver submission.
+          await dispatchAuthorizer.authorize({
+            jobId: jobData.jobId,
+            printerDeviceId: jobData.printerDeviceId,
+            windowsPrinterName: targetPrinterName
+          });
+        }
         journal.recordDispatchIntent(jobData.jobId, {
           ...deviceBinding,
           printerName: targetPrinterName,
