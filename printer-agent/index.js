@@ -596,7 +596,6 @@ const processPhysicalPrintJob = async (jobData) => {
   let targetSpoolerMonitor = spoolerMonitor;
   let dispatchLeaseAuthorization = null;
   let stopDispatchLeaseRenewal = null;
-  let driverSubmissionAccepted = false;
 
   try {
     if (deviceBound) {
@@ -775,7 +774,6 @@ const processPhysicalPrintJob = async (jobData) => {
           settings: jobData.settings
         });
         await ptp.print(printFilePath, printOptions);
-        driverSubmissionAccepted = true;
         if (stopDispatchLeaseRenewal) {
           stopDispatchLeaseRenewal();
           stopDispatchLeaseRenewal = null;
