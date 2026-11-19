@@ -144,3 +144,53 @@ Do not blindly retry ambiguous jobs. Do not delete migration history, use `prism
 **PREPARATION COMPLETE; NOT AUTHORIZED TO PAUSE OR DEPLOY.**
 
 The backup restore drill passed locally. The live snapshot currently has zero non-terminal PrintJobs and all nine Payments in SUCCESS, but this is not a post-pause snapshot and must be repeated during the approved window. Render Maintenance Mode is currently disabled; the live Staging backend auto-deploy remains enabled on `feature/printgo-production-readiness` with `npx prisma migrate deploy` in pre-deploy. Do not change these settings, merge, deploy, migrate, or alter Production without a separate explicit release authorization.
+
+
+## Post-maintenance final read-only snapshot — 2026-11-19
+
+### Maintenance Mode confirmation
+- Render service `printgo-backend-staging` (`srv-dbqpapon74is73csbc80`) reports `maintenanceMode.enabled=true`.
+- Render event `maintenance_mode_enabled` recorded at `2026-11-19T13:20:59.979371Z` (event `evt-dbvfferl550s739keru0`).
+- The service remains on `feature/printgo-production-readiness`; auto-deploy is still enabled and pre-deploy remains `npx prisma migrate deploy`. No service branch, auto-deploy, deployment, or database setting was changed.
+- The Maintenance Mode setting and event confirm the ingress lock is active. A separate external HTTP status probe of `/api/health` was not established in this check; public health endpoints are expected to be intercepted while the mode is active.
+
+### Final DB snapshot after Maintenance Mode was enabled
+Read-only Render Postgres queries against `printgo_staging` at `2026-11-19T13:22:22.930257Z` (latest PrinterStatus row timestamp `2026-11-19T13:23:07.238Z`) returned:
+
+| Check | Result |
+|---|---:|
+| Machine | 1 |
+| PrinterQr | 1 |
+| Session | 84 |
+| PrintJob | 9 |
+| PrinterStatus | 4,173 |
+| PrintJob COMPLETED | 9 |
+| Other PrintJob statuses | 0 |
+| Payment SUCCESS | 9 |
+| PaymentEvent rows | 0 |
+| Refund rows | 0 |
+| ReconciliationRecord rows | 0 |
+| Unexpired Sessions | 0 |
+| Sessions with `expiresAt <= now()` | 84 |
+| ACTIVE PrinterQr | 1 |
+| Duplicate ACTIVE QR per Machine | 0 groups |
+| Orphan QR/Machine, Session/Machine, Session/QR, PrintJob/Machine, PrinterStatus/Machine | 0 each |
+
+Session status labels remain CONNECTED 5, EXPIRED 4, WAITING_FOR_MOBILE 75; all 84 expiry timestamps are in the past. Do not infer that the CONNECTED / WAITING_FOR_MOBILE labels make those sessions active; the expiry timestamps are expired. Do not mass-rewrite these records in rollout preparation.
+
+The printer's latest recorded telemetry row showed `isOnline=true`, `paperStatus=OK`, `tonerStatus=OK`, `jamStatus=false`, machine `Main Shop Printer`, model `EPSON L6460 Series`, and `connectionType=NULL`. This is telemetry only. It does not prove a fresh physical print, the Windows spooler queue name, or physical certification. Do not infer queue name or connection type from model/status.
+
+### Migration ledger
+- Latest successful migration remains `20261118000011_add_cash_payment_mode_and_confirmation`.
+- All five target migrations 00012–00016 remain PENDING; none was applied.
+- No migration command was run.
+
+### Decision after this preflight
+The database checks passed for the observed snapshot and the Staging ingress lock is confirmed active. The final preflight is **PASS for the DB conditions observed at this timestamp**, but the release is **NOT AUTHORIZED TO MIGRATE/DEPLOY** yet:
+1. The store operator must confirm the counter/customer intake is physically paused and no physical print/spooler handoff remains in flight or ambiguous.
+2. The payment owner must confirm in the Cashfree merchant dashboard that there are no pending orders/callbacks outside the local database. Local PaymentEvent is empty and all stored Payments are SUCCESS, but that does not independently establish the external gateway has no callback in flight.
+3. Record the exact PITR recovery window shown in Render Recovery. The isolated logical backup restore drill passed, but that does not prove the currently configured PITR retention window.
+4. Freeze the release candidate and verify the exact complete Prisma migration status using the reviewed candidate. Reconfirm that deployment cannot be triggered through the current auto-deploy watched branch before the approved release choreography.
+5. Obtain explicit release approval, maintenance-window owner, migration operator, smoke-test owner, and rollback decision owner.
+
+Maintenance Mode was enabled by the operator; do not disable it until the operator-approved reopening sequence is completed. No Staging data or schema was modified; no deployment or migration was performed; Production remained untouched.
