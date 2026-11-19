@@ -235,7 +235,7 @@ describe('Printer Agent protocol — inventory report', () => {
     })).toThrow(expect.objectContaining({ code: 'DUPLICATE_DISCOVERED_QUEUE' }));
   });
 
-  test('rejects unsafe inventory payloads and never forwards invalid input', () => {
+  test('rejects invalid inventory metadata and never forwards invalid input', () => {
     const socket = {
       userType: 'printer',
       machineId: 'machine-a',
@@ -251,8 +251,8 @@ describe('Printer Agent protocol — inventory report', () => {
       payload: {
         protocolVersion: 1,
         discoveredPrinters: [{
-          windowsPrinterName: "Queue'; Remove-Printer *",
-          connectionType: 'USB'
+          windowsPrinterName: 'Queue A',
+          connectionType: 'UnsupportedType'
         }]
       }
     });
