@@ -281,6 +281,28 @@ describe('Printer Agent protocol — inventory report', () => {
     }));
   });
 
+  test('refuses inventory reports before successful multi-printer negotiation', () => {
+    const socket = {
+      userType: 'printer',
+      machineId: 'machine-a',
+      emit: jest.fn()
+    };
+    const io = { to: jest.fn() };
+    const result = handlePrinterInventoryReport({
+      socket,
+      io,
+      logger: { warn: jest.fn() },
+      payload: { protocolVersion: 1, discoveredPrinters: [] }
+    });
+
+    expect(result).toEqual(expect.objectContaining({ accepted: false, code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' }));
+    expect(io.to).not.toHaveBeenCalled();
+    expect(socket.emit).toHaveBeenCalledWith('printer_inventory_report_ack', expect.objectContaining({
+      accepted: false,
+      code: 'AGENT_PROTOCOL_NOT_NEGOTIATED'
+    }));
+  });
+
   test('refuses inventory reports from non-printer sockets', () => {
     const socket = { userType: 'session', machineId: 'machine-a', emit: jest.fn() };
     const io = { to: jest.fn() };
