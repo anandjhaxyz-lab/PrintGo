@@ -265,6 +265,14 @@ function handlePrinterInventoryReport({ socket, io, logger, payload }) {
   if (socket?.userType !== 'printer' || !socket.machineId) {
     return { accepted: false, code: 'UNAUTHORIZED_AGENT' };
   }
+  if (socket.agentProtocol?.supportsMultiPrinter !== true) {
+    socket.emit('printer_inventory_report_ack', {
+      accepted: false,
+      code: 'AGENT_PROTOCOL_NOT_NEGOTIATED',
+      message: 'Multi-printer capability must be negotiated before inventory can be reported.'
+    });
+    return { accepted: false, code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' };
+  }
 
   try {
     const discoveredPrinters = validateDiscoveredPrinterInventory(payload);
