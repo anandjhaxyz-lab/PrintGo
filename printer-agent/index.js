@@ -255,18 +255,44 @@ socket.on('ack_job_completed', ({ jobId }) => {
   journal.recordAcknowledged(jobId);
 });
 
-socket.on('reconcile_active_jobs', ({ requestId, jobIds = [] }) => {
+socket.on('reconcile_active_jobs', ({ requestId, jobIds = [], jobBindings = {} } = {}) => {
   console.log(`🔍 Received reconciliation request [ReqID: ${requestId || 'legacy'}] from backend for jobs:`, jobIds);
 
-  // FAIL-CLOSED GUARD: Corrupted, unreadable, or version-mismatched journal
+  const bindingForJob = (jobId, entry) => {
+    const hasServerBinding = Object.prototype.hasOwnProperty.call(jobBindings || {}, jobId);
+    const serverBinding = hasServerBinding ? (jobBindings[jobId] || {}) : null;
+    const journalBinding = entry && entry.printerDeviceId
+      ? {
+          printerDeviceId: entry.printerDeviceId,
+          windowsPrinterName: entry.windowsPrinterName || null
+        }
+      : {};
+
+    if (hasServerBinding) {
+      const serverId = serverBinding.printerDeviceId || null;
+      const serverQueue = serverBinding.windowsPrinterName || null;
+      const localId = journalBinding.printerDeviceId || null;
+      const localQueue = journalBinding.windowsPrinterName || null;
+      return {
+        binding: serverBinding,
+        mismatch: Boolean(entry && (serverId !== localId || serverQueue !== localQueue))
+      };
+    }
+
+    return { binding: journalBinding, mismatch: false };
+  };
+
+  // A corrupted journal is never evidence that a job was not dispatched.
   if (journal.isCorrupted) {
     console.error(`🔥 FAIL-CLOSED GUARD: Local journal is corrupted/unreadable (${journal.corruptionReason}). Refusing to report NOT_DISPATCHED!`);
     for (const jobId of jobIds) {
+      const { binding } = bindingForJob(jobId, null);
       socket.emit('print_physical_ambiguous', {
         jobId,
         requestId,
         reason: `Local journal corrupted/unreadable: ${journal.corruptionReason}. Manual verification required.`,
-        wasSeenInQueue: false
+        wasSeenInQueue: false,
+        ...binding
       });
     }
     return;
@@ -274,54 +300,81 @@ socket.on('reconcile_active_jobs', ({ requestId, jobIds = [] }) => {
 
   for (const jobId of jobIds) {
     const entry = journal.getJob(jobId);
-    if (!entry) {
-      // Proved never recorded in local journal
+    const { binding, mismatch } = bindingForJob(jobId, entry);
+
+    if (mismatch) {
+      console.warn(`⚠️ Journal physical-printer binding differs from the backend job record for ${jobId}. Reporting AMBIGUOUS.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Journal PrinterDevice identity does not match the current database job binding.',
+        wasSeenInQueue: false,
+        ...binding
+      });
+    } else if (!entry) {
+      // Backend-supplied binding lets the Agent prove an unseen device-bound
+      // job was never received without guessing its PrinterDevice identity.
       console.log(`📡 Job ${jobId} was never recorded in local journal.`);
-      socket.emit('job_reconciliation_report', { requestId, jobId, status: 'NOT_DISPATCHED' });
+      socket.emit('job_reconciliation_report', {
+        requestId,
+        jobId,
+        status: 'NOT_DISPATCHED',
+        ...binding
+      });
     } else if (journal.isCorruptedEntry(entry)) {
-      // Incomplete or malformed journal entry -> Fail closed as AMBIGUOUS
       console.warn(`⚠️ Incomplete/corrupted journal entry for Job ${jobId}. Reporting AMBIGUOUS.`);
       socket.emit('print_physical_ambiguous', {
         jobId,
         requestId,
         reason: 'Incomplete or malformed journal entry (missing required state)',
-        wasSeenInQueue: false
+        wasSeenInQueue: false,
+        ...binding
       });
     } else if (entry.state === 'RECEIVED') {
-      // Proved never dispatched to driver/spooler: safe to request re-dispatch
+      // Proved never dispatched to spooler: safe to request re-dispatch.
       console.log(`📡 Job ${jobId} was received but never dispatched to spooler locally.`);
-      socket.emit('job_reconciliation_report', { requestId, jobId, status: 'NOT_DISPATCHED' });
+      socket.emit('job_reconciliation_report', {
+        requestId,
+        jobId,
+        status: 'NOT_DISPATCHED',
+        ...binding
+      });
     } else if (entry.state === 'DISPATCH_INTENT') {
-      // Crash boundary: recorded intent to call driver, but spooler handoff unconfirmed.
-      // Physical outcome unknown. Must classify as AMBIGUOUS to prevent duplicate physical print.
-      console.warn(`⚠️ AMBIGUOUS DISPATCH: Job ${jobId} crashed during dispatch intent window. Reporting ambiguous.`);
+      // Driver dispatch intent without confirmed spooler handoff is ambiguous.
+      console.warn(`⚠️ AMBIGUOUS DISPATCH: Job ${jobId} crashed during driver dispatch intent.`);
       socket.emit('print_physical_ambiguous', {
         jobId,
         requestId,
         reason: 'Agent crashed during driver dispatch intent window (unconfirmed spooler handoff)',
-        wasSeenInQueue: false
+        wasSeenInQueue: false,
+        ...binding
       });
     } else if (['COMPLETED_LOCALLY', 'ACKNOWLEDGED'].includes(entry.state)) {
-      // Proved completed
       console.log(`📡 Reporting existing completion evidence for Job ${jobId} (state: ${entry.state})`);
       socket.emit('print_physical_success', {
         jobId,
         requestId,
         reconciled: true,
         dispatchedAt: entry.dispatchedAt || entry.dispatchIntentAt,
-        completedAt: entry.completedAt
+        completedAt: entry.completedAt,
+        ...binding
       });
     } else if (['SPOOLER_ACCEPTED', 'DISPATCHED_TO_SPOOLER', 'SPOOLING'].includes(entry.state)) {
-      // Spooler accepted before crash, but queue clearance was unverified prior to restart
-      console.log(`📡 Job ${jobId} was accepted by spooler prior to crash. Reporting ambiguous.`);
+      console.log(`📡 Job ${jobId} was accepted by spooler prior to Agent restart. Reporting AMBIGUOUS.`);
       socket.emit('print_physical_ambiguous', {
         jobId,
         requestId,
         reason: 'Spooler accepted job before agent restart; physical clearance unverified',
-        wasSeenInQueue: true
+        wasSeenInQueue: true,
+        ...binding
       });
     } else {
-      socket.emit('job_reconciliation_report', { requestId, jobId, status: entry.state });
+      socket.emit('job_reconciliation_report', {
+        requestId,
+        jobId,
+        status: entry.state,
+        ...binding
+      });
     }
   }
 });
