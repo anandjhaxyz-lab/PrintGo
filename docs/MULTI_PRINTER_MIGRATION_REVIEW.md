@@ -149,3 +149,31 @@ The Render Postgres tool connection used for this review exposes database metada
 Render documentation says paid Postgres databases have PITR; the recovery window is 3 days for Hobby workspaces and 7 days for Pro-or-higher workspaces. Logical exports are retained for 7 days on Render and must be downloaded for longer retention. Free compute databases do not support Render-managed backups. The actual workspace tier and the currently displayed backup/export state were not surfaced by the Render API query, so verify both on the Recovery page.
 
 **Migration hold remains in effect:** even after backup/restore is proven, repeat the data preflight after new customer submissions have been paused. The currently live backend auto-deploys and runs `prisma migrate deploy`, so do not merge the candidate or change the watched branch until the approved Staging rollout window and partial-stack deployment guard are ready.
+
+
+## Live Staging source-schema compatibility follow-up (2026-11-19)
+
+A second read-only inspection compared the existing Staging relation columns and foreign keys with the objects/columns consumed by migration 00012 and the following multi-printer migrations.
+
+### Compatibility findings
+
+- All expected legacy source columns used by 00012 are present on `Machine`, `PrinterQr`, `Session`, `PrintJob`, and `PrinterStatus`.
+- Existing source foreign keys are present:
+  - `Machine.companyId -> Company.id` uses `ON DELETE SET NULL`.
+  - `PrinterQr.machineId -> Machine.id` uses `ON DELETE SET NULL`.
+  - `Session.machineId -> Machine.id` and `Session.printerQrId -> PrinterQr.id` use `ON DELETE SET NULL`.
+  - `PrintJob.machineId -> Machine.id` uses `ON DELETE SET NULL`.
+  - `PrinterStatus.machineId -> Machine.id` uses `ON DELETE CASCADE`.
+- `gen_random_uuid()` resolves on the live PostgreSQL 18.6 instance even though `pgcrypto` is not installed. The 00012 UUID backfill function precondition is therefore satisfied.
+- The existing legacy active-per-Machine QR index exists and the target PrinterDevice/PrinterDiscovery/DispatchLease tables and queue snapshot column remain absent.
+- The only Machine has a populated printer model (`EPSON L6460 Series`) but `connectionType` is NULL. This is not a reason to guess the actual Windows queue or connection type. 00012 retains the NULL connection type; physical discovery and explicit Admin approval remain required.
+
+### Session expiry observation
+
+At 2026-11-19 11:33 UTC all 84 existing Session rows had `expiresAt <= now()`, including 5 rows still labelled `CONNECTED` and 75 labelled `WAITING_FOR_MOBILE`; the other 4 were labelled `EXPIRED`. No session was unexpired at query time. The migrations do not update these status values, and this review did not mutate them. Preserve this observation for the Staging smoke-test owner: verify that expired sessions are not surfaced as live customer sessions after the candidate is deployed. Do not mass-update old session statuses as part of migration preparation without a separate product-approved cleanup.
+
+### Operational conclusion
+
+The live source schema is compatible with the required baseline assumptions inspected for 00012–00016, and the UUID function exists. The remaining hard blocker is still the independently verified backup/restore: no export was created or downloaded, no restore drill was run, and PITR/export state and workspace tier could not be established from the available Render API response. Also repeat the row/identity and session-liveness queries after new submissions are paused in the approved maintenance window. The live Render backend is configured to auto-deploy commits and runs `npx prisma migrate deploy` as pre-deploy, so the current watched branch must not be changed by a candidate merge until all operational gates and approval are satisfied.
+
+All queries in this follow-up were read-only. No Staging or Production data, settings, services, branches, or deployments were changed.
