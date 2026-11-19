@@ -248,6 +248,7 @@ describe('Printer Agent protocol — inventory report', () => {
       userType: 'printer',
       machineId: 'machine-a',
       machineName: 'Hyderabad Client PC',
+      agentProtocol: { supportsMultiPrinter: true },
       emit: jest.fn()
     };
     const io = { to: jest.fn(() => adminRoom) };
