@@ -62,6 +62,7 @@ class SpoolerMonitor {
     const { execFile, printerName, journal } = options;
     this.execFile = execFile;
     this.printerName = printerName;
+    this.printerDeviceId = options.printerDeviceId || null;
     this.platform = options.platform || os.platform();
     this.isWin = this.platform === 'win32';
     this.journal = journal;
@@ -158,6 +159,7 @@ class SpoolerMonitor {
       isError,
       errorMessage,
       printerName: this.printerName,
+      ...(this.printerDeviceId ? { printerDeviceId: this.printerDeviceId } : {}),
       connectionType,
       telemetry: {
         memoryUsage: `${memoryUsage}%`,
