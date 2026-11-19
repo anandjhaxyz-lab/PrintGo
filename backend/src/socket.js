@@ -227,7 +227,12 @@ const setupSockets = (io) => {
       // PrinterStatus. This avoids one child printer's health affecting the
       // current single-QR customer availability path before Phase 3 routing.
       if (status?.printerDeviceId) {
-        if (socket.userType !== 'printer' || !socket.machineId || typeof status.printerDeviceId !== 'string') {
+        if (
+          socket.userType !== 'printer' ||
+          !socket.machineId ||
+          socket.agentProtocol?.supportsMultiPrinter !== true ||
+          typeof status.printerDeviceId !== 'string'
+        ) {
           logger.warn('Rejected device telemetry from a non-printer or unauthenticated socket');
           return;
         }
