@@ -286,3 +286,21 @@ This is enough to evidence that PITR is presented as available for the past 3 da
 - Screenshot evidence of 3-day PITR and >=7-day export retention: PASS.
 - Exact PITR `recoveryStatus` / `startsAt`: not captured; remains an optional precision evidence item, not inferred.
 - Staging migration/deploy: still NOT AUTHORIZED until the auto-deploy/branch collision and final candidate approval are resolved.
+
+
+## Required Staging Auto-Deploy containment — next operator action
+
+**Current observed setting:** Render backend `printgo-backend-staging` has `autoDeploy=yes`, `autoDeployTrigger=commit`, linked branch `feature/printgo-production-readiness`, and pre-deploy command `npx prisma migrate deploy`.
+
+Before merging any implementation PR or candidate PR into the linked branch:
+1. Open the exact Render web service `printgo-backend-staging` → **Settings**.
+2. Find **Auto-Deploy** in the Build & Deploy settings section.
+3. Select **Off** (not **After CI Checks Pass**) and save the change.
+4. Refresh the service Settings page and verify Auto-Deploy displays Off.
+5. Re-fetch service metadata / service Deploys + Events and capture evidence that `autoDeploy` is false or `autoDeployTrigger=off`. Do not merge until this is verified.
+
+Why Off rather than After CI Checks Pass: the candidate CI already passes. A successful CI check would therefore allow a deploy after a merge, defeating the need for a manually approved migration window. Off retains manual deploy capability and prevents intermediate stacked-PR merges from automatically deploying.
+
+Official Render instructions: https://render.com/docs/deploys (Settings → Auto-Deploy; Off disables automatic deploys; manual deploys remain available). The checked-in `render.yaml` / Blueprint is not being synced to this existing service as part of this step; do not use Blueprint approval as a substitute for this service-level setting.
+
+**Current state remains unchanged until operator action:** the connected Render tool set does not expose an update-service / Auto-Deploy toggle action. No setting change was made by this runbook update. Once the operator sets Off in the Dashboard, re-read Render metadata to verify before considering any merge.
