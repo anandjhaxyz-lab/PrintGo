@@ -61,7 +61,7 @@ The ledger currently contains migrations through 20261118000011. The stacked mul
 4. 20261119000015_printer_device_dispatch_leases — PR #15
 5. 20261119000016_print_job_queue_snapshot — PR #15
 
-None of migrations 00012–00016 appeared in the inspected Staging migration ledger. PRs #9–#15 are still open Draft PRs and form the code dependency chain. Before any migration, run npx prisma migrate status against the confirmed Staging database using the exact reviewed and integrated release candidate. Verify the complete pending set, including any other migration directories in that candidate; Prisma must apply every pending migration in timestamp order.
+None of migrations 00012–00016 appeared in the inspected Staging migration ledger. PRs #9–#13 and #15 are open Draft PRs and form the active code dependency chain; PR #14 is closed and is not part of the candidate. Before any migration, run npx prisma migrate status against the confirmed Staging database using the exact reviewed and integrated release candidate. Verify the complete pending set, including any other migration directories in that candidate; Prisma must apply every pending migration in timestamp order.
 
 The current CI workflow applies migrations to a disposable PostgreSQL 15 database. The inspected Render Staging database is PostgreSQL 18. The Staging migration execution must therefore be treated as a separate environment gate; CI success alone does not establish that the live Staging database has been migrated.
 
