@@ -1,6 +1,4 @@
 const AppError = require('../utils/AppError');
-const { DISPATCH_LEASE_TTL_MS } = require('./printerDeviceJobBinding.service');
-
 const DISCOVERY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MIN_OPERATOR_REASON_LENGTH = 10;
 
