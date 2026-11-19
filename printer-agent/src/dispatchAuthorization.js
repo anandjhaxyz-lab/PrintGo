@@ -105,6 +105,62 @@ class PrinterDispatchAuthorizer {
     });
   }
 
+  startLeaseRenewal(authorization, input = {}, intervalMs = 25000) {
+    const requestId = typeof authorization?.requestId === 'string' ? authorization.requestId : '';
+    const jobId = typeof input.jobId === 'string' ? input.jobId : '';
+    const printerDeviceId = typeof input.printerDeviceId === 'string' ? input.printerDeviceId : '';
+    const windowsPrinterName = typeof input.windowsPrinterName === 'string' ? input.windowsPrinterName.trim() : '';
+    if (
+      !/^[A-Za-z0-9_-]{1,128}$/.test(requestId) ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(jobId) ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(printerDeviceId) ||
+      !windowsPrinterName
+    ) {
+      throw new PrinterDispatchAuthorizationError(
+        'INVALID_LEASE_IDENTITY',
+        'A valid dispatch authorization and exact job/device/queue identity are required to renew a lease.'
+      );
+    }
+
+    const payload = { requestId, jobId, printerDeviceId, windowsPrinterName };
+    const timer = setInterval(() => {
+      if (this.closed || this.socket.connected === false) return;
+      this.socket.emit('printer_device_dispatch_lease_renewal', payload);
+    }, intervalMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    return () => clearInterval(timer);
+  }
+
+  releaseLease(authorization, input = {}) {
+    const requestId = typeof authorization?.requestId === 'string' ? authorization.requestId : '';
+    const jobId = typeof input.jobId === 'string' ? input.jobId : '';
+    const printerDeviceId = typeof input.printerDeviceId === 'string' ? input.printerDeviceId : '';
+    const windowsPrinterName = typeof input.windowsPrinterName === 'string' ? input.windowsPrinterName.trim() : '';
+    if (
+      !/^[A-Za-z0-9_-]{1,128}$/.test(requestId) ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(jobId) ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(printerDeviceId) ||
+      !windowsPrinterName
+    ) {
+      throw new PrinterDispatchAuthorizationError(
+        'INVALID_LEASE_IDENTITY',
+        'A valid dispatch authorization and exact job/device/queue identity are required to release a lease.'
+      );
+    }
+
+    if (!this.closed && this.socket.connected !== false) {
+      this.socket.emit('printer_device_dispatch_lease_release', {
+        requestId,
+        jobId,
+        printerDeviceId,
+        windowsPrinterName
+      });
+      return true;
+    }
+    return false;
+  }
+
   handleResult(payload) {
     const requestId = typeof payload?.requestId === 'string' ? payload.requestId : '';
     const pending = this.pending.get(requestId);
