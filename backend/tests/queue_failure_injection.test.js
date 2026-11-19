@@ -858,7 +858,7 @@ async function runTests() {
   // 1. Missing journal file initializes clean valid state.
   // 2. Corrupted / unparseable JSON file flags isCorrupted = true.
   // 3. Incomplete journal entry detected by isCorruptedEntry.
-  // 4. Schema version mismatch (> 1) flags isCorrupted = true.
+  // 4. Schema version mismatch (> 2) flags isCorrupted = true.
   // 5. Corrupted journal strictly fails closed during reconciliation (emits AMBIGUOUS, NEVER NOT_DISPATCHED).
   // 6. Atomic file write with fsync verified.
   // -------------------------------------------------------------------------
@@ -871,7 +871,7 @@ async function runTests() {
     if (fs.existsSync(missingFilePath)) fs.unlinkSync(missingFilePath);
     const jMissing = new JobJournal(missingFilePath, { isProvisioning: true });
     assert.strictEqual(jMissing.isCorrupted, false, 'Missing journal file initializes clean without corruption flag');
-    assert.strictEqual(jMissing.version, 1);
+    assert.strictEqual(jMissing.version, 2);
 
     // L2. Corrupted JSON file:
     const corruptFilePath = path.join(testDir, 'corrupt.journal.json');
@@ -930,7 +930,7 @@ async function runTests() {
     // Verify file exists on disk and contains version + jobs payload
     assert.ok(fs.existsSync(atomicPath), 'Journal file persisted to disk');
     const atomicContent = JSON.parse(fs.readFileSync(atomicPath, 'utf8'));
-    assert.strictEqual(atomicContent.version, 1);
+    assert.strictEqual(atomicContent.version, 2);
     assert.strictEqual(atomicContent.jobs.job_durability_1.state, 'DISPATCH_INTENT');
     // Verify no stray temp files remain in directory
     const tempFiles = fs.readdirSync(testDir).filter(f => f.includes('.tmp.'));
@@ -969,7 +969,7 @@ async function runTests() {
     // B1: Fresh installation with no previous journal: clean initialization and marker creation
     const jB1 = new JobJournal(bJournalPath, { markerPath: bMarkerPath, checkKeys: false, isProvisioning: true });
     assert.strictEqual(jB1.isCorrupted, false, 'B1: Fresh install initializes without corruption');
-    assert.strictEqual(jB1.version, 1, 'B1: Schema version 1');
+    assert.strictEqual(jB1.version, 2, 'B1: Schema version 2');
     assert.ok(fs.existsSync(bMarkerPath), 'B1: Installation marker created on fresh install');
     const markerData = JSON.parse(fs.readFileSync(bMarkerPath, 'utf8'));
     assert.ok(markerData.installationId && markerData.installationId.length > 20, 'B1: Marker has valid installation UUID');
