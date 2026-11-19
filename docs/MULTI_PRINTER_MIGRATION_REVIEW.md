@@ -177,3 +177,10 @@ At 2026-11-19 11:33 UTC all 84 existing Session rows had `expiresAt <= now()`, i
 The live source schema is compatible with the required baseline assumptions inspected for 00012–00016, and the UUID function exists. The remaining hard blocker is still the independently verified backup/restore: no export was created or downloaded, no restore drill was run, and PITR/export state and workspace tier could not be established from the available Render API response. Also repeat the row/identity and session-liveness queries after new submissions are paused in the approved maintenance window. The live Render backend is configured to auto-deploy commits and runs `npx prisma migrate deploy` as pre-deploy, so the current watched branch must not be changed by a candidate merge until all operational gates and approval are satisfied.
 
 All queries in this follow-up were read-only. No Staging or Production data, settings, services, branches, or deployments were changed.
+
+
+### Correction: Render Postgres compute plan eligibility
+
+The previously queried Staging database plan is `0.1c-256mb`. Render's current compute plan table identifies `free` as a separate plan ID; `0.1c-256mb` is the paid legacy Basic-256 MB plan. Accordingly, Render-managed PITR and on-demand logical exports are expected to be available for this Staging DB. This eligibility conclusion is based on the plan ID returned by Render plus the current official plan documentation; the actual Recovery page must still confirm the configured recovery window and export state. Workspace tier controls the PITR retention window. Logical exports are retained by Render for seven days and must be downloaded for longer-term retention.
+
+Reference: https://render.com/docs/compute-plans and https://render.com/docs/postgresql-backups.
