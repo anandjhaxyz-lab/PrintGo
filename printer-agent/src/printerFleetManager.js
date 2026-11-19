@@ -127,6 +127,8 @@ class PrinterFleetManager {
     const seenIds = new Set();
     const seenQueueNames = new Set();
     const normalized = registry.map(normalizeDeviceRecord);
+    const nextDevices = new Map();
+    const nextMonitors = new Map();
 
     for (const device of normalized) {
       if (seenIds.has(device.id)) {
@@ -135,20 +137,21 @@ class PrinterFleetManager {
       seenIds.add(device.id);
 
       if (device.windowsPrinterName) {
-        if (seenQueueNames.has(device.windowsPrinterName)) {
+        const queueKey = device.windowsPrinterName.toLowerCase();
+        if (seenQueueNames.has(queueKey)) {
           throw new PrinterFleetError(
             'DUPLICATE_APPROVED_QUEUE',
             `A Windows queue is assigned to more than one PrinterDevice: ${device.windowsPrinterName}`
           );
         }
-        seenQueueNames.add(device.windowsPrinterName);
+        seenQueueNames.add(queueKey);
       }
 
       const discoveredPrinter = device.windowsPrinterName
         ? discoveredByName.get(device.windowsPrinterName) || null
         : null;
       const approvalValid = device.status === ACTIVE_DEVICE_STATUS && !!device.approvedAt;
-      const canPrint = approvalValid && !!discoveredPrinter;
+      let canPrint = approvalValid && !!discoveredPrinter;
       let reason = null;
 
       if (device.status !== ACTIVE_DEVICE_STATUS) {
@@ -161,6 +164,21 @@ class PrinterFleetManager {
         reason = 'WINDOWS_QUEUE_NOT_PRESENT';
       }
 
+      if (canPrint) {
+        const monitor = this.monitorFactory({
+          printerDevice: device,
+          discoveredPrinter,
+          printerName: discoveredPrinter.windowsPrinterName,
+          journal: this.journal
+        });
+        if (!monitor || typeof monitor.checkPrinterStatus !== 'function') {
+          canPrint = false;
+          reason = 'DEVICE_MONITOR_UNAVAILABLE';
+        } else {
+          nextMonitors.set(device.id, monitor);
+        }
+      }
+
       const view = {
         ...device,
         availability: discoveredPrinter ? 'QUEUE_PRESENT' : 'QUEUE_MISSING',
@@ -168,19 +186,12 @@ class PrinterFleetManager {
         reason,
         discoveredPrinter
       };
-      this.devices.set(device.id, view);
-
-      if (canPrint) {
-        const monitor = this.monitorFactory({
-          printerDevice: view,
-          discoveredPrinter,
-          printerName: discoveredPrinter.windowsPrinterName,
-          journal: this.journal
-        });
-        if (monitor) this.monitors.set(device.id, monitor);
-      }
+      nextDevices.set(device.id, view);
     }
 
+    // Publish a complete, internally consistent snapshot only after all rows pass validation.
+    this.devices = nextDevices;
+    this.monitors = nextMonitors;
     this.discoveredPrinters = Array.from(discoveredByName.values());
     this.lastRefreshAt = new Date().toISOString();
     return this.listDevices();
