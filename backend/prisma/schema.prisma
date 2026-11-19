@@ -91,6 +91,7 @@ model Machine {
   sessions        Session[]
   printerQrs      PrinterQr[]
   printerDevices  PrinterDevice[]
+  printerDiscoveries PrinterDiscovery[]
   printPricingProfile PrintPricingProfile?
   advertisements  Advertisement[]
 
@@ -144,6 +145,32 @@ model PrinterDevice {
 
   @@index([machineId, status])
   @@index([machineId, healthStatus])
+  @@unique([machineId, windowsPrinterName])
+}
+
+model PrinterDiscovery {
+  id                       String   @id @default(uuid())
+  machineId                String
+  machine                  Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  windowsPrinterName       String
+  queueNameKey             String
+  driverName               String?
+  portName                 String?
+  connectionType           String   @default("Unknown")
+  printerStatus            String?
+  detectedErrorState       String?
+  workOffline              Boolean?
+  shared                   Boolean?
+  network                  Boolean?
+  isDefault                Boolean  @default(false)
+  reviewStatus             String   @default("DISCOVERED")
+  approvedPrinterDeviceId  String?
+  lastSeenAt               DateTime @default(now())
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@unique([machineId, queueNameKey])
+  @@index([machineId, reviewStatus, lastSeenAt])
 }
 
 model PrinterQr {

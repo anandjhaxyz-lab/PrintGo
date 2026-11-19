@@ -8,6 +8,15 @@ const {
   handlePrinterDeviceTelemetry
 } = require('../src/services/printerAgentProtocol.service');
 
+function createInventoryPrisma() {
+  const tx = {
+    printerDiscovery: {
+      upsert: jest.fn(async ({ create }) => ({ id: 'discovery-a', ...create }))
+    }
+  };
+  return { tx, $transaction: jest.fn(async (callback) => callback(tx)) };
+}
+
 function windowsHello(overrides = {}) {
   return {
     protocolVersion: AGENT_PROTOCOL_VERSION,
@@ -332,7 +341,7 @@ describe('Printer Agent protocol — inventory report', () => {
     })).toThrow(expect.objectContaining({ code: 'DUPLICATE_DISCOVERED_QUEUE' }));
   });
 
-  test('rejects invalid inventory metadata and never forwards invalid input', () => {
+  test('rejects invalid inventory metadata and never forwards invalid input', async () => {
     const socket = {
       userType: 'printer',
       machineId: 'machine-a',
@@ -342,9 +351,10 @@ describe('Printer Agent protocol — inventory report', () => {
     };
     const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
 
-    const result = handlePrinterInventoryReport({
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma: createInventoryPrisma(),
       logger: { warn: jest.fn() },
       payload: {
         protocolVersion: 1,
@@ -363,7 +373,7 @@ describe('Printer Agent protocol — inventory report', () => {
     }));
   });
 
-  test('forwards valid inventory only to Admin sockets and does not create/approve devices', () => {
+  test('persists discovery then forwards inventory to Admin sockets without approving a device', async () => {
     const adminRoom = { emit: jest.fn() };
     const socket = {
       userType: 'printer',
@@ -374,9 +384,11 @@ describe('Printer Agent protocol — inventory report', () => {
     };
     const io = { to: jest.fn(() => adminRoom) };
 
-    const result = handlePrinterInventoryReport({
+    const prisma = createInventoryPrisma();
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma,
       logger: { warn: jest.fn() },
       payload: {
         protocolVersion: 1,
@@ -390,6 +402,11 @@ describe('Printer Agent protocol — inventory report', () => {
     });
 
     expect(result).toEqual({ accepted: true, receivedCount: 1 });
+    expect(prisma.tx.printerDiscovery.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      where: { machineId_queueNameKey: { machineId: 'machine-a', queueNameKey: 'epson l6460' } },
+      create: expect.objectContaining({ reviewStatus: 'DISCOVERED', windowsPrinterName: 'Epson L6460' })
+    }));
+    expect(prisma.tx.printerDiscovery.upsert.mock.calls[0][0].update).not.toHaveProperty('reviewStatus');
     expect(io.to).toHaveBeenCalledWith('admins');
     expect(adminRoom.emit).toHaveBeenCalledWith('printer_inventory_report', expect.objectContaining({
       machineId: 'machine-a',
@@ -402,16 +419,17 @@ describe('Printer Agent protocol — inventory report', () => {
     }));
   });
 
-  test('refuses inventory reports before successful multi-printer negotiation', () => {
+  test('refuses inventory reports before successful multi-printer negotiation', async () => {
     const socket = {
       userType: 'printer',
       machineId: 'machine-a',
       emit: jest.fn()
     };
     const io = { to: jest.fn() };
-    const result = handlePrinterInventoryReport({
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma: createInventoryPrisma(),
       logger: { warn: jest.fn() },
       payload: { protocolVersion: 1, discoveredPrinters: [] }
     });
@@ -424,12 +442,13 @@ describe('Printer Agent protocol — inventory report', () => {
     }));
   });
 
-  test('refuses inventory reports from non-printer sockets', () => {
+  test('refuses inventory reports from non-printer sockets', async () => {
     const socket = { userType: 'session', machineId: 'machine-a', emit: jest.fn() };
     const io = { to: jest.fn() };
-    const result = handlePrinterInventoryReport({
+    const result = await handlePrinterInventoryReport({
       socket,
       io,
+      prisma: createInventoryPrisma(),
       logger: { warn: jest.fn() },
       payload: { protocolVersion: 1, discoveredPrinters: [] }
     });

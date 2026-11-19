@@ -143,10 +143,9 @@ const setupSockets = (io) => {
       await handlePrinterAgentHello({ socket, prisma, logger, payload });
     });
 
-    // Discovery is advisory only. This event never approves, binds, creates or
-    // mutates PrinterDevice records; it is forwarded to Admin sockets for review.
-    socket.on('printer_inventory_report', (payload) => {
-      handlePrinterInventoryReport({ socket, io, logger, payload });
+    // Discovery is persisted for Admin review only; it never approves a device.
+    socket.on('printer_inventory_report', async (payload) => {
+      await handlePrinterInventoryReport({ socket, io, logger, prisma, payload });
     });
 
     // Kiosk <-> Mobile Sync

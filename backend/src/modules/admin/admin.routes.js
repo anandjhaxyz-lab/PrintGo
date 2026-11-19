@@ -132,6 +132,10 @@ router.post('/reconciliation/:id/resolve', restrictTo('SUPERADMIN'), adminContro
 // PERMANENT PRINTER QR MANAGEMENT (Phase 2)
 // ==============================================
 const printerQrAdminController = require('./printerQr.admin.controller');
+const printerDiscoveryAdminController = require('./printerDiscovery.admin.controller');
+
+router.get('/printer-discoveries', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.listPrinterDiscoveries);
+router.post('/printer-discoveries/:id/approve', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerDiscoveryAdminController.approvePrinterDiscovery);
 
 router.get('/printer-qrs', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.listPrinterQrs);
 router.get('/printer-qrs/:id', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.getPrinterQrById);
