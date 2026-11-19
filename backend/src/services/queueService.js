@@ -32,11 +32,34 @@ let globalIo = null;
 
 const processJob = async (shortId) => {
   try {
-    const dbJob = await prisma.printJob.findUnique({ 
+    const dbJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true }
+      include: { document: true, printerDevice: true }
     });
     if (!dbJob) return;
+
+    // Device-bound jobs are dispatched only after the explicit feature gate and
+    // a fresh DB check of Machine ownership, approval evidence and exact queue.
+    // Legacy Machine-QR jobs (printerDeviceId=null) retain the original route.
+    if (dbJob.printerDeviceId) {
+      const device = dbJob.printerDevice;
+      if (process.env.ENABLE_MULTI_PRINTER_DISPATCH !== 'true') {
+        console.warn(`Job ${shortId}: multi-printer dispatch feature gate is disabled; no physical dispatch was attempted.`);
+        return;
+      }
+      if (
+        !device ||
+        device.id !== dbJob.printerDeviceId ||
+        device.machineId !== dbJob.machineId ||
+        device.status !== 'ACTIVE' ||
+        !device.approvedAt ||
+        typeof device.windowsPrinterName !== 'string' ||
+        !device.windowsPrinterName.trim()
+      ) {
+        console.error(`Job ${shortId}: PrinterDevice mapping is not approved, active and queue-bound to its Machine. Dispatch refused.`);
+        return;
+      }
+    }
 
     // Validate state transition using state machine
     if (!isValidJobTransition(dbJob.status, 'PRINTING')) {
@@ -47,7 +70,11 @@ const processJob = async (shortId) => {
     // Atomic test-and-set: guarantee exactly-once transition from WAITING to PRINTING
     // Ensures concurrent dispatches, interruptions, and admin retries cannot duplicate physical prints
     const updateResult = await prisma.printJob.updateMany({
-      where: { shortId, status: 'WAITING' },
+      where: {
+        shortId,
+        status: 'WAITING',
+        printerDeviceId: dbJob.printerDeviceId || null
+      },
       data: { status: 'PRINTING' }
     });
 
@@ -58,8 +85,36 @@ const processJob = async (shortId) => {
 
     const updatedJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true }
+      include: { document: true, printerDevice: true }
     });
+
+    // Re-check immediately before sending the Agent event. A concurrent Admin
+    // disable/remap after the initial read must fail closed, never fall back.
+    if (updatedJob?.printerDeviceId) {
+      const device = updatedJob.printerDevice;
+      const deviceStillValid = Boolean(
+        process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true' &&
+        device &&
+        device.id === updatedJob.printerDeviceId &&
+        device.machineId === updatedJob.machineId &&
+        device.status === 'ACTIVE' &&
+        device.approvedAt &&
+        typeof device.windowsPrinterName === 'string' &&
+        device.windowsPrinterName.trim()
+      );
+      if (!deviceStillValid) {
+        await prisma.printJob.updateMany({
+          where: {
+            shortId,
+            status: 'PRINTING',
+            printerDeviceId: updatedJob.printerDeviceId
+          },
+          data: { status: 'WAITING' }
+        });
+        console.error(`Job ${shortId}: PrinterDevice became unavailable before dispatch; restored job to WAITING. No fallback printer used.`);
+        return;
+      }
+    }
 
     if (globalIo) {
         // Emit status change to machine room + admins only
@@ -79,7 +134,11 @@ const processJob = async (shortId) => {
           },
           price: updatedJob.cost,
           encryptedKey: updatedJob.encryptedKey,
-          iv: updatedJob.iv
+          iv: updatedJob.iv,
+          ...(updatedJob.printerDeviceId ? {
+            printerDeviceId: updatedJob.printerDeviceId,
+            windowsPrinterName: updatedJob.printerDevice.windowsPrinterName
+          } : {})
         };
         
         if (updatedJob.machineId) {
@@ -106,6 +165,9 @@ const initWorker = async (io) => {
   if (printWorker && workerReady) return printWorker;
 
   try {
+    // Keep the backend event publisher single-threaded so Agent receipt order is
+    // deterministic. Per-device lanes in the Agent serialize same-printer work
+    // while allowing independent printers to download/submit in parallel.
     printWorker = new Worker('printQueue', async (job) => {
       const { shortId } = job.data;
       await processJob(shortId);
