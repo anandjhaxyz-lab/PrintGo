@@ -112,6 +112,9 @@ const bindDiscoveredPrinterDevice = async (machineId, data = {}, user) => {
       if (!existingBinding) {
         throw new AppError('Discovery record contains an invalid device binding. Manual review is required.', 409);
       }
+      if (normalizeQueueKey(existingBinding.windowsPrinterName) !== discovery.queueNameKey) {
+        throw new AppError('Discovery record is linked to a device with a different Windows queue. Manual review is required.', 409);
+      }
       return { device: existingBinding, alreadyBound: true };
     }
 
