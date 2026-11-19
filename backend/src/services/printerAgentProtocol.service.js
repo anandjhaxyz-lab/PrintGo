@@ -305,6 +305,85 @@ function handlePrinterInventoryReport({ socket, io, logger, payload }) {
   }
 }
 
+async function handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status }) {
+  if (socket?.userType !== 'printer' || !socket.machineId) {
+    return { accepted: false, code: 'UNAUTHORIZED_AGENT' };
+  }
+  if (socket.agentProtocol?.supportsMultiPrinter !== true) {
+    return { accepted: false, code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' };
+  }
+
+  try {
+    if (!isPlainObject(status) || typeof status.isError !== 'boolean') {
+      throw new PrinterAgentProtocolError('INVALID_DEVICE_TELEMETRY', 'Device telemetry status must contain a boolean isError field.');
+    }
+
+    const printerDeviceId = boundedText(status.printerDeviceId, 128, 'printerDeviceId', true);
+    const device = await prisma.printerDevice.findFirst({
+      where: {
+        id: printerDeviceId,
+        machineId: socket.machineId
+      },
+      select: { id: true }
+    });
+
+    if (!device) {
+      logger?.warn?.(`Rejected printer telemetry: device ${printerDeviceId} does not belong to Machine ${socket.machineId}`);
+      return { accepted: false, code: 'DEVICE_MACHINE_MISMATCH' };
+    }
+
+    const errorMessage = boundedText(status.errorMessage, 128, 'errorMessage') || '';
+    const message = errorMessage.toLowerCase();
+    let healthStatus = 'UNKNOWN';
+
+    if (status.isError === false) {
+      healthStatus = 'ONLINE';
+    } else if (message.includes('out of paper') || message.includes('paper out')) {
+      healthStatus = 'PAPER_OUT';
+    } else if (message.includes('paper jam') || message.includes('jam')) {
+      healthStatus = 'JAMMED';
+    } else if (message.includes('offline') || message.includes('unplugged')) {
+      healthStatus = 'OFFLINE';
+    } else {
+      healthStatus = 'ERROR';
+    }
+
+    const connectionType = ['USB', 'Network', 'Unknown'].includes(status.connectionType)
+      ? status.connectionType
+      : 'Unknown';
+    const printerName = boundedText(status.printerName, MAX_QUEUE_NAME_LENGTH, 'printerName');
+    const lastTelemetryAt = new Date();
+
+    await prisma.printerDevice.update({
+      where: { id: device.id },
+      data: { healthStatus, lastTelemetryAt }
+    });
+
+    const sourceTelemetry = isPlainObject(status.telemetry) ? status.telemetry : {};
+    const telemetry = {
+      connectionType,
+      portName: boundedText(sourceTelemetry.portName, MAX_QUEUE_NAME_LENGTH, 'telemetry.portName')
+    };
+
+    io.to('admins').emit('printer_device_status_update', {
+      machineId: socket.machineId,
+      printerDeviceId: device.id,
+      printerName,
+      connectionType,
+      isError: status.isError,
+      errorMessage,
+      telemetry,
+      healthStatus,
+      lastTelemetryAt: lastTelemetryAt.toISOString()
+    });
+
+    return { accepted: true, printerDeviceId: device.id, healthStatus };
+  } catch (error) {
+    logger?.warn?.(`Rejected device telemetry from Machine ${socket.machineId}:`, error.message);
+    return { accepted: false, code: error.code || 'INVALID_DEVICE_TELEMETRY' };
+  }
+}
+
 module.exports = {
   AGENT_PROTOCOL_VERSION,
   MAX_REGISTERED_PRINTERS,
@@ -314,5 +393,6 @@ module.exports = {
   getPrinterDeviceRegistry,
   validateDiscoveredPrinterInventory,
   handlePrinterAgentHello,
-  handlePrinterInventoryReport
+  handlePrinterInventoryReport,
+  handlePrinterDeviceTelemetry
 };
