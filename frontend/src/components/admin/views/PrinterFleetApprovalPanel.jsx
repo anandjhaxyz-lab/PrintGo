@@ -140,6 +140,36 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
     }
   };
 
+  const enableDevice = async (device) => {
+    if (!canApprove || busyId) return;
+    const reason = window.prompt('Reason for re-enabling this printer (minimum 10 characters):');
+    if (reason === null) return;
+    if (reason.trim().length < 10) {
+      setError('Please enter a reason with at least 10 characters.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Re-enable "${device.displayName}"? The backend will verify that its exact Windows queue was recently rediscovered on this Machine.`
+    );
+    if (!confirmed) return;
+
+    setBusyId(device.id);
+    setError('');
+    setSuccess('');
+    try {
+      await axios.post(
+        `${API_URL}/api/admin/printer-devices/${device.id}/enable`,
+        { reason: reason.trim() }
+      );
+      setSuccess(`${device.displayName} is active again. Its existing permanent QR and device identity are unchanged.`);
+      await loadFleet();
+    } catch (enableError) {
+      setError(enableError.response?.data?.error || enableError.message || 'Printer re-enable failed.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const remapDevice = async (device) => {
     if (!canApprove || busyId) return;
     const candidates = discoveries.filter((item) =>
@@ -298,7 +328,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       </div>
 
       <div style={{ marginTop: '1.25rem', paddingTop: '1rem', borderTop: '1px solid #e2e8f0' }}>
-        <h4 style={{ margin: '0 0 0.55rem', fontSize: '0.82rem', color: '#0f172a' }}>Approved physical printers ({devices.length})</h4>
+        <h4 style={{ margin: '0 0 0.55rem', fontSize: '0.82rem', color: '#0f172a' }}>Registered physical printers ({devices.length})</h4>
         {devices.length === 0 ? (
           <p style={{ color: '#64748b', fontSize: '0.78rem' }}>Approved printers will appear here. Each one can have its own permanent customer QR.</p>
         ) : (
@@ -367,7 +397,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
                   >
                     {busyId === device.id ? 'Updating…' : 'Remap queue'}
                   </button>
-                  {device.status === 'ACTIVE' && (
+                  {device.status === 'ACTIVE' ? (
                     <button
                       type="button"
                       onClick={() => disableDevice(device)}
@@ -376,7 +406,16 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
                     >
                       Disable printer
                     </button>
-                  )}
+                  ) : device.status === 'DISABLED' ? (
+                    <button
+                      type="button"
+                      onClick={() => enableDevice(device)}
+                      disabled={!canApprove || busyId !== null || Boolean(device.dispatchLease)}
+                      style={{ flex: 1, padding: '7px 8px', border: '1px solid #059669', borderRadius: '8px', background: '#fff', color: '#047857', fontWeight: 700, fontSize: '0.7rem', cursor: !canApprove || busyId !== null || device.dispatchLease ? 'not-allowed' : 'pointer', opacity: device.dispatchLease ? 0.55 : 1 }}
+                    >
+                      Enable printer
+                    </button>
+                  ) : null}
                 </div>
               </article>
             ))}
