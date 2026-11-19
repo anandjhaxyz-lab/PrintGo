@@ -304,3 +304,36 @@ Why Off rather than After CI Checks Pass: the candidate CI already passes. A suc
 Official Render instructions: https://render.com/docs/deploys (Settings → Auto-Deploy; Off disables automatic deploys; manual deploys remain available). The checked-in `render.yaml` / Blueprint is not being synced to this existing service as part of this step; do not use Blueprint approval as a substitute for this service-level setting.
 
 **Current state remains unchanged until operator action:** the connected Render tool set does not expose an update-service / Auto-Deploy toggle action. No setting change was made by this runbook update. Once the operator sets Off in the Dashboard, re-read Render metadata to verify before considering any merge.
+
+
+## Auto-Deploy disabled — verified on Render — 2026-11-19
+
+The operator changed the Render service setting, and the connected Render service metadata independently confirms:
+- Service: `printgo-backend-staging` (`srv-dbqpapon74is73csbc80`)
+- `autoDeploy=no`
+- `autoDeployTrigger=off`
+- Linked branch remains `feature/printgo-production-readiness`
+- Pre-deploy command remains `npx prisma migrate deploy`
+- Maintenance Mode remains `enabled=true`
+
+Render event history records:
+- Event type: `auto_deploy_disabled`
+- Event ID: `evt-dbvg10jm8hqs739sn640`
+- Timestamp: `2026-11-19T13:58:26.361858Z`
+- Details: `fromTrigger=commit`, `reason=setting_change`
+
+The latest listed deployment remains commit `cb4859550276bc73f1d4d3c07fc9fe011560878e`, finished `2026-11-18T23:30:33.061216Z`; the Events response after the setting change showed only `auto_deploy_disabled`, not a new deploy. Thus Auto-Deploy has been disabled without triggering a deployment.
+
+This closes the **automatic deployment containment** gate. It does not disable the configured pre-deploy migration command: any later manual deployment of the current service will still run `npx prisma migrate deploy`. A manual deploy must therefore happen only after explicit approval of the exact integrated candidate and migration sequence.
+
+### Candidate dependency note
+PR #18 is still Draft/unmerged and is based on `feature/printgo-production-readiness`; its changed files include migrations 00012–00016 plus backend/frontend/Agent implementation. PR #17 is a separate Draft/unmerged PR changing only `render.yaml` and `.github/workflows/ci.yml`; it is not part of PR #18's candidate branch. The PR #17 `render.yaml` explicitly labels itself as a legacy standalone Blueprint and warns it does not describe the live Staging service. Do not sync that Blueprint into the current workspace as a shortcut for this rollout.
+
+### Next required release review
+- Have the complete stacked implementation reviewed (PRs #9–#15 and candidate #18; currently Draft/unmerged, no submitted reviews returned on last inspection).
+- Keep the PR #17 Blueprint change separate; do not apply it to live Render as part of the Staging migration.
+- Obtain exact candidate release approval and record the exact commit SHA.
+- Run `npx prisma migrate status` against the confirmed Staging database from the approved candidate using a trusted secret context (never expose DATABASE_URL in chat/log output).
+- Recheck the DB preflight immediately before migration and manually trigger the approved deploy only after the release operator authorizes it.
+
+**Decision:** Auto-Deploy containment PASS. Maintenance Mode stays ON. Staging migration/deploy and reopening are still NOT AUTHORIZED. Production remains untouched.
