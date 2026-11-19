@@ -988,6 +988,118 @@ async function runTestSuite() {
     else process.env.ENABLE_MULTI_PRINTER_DISPATCH = previousMultiPrinterFlag;
   });
 
+  // Case 21: PR9 placeholder-bound historical Machine QR remains legacy-compatible.
+  await test('Case 21: Historical placeholder-bound Machine QR still creates a Machine-scoped session and job', async () => {
+    const previousFlag = process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    delete process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+
+    let placeholder = await prisma.printerDevice.findFirst({
+      where: {
+        machineId: machineA.id,
+        isDefault: true,
+        status: 'DISCOVERY_REQUIRED',
+        approvedAt: null,
+        windowsPrinterName: null
+      }
+    });
+    if (!placeholder) {
+      placeholder = await prisma.printerDevice.create({
+        data: {
+          machineId: machineA.id,
+          displayName: 'Legacy Primary Printer (pending discovery)',
+          windowsPrinterName: null,
+          status: 'DISCOVERY_REQUIRED',
+          healthStatus: 'UNKNOWN',
+          isDefault: true,
+          sortOrder: 0
+        }
+      });
+    }
+
+    await prisma.printerQr.updateMany({
+      where: { printerDeviceId: placeholder.id, status: 'ACTIVE' },
+      data: { status: 'REVOKED', revokedReason: 'Resetting legacy placeholder QR test' }
+    });
+
+    const legacyBoundQr = await prisma.printerQr.create({
+      data: {
+        publicCode: printerQrService.generateSecurePublicCode(),
+        label: 'Legacy Machine QR (backfilled placeholder)',
+        status: 'ACTIVE',
+        machineId: machineA.id,
+        printerDeviceId: placeholder.id,
+        generatedBy: operatorUser.id
+      }
+    });
+
+    const publicInfo = await printerQrService.getPublicPrinterQrInfo(legacyBoundQr.publicCode);
+    assert(publicInfo.printer.name === machineA.name, 'Legacy placeholder label must not leak as the customer-facing printer name');
+
+    const resolved = await printerQrService.resolvePrinterQr(legacyBoundQr.publicCode);
+    const legacySession = await prisma.session.findUnique({ where: { code: resolved.sessionCode } });
+    assert(legacySession.machineId === machineA.id, 'Legacy placeholder QR must still bind to its Machine');
+    assert(legacySession.printerQrId === legacyBoundQr.id, 'Legacy placeholder QR must retain its permanent QR reference');
+    assert(legacySession.printerDeviceId === null, 'A pending-discovery placeholder must not become a customer print target');
+
+    const { req, res, next, getStatusCode, getResponseData, getError } = createMockReqRes({
+      body: {
+        file: {
+          originalName: 'LegacyPlaceholderJob.pdf',
+          filename: 'LegacyPlaceholderJob_' + Date.now() + '.pdf',
+          mimetype: 'application/pdf',
+          size: 2048,
+          pages: 1
+        },
+        settings: {
+          color: 'bw',
+          duplex: 'single',
+          copies: 1,
+          pageRangeType: 'all',
+          pagesToPrint: 1
+        }
+      },
+      session: { sessionId: resolved.sessionCode, machineId: machineA.id, role: 'mobile' }
+    });
+    await jobsController.createJob(req, res, next);
+    assert(!getError(), `Legacy placeholder job must be accepted: ${getError()?.message}`);
+    assert(getStatusCode() === 200, 'Legacy placeholder job should return HTTP 200');
+    assert(getResponseData().job.printerDeviceId === null, 'Legacy placeholder job must remain Machine-scoped');
+
+    if (previousFlag === undefined) delete process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    else process.env.ENABLE_MULTI_PRINTER_DISPATCH = previousFlag;
+  });
+
+  // Case 22: Real device QR stays unavailable until Agent per-printer dispatch is enabled.
+  await test('Case 22: Device QR activation and scanning are fail-closed while dispatch feature flag is off', async () => {
+    const previousFlag = process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    delete process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    const device = await prisma.printerDevice.findFirst({
+      where: { machineId: machineA.id, windowsPrinterName: 'PHASE4-QUEUE-COUNTER-A' }
+    });
+    const currentQr = await prisma.printerQr.findFirst({
+      where: { printerDeviceId: device.id, status: 'ACTIVE' }
+    });
+
+    let generateBlocked = false;
+    try {
+      await printerQrService.generatePrinterDeviceQr(device.id, { label: 'Must stay gated' }, operatorUser);
+    } catch (error) {
+      generateBlocked = error.statusCode === 503;
+    }
+    assert(generateBlocked, 'Device QR creation must remain disabled unless multi-printer dispatch is enabled');
+
+    let resolveBlocked = false;
+    try {
+      await printerQrService.resolvePrinterQr(currentQr.publicCode);
+    } catch (error) {
+      resolveBlocked = error.statusCode === 503;
+    }
+    assert(resolveBlocked, 'An existing device QR must not create customer sessions while dispatch is disabled');
+
+    if (previousFlag === undefined) delete process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    else process.env.ENABLE_MULTI_PRINTER_DISPATCH = previousFlag;
+  });
+
   console.log('\n======================================================================');
   console.log(`PHASE 4 TEST SUMMARY: ${passed} PASSED, ${failed} FAILED`);
   console.log('======================================================================\n');

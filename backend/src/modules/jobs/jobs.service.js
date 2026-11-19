@@ -130,19 +130,32 @@ const createJob = async (jobData) => {
           machineId: true,
           status: true,
           approvedAt: true,
-          windowsPrinterName: true
+          windowsPrinterName: true,
+          isDefault: true
         }
       });
-      if (
-        !device ||
-        device.machineId !== resolvedMachineId ||
-        device.status !== 'ACTIVE' ||
-        !device.approvedAt ||
-        !device.windowsPrinterName?.trim()
-      ) {
-        throw new AppError('The physical printer selected by this QR is no longer approved or active. Please contact shop staff.', 409);
+      const isLegacyPlaceholder = Boolean(
+        device &&
+        device.isDefault === true &&
+        device.status === 'DISCOVERY_REQUIRED' &&
+        !device.approvedAt &&
+        !device.windowsPrinterName
+      );
+
+      // Phase 1 backfilled historic Machine QR sessions to an unbound primary
+      // placeholder. Preserve those legacy sessions as Machine-scoped jobs.
+      if (!isLegacyPlaceholder) {
+        if (
+          !device ||
+          device.machineId !== resolvedMachineId ||
+          device.status !== 'ACTIVE' ||
+          !device.approvedAt ||
+          !device.windowsPrinterName?.trim()
+        ) {
+          throw new AppError('The physical printer selected by this QR is no longer approved or active. Please contact shop staff.', 409);
+        }
+        resolvedPrinterDeviceId = device.id;
       }
-      resolvedPrinterDeviceId = device.id;
     }
   }
 
