@@ -263,7 +263,7 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
   }
 }
 
-function handlePrinterInventoryReport({ socket, io, logger, payload }) {
+async function handlePrinterInventoryReport({ socket, io, prisma, logger, payload }) {
   if (socket?.userType !== 'printer' || !socket.machineId) {
     return { accepted: false, code: 'UNAUTHORIZED_AGENT' };
   }
@@ -276,24 +276,9 @@ function handlePrinterInventoryReport({ socket, io, logger, payload }) {
     return { accepted: false, code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' };
   }
 
+  let discoveredPrinters;
   try {
-    const discoveredPrinters = validateDiscoveredPrinterInventory(payload);
-    const report = {
-      machineId: socket.machineId,
-      machineName: socket.machineName || null,
-      reportedAt: new Date().toISOString(),
-      discoveredPrinters
-    };
-
-    // Inventory is advisory and forwarded to Admin sockets; it never approves,
-    // binds, creates or changes PrinterDevice records.
-    io.to('admins').emit('printer_inventory_report', report);
-    socket.emit('printer_inventory_report_ack', {
-      accepted: true,
-      machineId: socket.machineId,
-      receivedCount: discoveredPrinters.length
-    });
-    return { accepted: true, receivedCount: discoveredPrinters.length };
+    discoveredPrinters = validateDiscoveredPrinterInventory(payload);
   } catch (error) {
     logger?.warn?.(`Rejected printer inventory report from Machine ${socket.machineId}:`, error.message);
     socket.emit('printer_inventory_report_ack', {
@@ -302,6 +287,119 @@ function handlePrinterInventoryReport({ socket, io, logger, payload }) {
       message: error.message
     });
     return { accepted: false, code: error.code || 'INVALID_INVENTORY_REPORT' };
+  }
+
+  try {
+    if (!prisma?.printerDiscovery || typeof prisma.$transaction !== 'function') {
+      throw new PrinterAgentProtocolError('INVENTORY_PERSISTENCE_UNAVAILABLE', 'Printer discovery persistence is unavailable.');
+    }
+
+    const reportedAt = new Date();
+    const persisted = await prisma.$transaction(async (tx) => {
+      // Serialize reports for this PC so an older inventory cannot race a newer one.
+      const machineRows = await tx.$queryRawUnsafe(
+        'SELECT "id" FROM "Machine" WHERE "id" = $1 FOR UPDATE',
+        socket.machineId
+      );
+      if (!machineRows || machineRows.length === 0) {
+        throw new PrinterAgentProtocolError('MACHINE_NOT_FOUND', 'Authenticated Machine no longer exists.');
+      }
+
+      // Anything not present in this full snapshot becomes absent; historic rows remain.
+      await tx.printerDiscovery.updateMany({
+        where: { machineId: socket.machineId },
+        data: { isPresent: false }
+      });
+
+      const rows = [];
+      for (const printer of discoveredPrinters) {
+        const queueNameKey = printer.windowsPrinterName.toLocaleLowerCase('en-US');
+        const createData = {
+          machineId: socket.machineId,
+          windowsPrinterName: printer.windowsPrinterName,
+          queueNameKey,
+          driverName: printer.driverName,
+          portName: printer.portName,
+          connectionType: printer.connectionType,
+          printerStatus: printer.printerStatus === null ? null : String(printer.printerStatus),
+          detectedErrorState: printer.detectedErrorState === null ? null : String(printer.detectedErrorState),
+          workOffline: printer.workOffline,
+          shared: printer.shared,
+          network: printer.network,
+          isDefault: printer.isDefault,
+          isPresent: true,
+          firstSeenAt: reportedAt,
+          lastSeenAt: reportedAt
+        };
+        const updateData = {
+          windowsPrinterName: printer.windowsPrinterName,
+          driverName: printer.driverName,
+          portName: printer.portName,
+          connectionType: printer.connectionType,
+          printerStatus: createData.printerStatus,
+          detectedErrorState: createData.detectedErrorState,
+          workOffline: printer.workOffline,
+          shared: printer.shared,
+          network: printer.network,
+          isDefault: printer.isDefault,
+          isPresent: true,
+          lastSeenAt: reportedAt
+          // Deliberately omit printerDeviceId: discovery must never bind a device.
+        };
+
+        rows.push(await tx.printerDiscovery.upsert({
+          where: {
+            machineId_queueNameKey: {
+              machineId: socket.machineId,
+              queueNameKey
+            }
+          },
+          create: createData,
+          update: updateData
+        }));
+      }
+      return rows;
+    }, { maxWait: 10000, timeout: 15000 });
+
+    const report = {
+      machineId: socket.machineId,
+      machineName: socket.machineName || null,
+      reportedAt: reportedAt.toISOString(),
+      discoveredPrinters: persisted.map((row) => ({
+        id: row.id,
+        windowsPrinterName: row.windowsPrinterName,
+        driverName: row.driverName,
+        portName: row.portName,
+        connectionType: row.connectionType,
+        printerStatus: row.printerStatus,
+        detectedErrorState: row.detectedErrorState,
+        workOffline: row.workOffline,
+        shared: row.shared,
+        network: row.network,
+        isDefault: row.isDefault,
+        isPresent: row.isPresent,
+        printerDeviceId: row.printerDeviceId || null,
+        firstSeenAt: row.firstSeenAt,
+        lastSeenAt: row.lastSeenAt
+      }))
+    };
+
+    // Persist first. Only a successful, committed snapshot reaches Admin sockets.
+    io.to('admins').emit('printer_inventory_report', report);
+    socket.emit('printer_inventory_report_ack', {
+      accepted: true,
+      machineId: socket.machineId,
+      receivedCount: persisted.length
+    });
+    return { accepted: true, receivedCount: persisted.length };
+  } catch (error) {
+    logger?.warn?.(`Failed to persist printer inventory from Machine ${socket.machineId}:`, error.message);
+    socket.emit('printer_inventory_report_ack', {
+      accepted: false,
+      code: error.code || 'INVENTORY_PERSIST_FAILED',
+      message: 'Printer inventory could not be saved. No Admin inventory update was published.'
+    });
+    return { accepted: false, code: error.code || 'INVENTORY_PERSIST_FAILED' };
   }
 }
 
