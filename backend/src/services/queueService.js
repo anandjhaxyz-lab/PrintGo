@@ -3,6 +3,85 @@ const { connection } = require('./redisClient');
 const prisma = require('../utils/prisma');
 const { isValidJobTransition } = require('../utils/stateMachine');
 
+/**
+ * A queue item must never disappear while leaving a paid device-bound job in
+ * WAITING. If authorization fails before Agent dispatch, terminally fail the
+ * job, record the reason, notify watchers, and refund a successful payment.
+ */
+const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
+  if (!job?.shortId || !job?.printerDeviceId || !['WAITING', 'PRINTING'].includes(expectedStatus)) {
+    return false;
+  }
+  // WAITING jobs have not entered the Agent/driver path and may only be
+  // CANCELLED; once claimed as PRINTING, the state machine allows FAILED.
+  const terminalStatus = expectedStatus === 'WAITING' ? 'CANCELLED' : 'FAILED';
+  if (!isValidJobTransition(expectedStatus, terminalStatus)) {
+    console.error(`Job ${job.shortId}: state machine rejected dispatch-block transition from ${expectedStatus} to ${terminalStatus}.`);
+    return false;
+  }
+
+  const updateResult = await prisma.printJob.updateMany({
+    where: {
+      shortId: job.shortId,
+      status: expectedStatus,
+      printerDeviceId: job.printerDeviceId
+    },
+    data: { status: terminalStatus }
+  });
+  if (updateResult.count !== 1) {
+    console.warn(`Job ${job.shortId}: dispatch failure was not applied because its state/binding changed concurrently.`);
+    return false;
+  }
+
+  const errorDetails = `Device dispatch refused [${code}]: ${reason}`;
+  try {
+    await prisma.printHistory.create({
+      data: {
+        printJobId: job.id,
+        success: false,
+        errorDetails,
+        completedAt: new Date()
+      }
+    });
+  } catch (historyError) {
+    console.error(`Job ${job.shortId}: could not write dispatch refusal history:`, historyError.message);
+  }
+
+  const statusEvent = {
+    id: job.id,
+    shortId: job.shortId,
+    status: terminalStatus,
+    error: reason,
+    code
+  };
+  if (globalIo) {
+    if (job.machineId) globalIo.to(`machine_${job.machineId}`).emit('job_status_changed', statusEvent);
+    globalIo.to(`job_${job.shortId}`).emit('job_status_changed', statusEvent);
+    globalIo.to('admins').emit('job_status_changed', statusEvent);
+  }
+
+  if (job.paymentId && job.payment?.status === 'SUCCESS') {
+    try {
+      const paymentsService = require('../modules/payments/payments.service');
+      await paymentsService.refundPayment(
+        job.shortId,
+        null,
+        `Automatic refund: physical printer dispatch was blocked (${code}). ${reason}`,
+        {
+          initiatedBy: 'SYSTEM',
+          preserveJobStatus: true,
+          idempotencyKey: `device_dispatch_blocked_${job.id}_${job.paymentId}`
+        }
+      );
+    } catch (refundError) {
+      console.error(`Job ${job.shortId}: automatic refund failed after dispatch refusal:`, refundError.message);
+    }
+  }
+
+  console.warn(`Job ${job.shortId} was marked ${terminalStatus} because device dispatch was refused [${code}].`);
+  return true;
+};
+
 const isProductionRuntime = process.env.NODE_ENV === 'production';
 const isRedisRequired = isProductionRuntime || process.env.QUEUE_REDIS_REQUIRED === 'true';
 
@@ -32,11 +111,47 @@ let globalIo = null;
 
 const processJob = async (shortId) => {
   try {
-    const dbJob = await prisma.printJob.findUnique({ 
+    const dbJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true }
+      include: { document: true, printerDevice: true, payment: true }
     });
     if (!dbJob) return;
+
+    // Device-bound jobs are dispatched only after the explicit feature gate and
+    // a fresh DB check of Machine ownership, approval evidence and exact queue.
+    // Legacy Machine-QR jobs (printerDeviceId=null) retain the original route.
+    if (dbJob.printerDeviceId) {
+      const device = dbJob.printerDevice;
+      let blockedCode = null;
+      let blockedReason = null;
+      if (process.env.ENABLE_MULTI_PRINTER_DISPATCH !== 'true') {
+        blockedCode = 'DISPATCH_FEATURE_DISABLED';
+        blockedReason = 'Multi-printer dispatch is disabled. Please contact shop staff for assistance.';
+      } else if (
+        !device ||
+        device.id !== dbJob.printerDeviceId ||
+        device.machineId !== dbJob.machineId ||
+        device.status !== 'ACTIVE' ||
+        !device.approvedAt ||
+        typeof device.windowsPrinterName !== 'string' ||
+        !device.windowsPrinterName.trim()
+      ) {
+        blockedCode = 'PRINTER_DEVICE_UNAVAILABLE';
+        blockedReason = 'The selected physical printer is no longer approved, active or correctly mapped. Please contact shop staff.';
+      } else if (
+        typeof dbJob.printerWindowsQueueName !== 'string' ||
+        !dbJob.printerWindowsQueueName.trim() ||
+        dbJob.printerWindowsQueueName !== device.windowsPrinterName
+      ) {
+        blockedCode = 'PRINTER_QUEUE_SNAPSHOT_MISMATCH';
+        blockedReason = 'The printer queue mapping changed after this job was created. This job was not submitted to a different queue; please create a new print job.';
+      }
+
+      if (blockedCode) {
+        await failBlockedDeviceDispatch(dbJob, 'WAITING', blockedCode, blockedReason);
+        return;
+      }
+    }
 
     // Validate state transition using state machine
     if (!isValidJobTransition(dbJob.status, 'PRINTING')) {
@@ -47,7 +162,11 @@ const processJob = async (shortId) => {
     // Atomic test-and-set: guarantee exactly-once transition from WAITING to PRINTING
     // Ensures concurrent dispatches, interruptions, and admin retries cannot duplicate physical prints
     const updateResult = await prisma.printJob.updateMany({
-      where: { shortId, status: 'WAITING' },
+      where: {
+        shortId,
+        status: 'WAITING',
+        printerDeviceId: dbJob.printerDeviceId || null
+      },
       data: { status: 'PRINTING' }
     });
 
@@ -58,8 +177,36 @@ const processJob = async (shortId) => {
 
     const updatedJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true }
+      include: { document: true, printerDevice: true, payment: true }
     });
+
+    // Re-check immediately before sending the Agent event. A concurrent Admin
+    // disable/remap after the initial read must fail closed, never fall back.
+    if (updatedJob?.printerDeviceId) {
+      const device = updatedJob.printerDevice;
+      const deviceStillValid = Boolean(
+        process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true' &&
+        device &&
+        device.id === updatedJob.printerDeviceId &&
+        device.machineId === updatedJob.machineId &&
+        device.status === 'ACTIVE' &&
+        device.approvedAt &&
+        typeof device.windowsPrinterName === 'string' &&
+        device.windowsPrinterName.trim() &&
+        typeof updatedJob.printerWindowsQueueName === 'string' &&
+        updatedJob.printerWindowsQueueName.trim() &&
+        updatedJob.printerWindowsQueueName === device.windowsPrinterName
+      );
+      if (!deviceStillValid) {
+        await failBlockedDeviceDispatch(
+          updatedJob,
+          'PRINTING',
+          'PRINTER_DEVICE_CHANGED_BEFORE_DISPATCH',
+          'The selected physical printer changed or became unavailable before Agent dispatch. Please contact shop staff.'
+        );
+        return;
+      }
+    }
 
     if (globalIo) {
         // Emit status change to machine room + admins only
@@ -79,7 +226,11 @@ const processJob = async (shortId) => {
           },
           price: updatedJob.cost,
           encryptedKey: updatedJob.encryptedKey,
-          iv: updatedJob.iv
+          iv: updatedJob.iv,
+          ...(updatedJob.printerDeviceId ? {
+            printerDeviceId: updatedJob.printerDeviceId,
+            windowsPrinterName: updatedJob.printerWindowsQueueName
+          } : {})
         };
         
         if (updatedJob.machineId) {
@@ -106,6 +257,9 @@ const initWorker = async (io) => {
   if (printWorker && workerReady) return printWorker;
 
   try {
+    // Keep the backend event publisher single-threaded so Agent receipt order is
+    // deterministic. Per-device lanes in the Agent serialize same-printer work
+    // while allowing independent printers to download/submit in parallel.
     printWorker = new Worker('printQueue', async (job) => {
       const { shortId } = job.data;
       await processJob(shortId);

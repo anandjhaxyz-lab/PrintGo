@@ -265,6 +265,52 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
   }
 }
 
+async function handlePrinterDeviceRegistryRequest({ socket, prisma, logger, requestId }) {
+  if (socket?.userType !== 'printer' || !socket.machineId) {
+    return { accepted: false, code: 'UNAUTHORIZED_AGENT' };
+  }
+  if (socket.agentProtocol?.supportsMultiPrinter !== true) {
+    socket.emit('printer_device_registry_error', {
+      requestId: typeof requestId === 'string' ? requestId : null,
+      code: 'AGENT_PROTOCOL_NOT_NEGOTIATED',
+      retryable: false,
+      message: 'Multi-printer protocol must be negotiated before requesting a device registry.'
+    });
+    return { accepted: false, code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' };
+  }
+  if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(requestId)) {
+    socket.emit('printer_device_registry_error', {
+      requestId: null,
+      code: 'INVALID_REGISTRY_REQUEST_ID',
+      retryable: false,
+      message: 'A valid registry request ID is required.'
+    });
+    return { accepted: false, code: 'INVALID_REGISTRY_REQUEST_ID' };
+  }
+
+  try {
+    // Never trust Machine identity supplied in the event payload.
+    const devices = await getPrinterDeviceRegistry(prisma, socket.machineId);
+    socket.emit('printer_device_registry', {
+      protocolVersion: AGENT_PROTOCOL_VERSION,
+      machineId: socket.machineId,
+      issuedAt: new Date().toISOString(),
+      requestId,
+      devices
+    });
+    return { accepted: true, requestId, deviceCount: devices.length };
+  } catch (error) {
+    logger?.error?.(`Failed to refresh PrinterDevice registry for Machine ${socket.machineId}:`, error);
+    socket.emit('printer_device_registry_error', {
+      requestId,
+      code: error.code || 'REGISTRY_UNAVAILABLE',
+      retryable: true,
+      message: 'Printer registry could not be refreshed. Device-bound dispatch must remain blocked.'
+    });
+    return { accepted: false, requestId, code: error.code || 'REGISTRY_UNAVAILABLE' };
+  }
+}
+
 async function handlePrinterInventoryReport({ socket, io, logger, prisma, payload }) {
   if (socket?.userType !== 'printer' || !socket.machineId) {
     return { accepted: false, code: 'UNAUTHORIZED_AGENT' };
@@ -396,6 +442,7 @@ module.exports = {
   getPrinterDeviceRegistry,
   validateDiscoveredPrinterInventory,
   handlePrinterAgentHello,
+  handlePrinterDeviceRegistryRequest,
   handlePrinterInventoryReport,
   handlePrinterDeviceTelemetry
 };

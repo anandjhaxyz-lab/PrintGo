@@ -123,4 +123,65 @@ describe('JobJournal multi-printer schema v2 compatibility', () => {
     expect(journal.isCorrupted).toBe(true);
     expect(journal.corruptionReason).toContain('Unsupported journal schema version: 3');
   });
+
+  test('allows replay processing only when no dispatch intent exists', () => {
+    fs.writeFileSync(journalPath, JSON.stringify({ version: 1, jobs: {} }));
+    const journal = new JobJournal(journalPath, { markerPath, keysDir, checkKeys: false });
+
+    expect(journal.getReplayDisposition('missing_job')).toBe('PROCESS');
+
+    journal.recordReceived('received_job', { originalName: 'document.pdf' });
+    expect(journal.getReplayDisposition('received_job')).toBe('PROCESS');
+  });
+
+  test('classifies all possible driver-handoff states as ambiguous, never completed', () => {
+    fs.writeFileSync(journalPath, JSON.stringify({
+      version: 1,
+      jobs: {
+        dispatch_intent: { jobId: 'dispatch_intent', state: 'DISPATCH_INTENT' },
+        dispatched: { jobId: 'dispatched', state: 'DISPATCHED_TO_SPOOLER' },
+        accepted: { jobId: 'accepted', state: 'SPOOLER_ACCEPTED' },
+        spooling: { jobId: 'spooling', state: 'SPOOLING' }
+      }
+    }));
+    const journal = new JobJournal(journalPath, { markerPath, keysDir, checkKeys: false });
+
+    for (const jobId of ['dispatch_intent', 'dispatched', 'accepted', 'spooling']) {
+      expect(journal.getReplayDisposition(jobId)).toBe('AMBIGUOUS');
+    }
+  });
+
+  test('reports success only with durable local completion evidence', () => {
+    fs.writeFileSync(journalPath, JSON.stringify({
+      version: 1,
+      jobs: {
+        completed: { jobId: 'completed', state: 'COMPLETED_LOCALLY' },
+        acknowledged: { jobId: 'acknowledged', state: 'ACKNOWLEDGED' }
+      }
+    }));
+    const journal = new JobJournal(journalPath, { markerPath, keysDir, checkKeys: false });
+
+    expect(journal.getReplayDisposition('completed')).toBe('COMPLETED');
+    expect(journal.getReplayDisposition('acknowledged')).toBe('COMPLETED');
+  });
+
+  test('fails closed for malformed, unknown or globally corrupted journal evidence', () => {
+    fs.writeFileSync(journalPath, JSON.stringify({
+      version: 1,
+      jobs: {
+        malformed: { jobId: 'malformed' },
+        unknown: { jobId: 'unknown', state: 'UNRECOGNIZED_STATE' }
+      }
+    }));
+    const journal = new JobJournal(journalPath, { markerPath, keysDir, checkKeys: false });
+
+    expect(journal.getReplayDisposition('malformed')).toBe('AMBIGUOUS');
+    expect(journal.getReplayDisposition('unknown')).toBe('AMBIGUOUS');
+
+    fs.writeFileSync(journalPath, '{invalid-json');
+    const corruptedJournal = new JobJournal(journalPath, { markerPath, keysDir, checkKeys: false });
+    expect(corruptedJournal.isCorrupted).toBe(true);
+    expect(corruptedJournal.getReplayDisposition('any_job')).toBe('AMBIGUOUS');
+  });
+
 });

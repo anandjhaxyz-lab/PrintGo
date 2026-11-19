@@ -1,8 +1,8 @@
 # PrintGo Multi-Printer — Backend / Agent Protocol Integration
 
-**Status:** Protocol integration development slice  
-**Branch:** `feat/multi-printer-backend-agent-protocol`  
-**Parent:** `feat/multi-printer-agent-fleet`  
+**Status:** Phase 4C — device-bound dispatch, per-printer FIFO, final authorization leases, and Admin lifecycle controls (Draft / CI verification pending)  
+**Branch:** `feat/multi-printer-agent-device-dispatch`  
+**Parent:** `feat/multi-printer-device-qr-session-binding` (stacked Draft PR #13)  
 **Protocol version:** 1  
 **Scope:** One authenticated Windows x64 Agent / one Machine / up to 10 queue-bound PrinterDevices  
 **Physical certification:** Pending access to the client's Windows PC in Hyderabad  
@@ -55,9 +55,10 @@ The Agent discovers installed Windows queues locally and emits `printer_inventor
 
 - The backend accepts this event only from an authenticated printer socket that successfully negotiated multi-printer capability.
 - Queue names and metadata are normalized and bounded; duplicate queues and malformed values are rejected.
-- Valid inventory is forwarded to the Admin Socket.IO room as `printer_inventory_report`.
-- The backend does not auto-create, bind, approve, activate or modify PrinterDevice records from discovery.
-- Discovery inventory is advisory and currently transient; persistence and Admin approval UI are subsequent work.
+- Inventory is persisted as Machine-scoped discovery data, with repeat reports updating last-seen state while preserving Admin review status and any approval link.
+- The Admin UI lists discovered queues and requires an explicit Admin approval action. A discovery event never creates, binds, approves or activates a PrinterDevice.
+- Approval is tenant-scoped, rejects stale discovery, duplicate queue mappings, inactive Machines and the per-PC device limit, and creates an ACTIVE PrinterDevice with approval evidence.
+- Registry responses to the Agent contain the authenticated Machine's queue-bound PrinterDevices only; the Agent enables a local monitor only for ACTIVE devices with approval evidence and an exact local Windows queue match.
 
 ## 5. Device health telemetry
 
@@ -70,31 +71,54 @@ Backend:
 - Broadcasts `printer_device_status_update` to Admin sockets.
 - Does not write these per-device readings into the legacy Machine-wide PrinterStatus stream. This prevents one child printer from changing the current legacy customer availability calculation before device-bound QR/session routing is implemented.
 
-## 6. Explicitly deferred
+## 6. Phase 4C — device-bound dispatch and per-printer lanes
 
-- No multi-printer print dispatch: existing `physical_print_job` still follows the legacy `PRINTER_NAME` path.
-- No device-bound Session or PrintJob routing.
-- No durable per-device BullMQ lanes or concurrency changes.
-- No Admin UI persistence/approval flow.
-- No customer QR changes.
-- No Branch or multi-city functionality.
-- No OTA update or local Agent install.
+This implementation extends the already-stacked device QR/session/job binding from PR #13. It does not enable that flow by default.
 
-These items require the later device-bound routing and Admin UI gate. The registry handshake alone must not be interpreted as enabling multi-printer production printing.
+Backend dispatch:
+- The existing durable BullMQ publisher remains at global concurrency 1 to preserve deterministic event publication order.
+- A PrintJob with `printerDeviceId` is dispatchable only when `ENABLE_MULTI_PRINTER_DISPATCH=true`, and a fresh database read confirms the exact child device belongs to the same Machine, is `ACTIVE`, has `approvedAt`, and has a non-empty exact Windows queue name.
+- The device identity and queue name sent to the Agent are read from the database, never from the customer payload.
+- Each device-bound PrintJob stores `printerWindowsQueueName`, an immutable snapshot of the exact Windows queue chosen when the job is created. The migration backfills existing device-bound jobs from their current verified PrinterDevice mapping so in-flight jobs retain a reportable identity.
+- Before dispatch, the backend requires the current PrinterDevice mapping to still match the PrintJob snapshot. A remap before dispatch cancels/fails the blocked job, records history, notifies watchers, and attempts an idempotent refund for a successful payment; it never redirects the already-paid job to a different queue.
+- After Agent dispatch, success/error/ambiguous/reconciliation reports are validated against the immutable PrintJob snapshot, not the PrinterDevice's mutable current mapping. An Admin remap therefore affects future jobs only and cannot make an already submitted job's legitimate report fail identity validation.
+- The job is atomically claimed only while its device binding and queue snapshot remain unchanged. The mapping is checked again immediately before Socket.IO emission; if it became invalid, no fallback route is used.
+- Legacy jobs with `printerDeviceId=null` retain the existing Machine room / `PRINTER_NAME` path.
+
+Agent dispatch:
+- Every device-bound job requests a fresh registry over the authenticated Machine socket before selecting a local queue. The Agent validates the Machine-bound registry, rediscovers local Windows queues, and refreshes its FleetManager before dispatch.
+- A device-bound job requires Windows x64 multi-printer negotiation and an exact match between database `printerDeviceId` / queue name and the Agent's approved local registry. Missing, disabled, unapproved, stale or mismatched mappings fail closed; they never fall back to `PRINTER_NAME`.
+- Agent lanes are keyed by normalized physical Windows queue name. Jobs targeting one physical queue are submitted to its driver in FIFO order; independent queues can prepare and submit concurrently. Legacy `PRINTER_NAME` and a child device mapped to that same queue share a lane.
+- Each device continues to use its own `SpoolerMonitor` for spooler outcome observation.
+- After document download/decryption and immediately before durable dispatch intent / Windows driver submission, the Agent requests a correlated backend authorization for the exact job, PrinterDevice and queue identity.
+- Backend authorization locks the `PrinterDevice` row and creates one bounded two-minute dispatch lease per physical device. The Agent renews the lease while awaiting the Windows driver submission and releases it after the spooler handoff succeeds. Failed/ambiguous handoff leaves the lease to expire conservatively.
+- Admin disable, enable and remap transactions acquire the same Machine/PrinterDevice row locks. A live dispatch lease blocks these mutations with HTTP 409; if Admin obtains the lock first, the final Agent authorization observes the new status/mapping and denies dispatch.
+- Spooler success, physical success/error/ambiguous, and reconciliation events carry the exact device identity. Backend accepts a device-bound outcome only when both the PrinterDevice ID and exact queue name match the immutable queue snapshot on the database job. Legacy jobs cannot claim a child PrinterDevice.
+- Reconciliation receives backend-derived job-to-device bindings. A missing journal entry is treated as `NOT_DISPATCHED` only when the returned device binding matches; journal corruption, mismatch, or ambiguous dispatch remains fail-closed.
+
+Admin lifecycle controls:
+- Admins can disable an ACTIVE device with a mandatory operator reason (10–500 characters).
+- Admins can remap a device only to a fresh discovery on the same Machine that is not already mapped to another PrinterDevice. Remapping preserves the stable PrinterDevice ID and permanent QR; a DISABLED device remains DISABLED.
+- A DISABLED device can be re-enabled only when the Machine is ACTIVE and the exact Windows queue is present in a recent, approved discovery record for that same PrinterDevice. Enable/disable/remap actions write ActivityLog records.
+- The Admin fleet panel exposes the current device status and any unexpired dispatch lease; lifecycle buttons are disabled while a lease is active. The backend independently enforces the same checks and returns 409 if a live dispatch lease exists.
+- Admin approval/remap/enable/disable transactions acquire the Machine row first and then their relevant discovery/device rows. Agent dispatch authorization, lease renewal and release lock the PrinterDevice row. Admin mutations and Agent dispatch therefore serialize on the same PrinterDevice row to avoid disable/remap races and conflicting queue updates.
+
+The PR does not turn on `ENABLE_MULTI_PRINTER_DISPATCH` and does not change any deployed environment variables. Physical certification on the client's Hyderabad Windows PC remains a separate gate.
 
 ## 7. Tests and validation
 
 Automated tests cover:
-- Protocol and journal compatibility checks.
-- Windows x64 capability negotiation and unsupported-platform fallback.
-- Authenticated Machine scoping even when the payload includes a different Machine ID.
-- Safe registry DTO and maximum fleet size.
-- Cross-Machine response rejection in the Agent.
-- Inventory validation, duplicate prevention and negotiation/authentication gate.
-- Device telemetry identity tagging.
+- Protocol negotiation, Agent journal compatibility and authenticated Machine scoping.
+- Registry refresh authorization, request ID validation, fresh queue-bound registry contents and failure handling.
+- Agent FIFO ordering for the same physical queue, cross-queue concurrency, queue failure isolation, legacy/device queue collision protection, and maximum supported Windows queue-name length.
+- Backend rejection of wrong PrinterDevice IDs, wrong exact queue names, incomplete bindings, and child-device claims on legacy jobs.
+- Dispatch lease acquisition, same-device contention, request-id idempotency, authenticated renewal/release, expiry handling, and failure-closed authorization.
+- Admin disable/remap/re-enable permission checks, operator-reason validation, fresh discovery and same-Machine constraints, duplicate mapping rejection, active-lease conflict responses, and consistent Machine-first lock ordering.
+- Agent lease renewal and release behavior, including the disconnected-socket case.
+- Agent fleet validation and fail-closed printer identity checks remain part of the existing Agent test suite.
 
-CI runs on disposable test infrastructure only. Passing CI does not certify real Windows queue/driver behavior.
+CI runs on disposable GitHub Actions infrastructure only. It does not run a real Windows spooler or physical printer. Passing CI does not certify real driver behavior.
 
 ## 8. Safety boundary
 
-This branch is a Draft PR layered on the separate Phase 2 Draft PR. No Staging DB migration, Render deployment, Production change, client PC access, Agent OTA update or physical print test is authorized or performed. Physical verification must happen on the client's actual Windows PC in Hyderabad after reviewed protocol and release gates.
+This branch is intended as a Draft PR stacked directly on PR #13. No PR is merged by this work. No Staging or Production database migration, Render configuration/deployment, Production change, Agent OTA update, installation on a client PC, or physical print test is authorized or performed. Physical verification must happen on the client's actual Windows PC in Hyderabad after separate approval and reviewed release gates.

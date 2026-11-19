@@ -1,5 +1,6 @@
 const {
   recordPrinterDiscoveryInventory,
+  listApprovedPrinterDevices,
   approvePrinterDiscovery,
   DISCOVERY_MAX_AGE_MS
 } = require('../src/services/printerDiscovery.service');
@@ -79,11 +80,68 @@ describe('Printer discovery persistence and approval', () => {
     expect(upsert.mock.calls[0][0].update).not.toHaveProperty('approvedPrinterDeviceId');
   });
 
+  test('lists ACTIVE and DISABLED registered printers with only unexpired dispatch leases', async () => {
+    const liveExpiresAt = new Date(Date.now() + 30000);
+    const expiredAt = new Date(Date.now() - 30000);
+    const devices = [
+      {
+        id: 'device-live',
+        status: 'ACTIVE',
+        printerQrs: [],
+        dispatchLease: {
+          jobShortId: 'JOB_LIVE',
+          expiresAt: liveExpiresAt,
+          releasedAt: null
+        }
+      },
+      {
+        id: 'device-disabled',
+        status: 'DISABLED',
+        printerQrs: [],
+        dispatchLease: {
+          jobShortId: 'JOB_EXPIRED',
+          expiresAt: expiredAt,
+          releasedAt: null
+        }
+      }
+    ];
+    const prisma = {
+      printerDevice: {
+        findMany: jest.fn().mockResolvedValue(devices),
+        count: jest.fn().mockResolvedValue(2)
+      }
+    };
+
+    const result = await listApprovedPrinterDevices(superadmin, {}, prisma);
+
+    expect(prisma.printerDevice.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        status: { in: ['ACTIVE', 'DISABLED', 'MAINTENANCE'] },
+        approvedAt: { not: null },
+        windowsPrinterName: { not: null }
+      },
+      include: expect.objectContaining({
+        dispatchLease: {
+          select: { jobShortId: true, expiresAt: true, releasedAt: true }
+        }
+      })
+    }));
+    expect(result.devices[0].dispatchLease).toEqual({
+      jobShortId: 'JOB_LIVE',
+      expiresAt: liveExpiresAt
+    });
+    expect(result.devices[1].dispatchLease).toBeNull();
+  });
+
   test('creates an ACTIVE PrinterDevice only after explicit Admin approval', async () => {
     const { prisma, tx, device } = makeApprovalFixture();
     const result = await approvePrinterDiscovery('discovery-a', { displayName: 'Epson Counter' }, superadmin, prisma);
 
     expect(result).toEqual({ device, alreadyApproved: false });
+    expect(tx.$queryRaw.mock.calls.map(([strings]) => strings.join(''))).toEqual([
+      expect.stringContaining('FROM "Machine"'),
+      expect.stringContaining('FROM "PrinterDiscovery"')
+    ]);
     expect(tx.printerDevice.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         machineId: 'machine-a',

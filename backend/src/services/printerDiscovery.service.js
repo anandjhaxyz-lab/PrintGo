@@ -68,7 +68,7 @@ const listApprovedPrinterDevices = async (user, query = {}, prisma) => {
   const parsedLimit = Number(query.limit);
   const take = Number.isInteger(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 100) : 100;
   const where = {
-    status: 'ACTIVE',
+    status: { in: ['ACTIVE', 'DISABLED', 'MAINTENANCE'] },
     approvedAt: { not: null },
     windowsPrinterName: { not: null }
   };
@@ -90,6 +90,9 @@ const listApprovedPrinterDevices = async (user, query = {}, prisma) => {
           take: 1,
           orderBy: { createdAt: 'desc' },
           select: { id: true, publicCode: true, label: true, status: true, createdAt: true }
+        },
+        dispatchLease: {
+          select: { jobShortId: true, expiresAt: true, releasedAt: true }
         }
       },
       orderBy: [{ machineId: 'asc' }, { sortOrder: 'asc' }, { displayName: 'asc' }]
@@ -101,6 +104,14 @@ const listApprovedPrinterDevices = async (user, query = {}, prisma) => {
     devices: devices.map((device) => ({
       ...device,
       activeQr: device.printerQrs?.[0] || null,
+      dispatchLease: device.dispatchLease &&
+        !device.dispatchLease.releasedAt &&
+        device.dispatchLease.expiresAt > new Date()
+        ? {
+            jobShortId: device.dispatchLease.jobShortId,
+            expiresAt: device.dispatchLease.expiresAt
+          }
+        : null,
       printerQrs: undefined
     })),
     total
@@ -113,6 +124,15 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
   }
 
   return prisma.$transaction(async (tx) => {
+    const discoveryReference = await tx.printerDiscovery.findUnique({
+      where: { id: discoveryId },
+      select: { machineId: true }
+    });
+    if (!discoveryReference) throw new AppError('Printer discovery record not found.', 404);
+
+    // Admin printer mutations take the Machine lock first so concurrent
+    // approval/remap flows cannot deadlock while changing queue assignments.
+    await tx.$queryRaw`SELECT "id" FROM "Machine" WHERE "id" = ${discoveryReference.machineId} FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "PrinterDiscovery" WHERE "id" = ${discoveryId} FOR UPDATE`;
     const discovery = await tx.printerDiscovery.findUnique({
       where: { id: discoveryId },
@@ -145,7 +165,7 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
       throw new AppError('displayName must be a non-empty label of at most 120 characters.', 400);
     }
 
-    await tx.$queryRaw`SELECT "id" FROM "Machine" WHERE "id" = ${discovery.machineId} FOR UPDATE`;
+    // Machine row is already locked before locking this discovery record.
 
     const mappedQueue = await tx.printerDevice.findFirst({
       where: {

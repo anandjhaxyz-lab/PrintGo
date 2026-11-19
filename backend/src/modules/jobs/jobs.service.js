@@ -97,6 +97,7 @@ const createJob = async (jobData) => {
   const { file, settings, encryptedKey, iv } = jobData;
   let resolvedMachineId = jobData.machineId || null;
   let resolvedPrinterDeviceId = null;
+  let resolvedPrinterWindowsQueueName = null;
   let resolvedPaymentMode = jobData.paymentMode;
 
   // A signed session token identifies the session; the database remains the
@@ -155,6 +156,7 @@ const createJob = async (jobData) => {
           throw new AppError('The physical printer selected by this QR is no longer approved or active. Please contact shop staff.', 409);
         }
         resolvedPrinterDeviceId = device.id;
+        resolvedPrinterWindowsQueueName = device.windowsPrinterName;
       }
     }
   }
@@ -196,6 +198,7 @@ const createJob = async (jobData) => {
       shortId: generateShortId(),
       machineId: resolvedMachineId,
       printerDeviceId: resolvedPrinterDeviceId,
+      printerWindowsQueueName: resolvedPrinterWindowsQueueName,
       documentId: document.id,
       cost,
       paymentMode: finalPaymentMode,

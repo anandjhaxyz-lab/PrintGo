@@ -227,6 +227,31 @@ describe('SpoolerMonitor', () => {
       expect(fs.unlinkSync).toHaveBeenCalledWith('temp.pdf');
     });
 
+    it('keeps a never-observed fast-clearing job ambiguous instead of reporting false success', () => {
+      const jobId = 'job-fast-clear';
+
+      // The queue is empty on every poll: there is no positive evidence that
+      // this particular job entered the spooler or physically completed.
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, '');
+      });
+
+      monitor.startPollingJob(jobId, 'temp.pdf', mockSocket);
+
+      jest.advanceTimersByTime(6000);
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('print_physical_success', expect.any(Object));
+
+      // The bounded polling window ends in AMBIGUOUS, not COMPLETED.
+      jest.advanceTimersByTime(116000);
+      expect(mockSocket.emit).toHaveBeenCalledWith('print_physical_ambiguous', expect.objectContaining({
+        jobId,
+        wasSeenInQueue: false,
+        reason: 'Job was never observed in queue within timeout window'
+      }));
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('print_physical_success', expect.any(Object));
+    });
+
     it('should emit physical error if spooler reports PaperJam', () => {
       const jobId = 'job456';
       

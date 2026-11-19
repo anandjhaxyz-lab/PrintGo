@@ -854,7 +854,7 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
       await queueService.startPrintingProcess('job_q_1', mockIo);
 
       expect(mockPrisma.printJob.updateMany).toHaveBeenCalledWith({
-        where: { shortId: 'job_q_1', status: 'WAITING' },
+        where: { shortId: 'job_q_1', status: 'WAITING', printerDeviceId: null },
         data: { status: 'PRINTING' }
       });
       expect(mockIo.to).toHaveBeenCalledWith('machine_mach-1');

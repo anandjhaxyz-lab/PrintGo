@@ -108,6 +108,121 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
     }
   };
 
+  const disableDevice = async (device) => {
+    if (!canApprove || busyId) return;
+    const reason = window.prompt(
+      'Reason for disabling this physical printer (minimum 10 characters):'
+    );
+    if (reason === null) return;
+    if (reason.trim().length < 10) {
+      setError('Please enter a reason with at least 10 characters.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Disable "${device.displayName}" on "${device.machine?.name || 'this Machine'}"? New print jobs for this device will be blocked.`
+    );
+    if (!confirmed) return;
+
+    setBusyId(device.id);
+    setError('');
+    setSuccess('');
+    try {
+      await axios.post(
+        `${API_URL}/api/admin/printer-devices/${device.id}/disable`,
+        { reason: reason.trim() }
+      );
+      setSuccess(`${device.displayName} is now disabled. Its permanent QR remains assigned, but new print jobs are blocked.`);
+      await loadFleet();
+    } catch (disableError) {
+      setError(disableError.response?.data?.error || disableError.message || 'Printer disable failed.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const enableDevice = async (device) => {
+    if (!canApprove || busyId) return;
+    const reason = window.prompt('Reason for re-enabling this printer (minimum 10 characters):');
+    if (reason === null) return;
+    if (reason.trim().length < 10) {
+      setError('Please enter a reason with at least 10 characters.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Re-enable "${device.displayName}"? The backend will verify that its exact Windows queue was recently rediscovered on this Machine.`
+    );
+    if (!confirmed) return;
+
+    setBusyId(device.id);
+    setError('');
+    setSuccess('');
+    try {
+      await axios.post(
+        `${API_URL}/api/admin/printer-devices/${device.id}/enable`,
+        { reason: reason.trim() }
+      );
+      setSuccess(`${device.displayName} is active again. Its existing permanent QR and device identity are unchanged.`);
+      await loadFleet();
+    } catch (enableError) {
+      setError(enableError.response?.data?.error || enableError.message || 'Printer re-enable failed.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const remapDevice = async (device) => {
+    if (!canApprove || busyId) return;
+    const candidates = discoveries.filter((item) =>
+      item.machineId === device.machineId &&
+      item.reviewStatus === 'DISCOVERED'
+    );
+    if (candidates.length === 0) {
+      setError('No unassigned Windows queue was recently discovered on this same Machine. Refresh the Agent inventory first.');
+      return;
+    }
+
+    const choices = candidates
+      .map((item, index) => `${index + 1}. ${item.windowsPrinterName}`)
+      .join('\n');
+    const selection = window.prompt(
+      `Choose the newly discovered Windows queue for "${device.displayName}" by number:\n${choices}`
+    );
+    if (selection === null) return;
+    const selectedIndex = Number(selection) - 1;
+    if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= candidates.length) {
+      setError('Invalid queue selection. Enter one of the listed numbers.');
+      return;
+    }
+
+    const target = candidates[selectedIndex];
+    const reason = window.prompt('Reason for remapping this printer (minimum 10 characters):');
+    if (reason === null) return;
+    if (reason.trim().length < 10) {
+      setError('Please enter a reason with at least 10 characters.');
+      return;
+    }
+    const confirmed = window.confirm(
+      `Remap "${device.displayName}" from "${device.windowsPrinterName}" to "${target.windowsPrinterName}"? The device's current ACTIVE/DISABLED state and permanent QR identity will be preserved.`
+    );
+    if (!confirmed) return;
+
+    setBusyId(device.id);
+    setError('');
+    setSuccess('');
+    try {
+      await axios.post(
+        `${API_URL}/api/admin/printer-devices/${device.id}/remap`,
+        { discoveryId: target.id, reason: reason.trim() }
+      );
+      setSuccess(`${device.displayName} now maps to ${target.windowsPrinterName}. Its physical device ID and permanent QR are unchanged.`);
+      await loadFleet();
+    } catch (remapError) {
+      setError(remapError.response?.data?.error || remapError.message || 'Printer remapping failed.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const showDeviceQr = (device) => {
     if (!device.activeQr?.targetUrl) return;
     setQrPreview({
@@ -213,7 +328,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       </div>
 
       <div style={{ marginTop: '1.25rem', paddingTop: '1rem', borderTop: '1px solid #e2e8f0' }}>
-        <h4 style={{ margin: '0 0 0.55rem', fontSize: '0.82rem', color: '#0f172a' }}>Approved physical printers ({devices.length})</h4>
+        <h4 style={{ margin: '0 0 0.55rem', fontSize: '0.82rem', color: '#0f172a' }}>Registered physical printers ({devices.length})</h4>
         {devices.length === 0 ? (
           <p style={{ color: '#64748b', fontSize: '0.78rem' }}>Approved printers will appear here. Each one can have its own permanent customer QR.</p>
         ) : (
@@ -222,7 +337,13 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
               <article key={device.id} style={{ border: '1px solid #dbeafe', borderRadius: '10px', padding: '0.85rem', minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
                   <strong style={{ color: '#0f172a', fontSize: '0.85rem' }}>{device.displayName}</strong>
-                  <span style={{ fontSize: '0.65rem', background: '#dcfce7', color: '#166534', borderRadius: '999px', padding: '3px 7px' }}>APPROVED</span>
+                  <span style={{
+                    fontSize: '0.65rem',
+                    background: device.status === 'ACTIVE' ? '#dcfce7' : '#fee2e2',
+                    color: device.status === 'ACTIVE' ? '#166534' : '#991b1b',
+                    borderRadius: '999px',
+                    padding: '3px 7px'
+                  }}>{device.status || 'UNKNOWN'}</span>
                 </div>
                 <div style={{ color: '#64748b', fontSize: '0.7rem', marginTop: '3px' }}>{device.machine?.name || 'Unknown Machine'} · {device.machine?.location || 'Location not set'}</div>
                 <div style={{ marginTop: '0.55rem', fontSize: '0.75rem', overflowWrap: 'anywhere' }}>
@@ -231,6 +352,16 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
                 <div style={{ marginTop: '0.35rem', fontSize: '0.7rem', color: '#64748b' }}>
                   {device.connectionType || 'Unknown connection'} · {device.portName || 'Port not reported'}
                 </div>
+                {device.dispatchLease && (
+                  <div style={{ marginTop: '0.55rem', padding: '7px 8px', borderRadius: '7px', background: '#fff7ed', color: '#9a3412', fontSize: '0.68rem', lineHeight: 1.45 }}>
+                    Dispatch in progress: {device.dispatchLease.jobShortId}. Disable/remap is locked while the Agent submits this job.
+                  </div>
+                )}
+                {device.status === 'DISABLED' && (
+                  <div style={{ marginTop: '0.55rem', padding: '7px 8px', borderRadius: '7px', background: '#fef2f2', color: '#991b1b', fontSize: '0.68rem' }}>
+                    Disabled. New print jobs are blocked for this printer.
+                  </div>
+                )}
                 {!deviceQrEnabled ? (
                   <div style={{ marginTop: '0.75rem', padding: '8px 9px', borderRadius: '8px', background: '#fffbeb', color: '#92400e', fontSize: '0.7rem', lineHeight: 1.45 }}>
                     Device QR activation is locked until per-printer Agent dispatch is released. This prevents a scan from reaching the legacy single-printer route.
@@ -243,6 +374,10 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
                   >
                     <QrCode size={14} /> View permanent QR
                   </button>
+                ) : device.status !== 'ACTIVE' ? (
+                  <div style={{ marginTop: '0.75rem', padding: '8px 9px', borderRadius: '8px', background: '#fef2f2', color: '#991b1b', fontSize: '0.7rem' }}>
+                    QR creation is unavailable while this printer is not ACTIVE.
+                  </div>
                 ) : (
                   <button
                     type="button"
@@ -253,6 +388,35 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
                     <QrCode size={14} /> {busyId === device.id ? 'Creating QR…' : 'Generate permanent QR'}
                   </button>
                 )}
+                <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.65rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => remapDevice(device)}
+                    disabled={!canApprove || busyId !== null || Boolean(device.dispatchLease)}
+                    style={{ flex: 1, padding: '7px 8px', border: '1px solid #64748b', borderRadius: '8px', background: '#fff', color: '#334155', fontWeight: 700, fontSize: '0.7rem', cursor: !canApprove || busyId !== null || device.dispatchLease ? 'not-allowed' : 'pointer', opacity: device.dispatchLease ? 0.55 : 1 }}
+                  >
+                    {busyId === device.id ? 'Updating…' : 'Remap queue'}
+                  </button>
+                  {device.status === 'ACTIVE' ? (
+                    <button
+                      type="button"
+                      onClick={() => disableDevice(device)}
+                      disabled={!canApprove || busyId !== null || Boolean(device.dispatchLease)}
+                      style={{ flex: 1, padding: '7px 8px', border: '1px solid #dc2626', borderRadius: '8px', background: '#fff', color: '#b91c1c', fontWeight: 700, fontSize: '0.7rem', cursor: !canApprove || busyId !== null || device.dispatchLease ? 'not-allowed' : 'pointer', opacity: device.dispatchLease ? 0.55 : 1 }}
+                    >
+                      Disable printer
+                    </button>
+                  ) : device.status === 'DISABLED' ? (
+                    <button
+                      type="button"
+                      onClick={() => enableDevice(device)}
+                      disabled={!canApprove || busyId !== null || Boolean(device.dispatchLease)}
+                      style={{ flex: 1, padding: '7px 8px', border: '1px solid #059669', borderRadius: '8px', background: '#fff', color: '#047857', fontWeight: 700, fontSize: '0.7rem', cursor: !canApprove || busyId !== null || device.dispatchLease ? 'not-allowed' : 'pointer', opacity: device.dispatchLease ? 0.55 : 1 }}
+                    >
+                      Enable printer
+                    </button>
+                  ) : null}
+                </div>
               </article>
             ))}
           </div>
