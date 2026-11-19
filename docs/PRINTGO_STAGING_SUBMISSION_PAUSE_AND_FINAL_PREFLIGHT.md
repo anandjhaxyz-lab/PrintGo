@@ -337,3 +337,26 @@ PR #18 is still Draft/unmerged and is based on `feature/printgo-production-readi
 - Recheck the DB preflight immediately before migration and manually trigger the approved deploy only after the release operator authorizes it.
 
 **Decision:** Auto-Deploy containment PASS. Maintenance Mode stays ON. Staging migration/deploy and reopening are still NOT AUTHORIZED. Production remains untouched.
+
+
+## Post-Auto-Deploy-off verification — 2026-11-19
+
+A fresh Render re-read after the setting change confirms:
+- `autoDeploy=no`
+- `autoDeployTrigger=off`
+- Maintenance Mode `enabled=true`
+- branch remains `feature/printgo-production-readiness`
+- pre-deploy command remains `npx prisma migrate deploy`
+
+Render Events contains the `auto_deploy_disabled` event at `2026-11-19T13:58:26.361858Z`. The latest listed live deployment is still commit `cb4859550276bc73f1d4d3c07fc9fe011560878e`, finished `2026-11-18T23:30:33.061216Z`; the inspected Events page contains no later deploy event. No candidate deployment occurred when disabling Auto-Deploy.
+
+Fresh read-only Staging DB recheck:
+- `PrintJob`: 9, all COMPLETED.
+- `Payment`: 9, all SUCCESS.
+- latest successful Prisma migration remains `20261118000011_add_cash_payment_mode_and_confirmation`.
+- No migration was run.
+
+Documentation commit `0e3371b60edbb2eddebc03cc57fe335e66f2e2a5` passed CI run [#44539220566](https://github.com/anandjhaxyz-lab/PrintGo/actions/runs/44539220566); Backend/PostgreSQL, Frontend and Printer Agent jobs all succeeded.
+
+### Gate update
+Automatic deployment containment is PASS. Database backup/restore and post-maintenance DB checks remain PASS for their recorded snapshots. The complete integrated candidate still needs formal code review/approval, exact Staging `prisma migrate status` from a trusted secret context, and an explicitly authorized manual release. Do not merge or manually deploy yet. Keep Maintenance Mode ON; Production remains untouched.
