@@ -58,7 +58,8 @@ function classifyConnection(portName) {
 }
 
 class SpoolerMonitor {
-  constructor({ execFile, printerName, journal }) {
+  constructor(options = {}) {
+    const { execFile, printerName, journal } = options;
     this.execFile = execFile;
     this.printerName = printerName;
     this.platform = options.platform || os.platform();
