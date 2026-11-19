@@ -126,11 +126,12 @@ jobs:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
 
-      - name: Run Last-Moment Printer Dispatch Authorization Tests
-        run: npx jest tests/printer_device_dispatch_authorization.test.js --runInBand --forceExit
+      - name: Run Last-Moment Printer Dispatch Authorization & PostgreSQL Row-Lock Tests
+        run: npx jest tests/printer_device_dispatch_authorization.test.js tests/printer_device_lease_row_lock.integration.test.js --runInBand --forceExit
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
 
       - name: Run Admin Printer Disable/Remap Lease Tests
         run: npx jest tests/printer_device_admin.test.js --runInBand --forceExit
