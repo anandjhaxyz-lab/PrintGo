@@ -11,7 +11,9 @@ function verifyPrinterDeviceReport(job, report) {
   const reportedQueueName = report.windowsPrinterName || null;
 
   if (job.printerDeviceId) {
-    const expectedQueueName = job.printerDevice?.windowsPrinterName || null;
+    // The PrintJob queue snapshot is immutable; the PrinterDevice's current
+    // mapping may have changed after this job was already dispatched.
+    const expectedQueueName = job.printerWindowsQueueName || null;
     return Boolean(
       expectedQueueName &&
       reportedDeviceId === job.printerDeviceId &&
@@ -66,7 +68,7 @@ async function authorizePrinterDeviceDispatch({ socket, prisma, request = {} }) 
       ...(allowed ? {
         jobId: job.shortId,
         printerDeviceId: job.printerDeviceId,
-        windowsPrinterName: job.printerDevice.windowsPrinterName,
+        windowsPrinterName: job.printerWindowsQueueName,
         machineId: socket.machineId,
         leaseExpiresAt: job.leaseExpiresAt
       } : { code })
@@ -109,9 +111,19 @@ async function authorizePrinterDeviceDispatch({ socket, prisma, request = {} }) 
       if (device.status !== 'ACTIVE') return { allowed: false, code: 'DEVICE_NOT_ACTIVE' };
       if (!device.approvedAt) return { allowed: false, code: 'DEVICE_NOT_APPROVED' };
       if (
+        typeof job.printerWindowsQueueName !== 'string' ||
+        !job.printerWindowsQueueName.trim() ||
+        job.printerWindowsQueueName !== windowsPrinterName
+      ) {
+        return { allowed: false, code: 'JOB_QUEUE_SNAPSHOT_MISMATCH' };
+      }
+      // An Admin remap before Agent authorization must block the old queued
+      // job. A remap after the authorization/driver handoff does not rewrite
+      // the job's immutable queue snapshot used for later outcome reports.
+      if (
         typeof device.windowsPrinterName !== 'string' ||
         !device.windowsPrinterName.trim() ||
-        device.windowsPrinterName !== windowsPrinterName
+        device.windowsPrinterName !== job.printerWindowsQueueName
       ) {
         return { allowed: false, code: 'QUEUE_MAPPING_MISMATCH' };
       }
