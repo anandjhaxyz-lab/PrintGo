@@ -1,8 +1,6 @@
 const os = require('os');
 const fs = require('fs');
 
-const isWin = os.platform() === 'win32';
-
 function encodePowerShellValue(value) {
   return Buffer.from(String(value), 'utf16le').toString('base64');
 }
