@@ -80,7 +80,7 @@ The existing job snapshot tests cover creation from an approved device and Machi
 - [ ] Verified current Staging backup and a tested restore/rollback plan.
 - [ ] Read-only preflight of Machine, PrinterQr, Session, PrintJob, PrinterStatus counts and duplicate/NULL identity cases.
 - [ ] No unresolved non-terminal/in-flight legacy PrintJobs; drain or reconcile them before 00012.
-- [x] Isolated PostgreSQL CI fixture applies the complete ordered set 00012–00016 to a representative pre-migration schema (migration fixture step passed on PostgreSQL 18 in CI run #44511811143; full workflow still running at the time of this update).
+- [x] Isolated PostgreSQL CI fixture applies the complete ordered set 00012–00016 to a representative pre-migration schema (full workflow #44511811143 passed on PostgreSQL 18; backend, frontend and Agent jobs all succeeded).
 - [x] Explicit 00014 partial-index transition tests described above pass in the isolated PostgreSQL fixture.
 - [x] Lease primary-key / requestId uniqueness and queue snapshot NULL/blank/known-name backfill assertions pass in the isolated PostgreSQL fixture.
 - [x] Existing queue snapshot/report service tests remain in the backend CI workflow.
