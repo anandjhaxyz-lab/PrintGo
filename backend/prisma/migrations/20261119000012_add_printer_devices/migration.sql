@@ -94,8 +94,15 @@ UPDATE "Session" s
 SET "printerDeviceId" = pq."printerDeviceId"
 FROM "PrinterQr" pq
 WHERE s."printerQrId" = pq."id"
+  AND s."machineId" = pq."machineId"
   AND pq."printerDeviceId" IS NOT NULL
-  AND s."printerDeviceId" IS NULL;
+  AND s."printerDeviceId" IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM "PrinterDevice" pd
+      WHERE pd."id" = pq."printerDeviceId"
+        AND pd."machineId" = s."machineId"
+  );
 
 UPDATE "Session" s
 SET "printerDeviceId" = pd."id"
