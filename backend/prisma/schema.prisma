@@ -90,6 +90,7 @@ model Machine {
   activityLogs    ActivityLog[]
   sessions        Session[]
   printerQrs      PrinterQr[]
+  printerDevices  PrinterDevice[]
   printPricingProfile PrintPricingProfile?
   advertisements  Advertisement[]
 
@@ -108,14 +109,53 @@ model Machine {
   @@index([adSuppressionMode, adSuppressionUntil])
 }
 
+model PrinterDevice {
+  id                 String   @id @default(uuid())
+  machineId          String
+  machine            Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  // Stable cloud identity is independent of the Windows queue display name.
+  displayName        String
+  windowsPrinterName String?
+  printerModel       String?
+  driverName         String?
+  portName           String?
+  connectionType     String?
+
+  // DISCOVERY_REQUIRED, PENDING_APPROVAL, ACTIVE, DISABLED, MAINTENANCE
+  status             String   @default("DISCOVERY_REQUIRED")
+  // UNKNOWN, ONLINE, OFFLINE, PAPER_OUT, JAMMED, ERROR
+  healthStatus       String   @default("UNKNOWN")
+  isDefault          Boolean  @default(false)
+  sortOrder          Int      @default(0)
+
+  approvedAt         DateTime?
+  approvedBy         String?
+  lastDiscoveredAt   DateTime?
+  lastTelemetryAt    DateTime?
+
+  printerQrs         PrinterQr[]
+  sessions           Session[]
+  printJobs          PrintJob[]
+  printerStatuses    PrinterStatus[]
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([machineId, status])
+  @@index([machineId, healthStatus])
+}
+
 model PrinterQr {
   id            String    @id @default(uuid())
   publicCode    String    @unique // High-entropy, cryptographically secure random token (URL-safe)
   label         String?   @default("Front Desk Counter") // Friendly placement label
   status        String    @default("ACTIVE") // ACTIVE, REVOKED, REPLACED
 
-  machineId     String?
-  machine       Machine?  @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  machineId       String?
+  machine         Machine?       @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
 
   // Metadata & Audit Trail
   generatedBy   String?   // Admin User ID or "SYSTEM"
@@ -131,7 +171,10 @@ model PrinterQr {
 
   @@index([publicCode])
   @@index([machineId])
+  @@index([printerDeviceId])
   @@index([status])
+  // Phase 1 retains the active-per-Machine index. Phase 3 replaces it only after
+  // device-aware QR APIs and Admin UI are deployed together.
   // Note: PostgreSQL partial unique index "printer_qrs_machine_id_active_unique"
   // enforces at database level that at most one ACTIVE record exists per machineId (excluding null).
 }
@@ -145,8 +188,10 @@ model Session {
   machine     Machine?   @relation(fields: [machineId], references: [id], onDelete: SetNull)
   
   // Optional link to the permanent physical QR that spawned this session
-  printerQrId String?
-  printerQr   PrinterQr? @relation(fields: [printerQrId], references: [id], onDelete: SetNull)
+  printerQrId     String?
+  printerQr       PrinterQr?     @relation(fields: [printerQrId], references: [id], onDelete: SetNull)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
   paymentMode String?    // CASH_AT_COUNTER, DEMO_SIMULATION, CASHFREE_ONLINE (null indicates legacy session)
   
   expiresAt   DateTime   // Session expiration time (60 mins TTL)
@@ -158,6 +203,7 @@ model Session {
   @@index([status])
   @@index([expiresAt])
   @@index([printerQrId])
+  @@index([printerDeviceId, status])
 }
 
 
@@ -326,8 +372,10 @@ model PrintJob {
   status String @default("PENDING_PAYMENT")
   cost          Float
   
-  machineId     String?
-  machine       Machine?      @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  machineId       String?
+  machine         Machine?       @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
   customerId    String?
   customer      Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
   documentId    String
@@ -361,6 +409,7 @@ model PrintJob {
 
   @@index([shortId])
   @@index([machineId])
+  @@index([printerDeviceId, status, createdAt])
   @@index([isTest])
 }
 
@@ -384,8 +433,10 @@ model PrintHistory {
 
 model PrinterStatus {
   id           String   @id @default(uuid())
-  machineId    String
-  machine      Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  machineId       String
+  machine         Machine        @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
   isOnline     Boolean  @default(true)
   paperStatus  String   @default("OK") // OK, LOW, OUT
   tonerStatus  String   @default("OK") // OK, LOW, EMPTY
@@ -397,6 +448,7 @@ model PrinterStatus {
   updatedAt DateTime @updatedAt
 
   @@index([machineId])
+  @@index([printerDeviceId, timestamp])
 }
 
 model Notification {
