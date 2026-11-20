@@ -1,10 +1,10 @@
 # PrintGo Multi-Printer Phase 2 — Agent Fleet Foundation
 
-**Status:** Development foundation only  
-**Branch:** `feat/multi-printer-agent-fleet`  
-**Parent Phase 1 branch:** `feat/multi-printer-foundation`  
-**Scope:** One Windows PC / one Agent / up to 10 registered printers  
-**Physical certification:** Pending access to the client's Windows PC in Hyderabad  
+**Status:** Development foundation only<br>
+**Branch:** `feat/multi-printer-agent-fleet`<br>
+**Parent Phase 1 branch:** `feat/multi-printer-foundation`<br>
+**Scope:** One Windows PC / one Agent / up to 10 registered printers<br>
+**Physical certification:** Pending access to the client's Windows PC in Hyderabad<br>
 **Staging and Production:** No migration, deployment, Agent rollout or print test authorized or performed.
 
 ## Implemented in this development slice
