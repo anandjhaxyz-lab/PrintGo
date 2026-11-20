@@ -1,7 +1,25 @@
 const os = require('os');
 const fs = require('fs');
 
-const isWin = os.platform() === 'win32';
+function encodePowerShellValue(value) {
+  return Buffer.from(String(value), 'utf16le').toString('base64');
+}
+
+function buildPrinterStatusCommand(printerName) {
+  const encodedName = encodePowerShellValue(printerName);
+  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Name -eq $printerName } | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, WorkOffline, PortName`;
+}
+
+function buildPrintJobQueryCommand(printerName) {
+  const encodedName = encodePowerShellValue(printerName);
+  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); Get-PrintJob -PrinterName $printerName -ErrorAction SilentlyContinue | Select-Object Id, DocumentName, JobStatus | ConvertTo-Json`;
+}
+
+function buildRemovePrintJobCommand(printerName, jobId) {
+  const encodedName = encodePowerShellValue(printerName);
+  const encodedJobId = encodePowerShellValue(jobId);
+  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); $jobId = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedJobId}')); Get-PrintJob -PrinterName $printerName | Where-Object { $_.DocumentName -like ('*' + $jobId + '*') } | Remove-PrintJob`;
+}
 
 /**
  * Classifies printer connection type based on port name.
@@ -40,9 +58,12 @@ function classifyConnection(portName) {
 }
 
 class SpoolerMonitor {
-  constructor({ execFile, printerName, journal }) {
+  constructor(options = {}) {
+    const { execFile, printerName, journal } = options;
     this.execFile = execFile;
     this.printerName = printerName;
+    this.platform = options.platform || os.platform();
+    this.isWin = this.platform === 'win32';
     this.journal = journal;
     this.isCheckingStatus = false;
     this.portName = 'Unknown';
@@ -54,12 +75,12 @@ class SpoolerMonitor {
     if (this.isCheckingStatus) return; // Prevent overlapping executions
     this.isCheckingStatus = true;
     
-    if (isWin) {
+    if (this.isWin) {
       this.execFile('powershell.exe', [
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `Get-CimInstance -ClassName Win32_Printer -Filter "Name='${this.printerName}'" | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, WorkOffline, PortName`
+        buildPrinterStatusCommand(this.printerName)
       ], { timeout: 8000 }, (error, stdout) => {
         this.isCheckingStatus = false;
         if (error) {
@@ -195,13 +216,13 @@ class SpoolerMonitor {
         return;
       }
 
-      if (isWin) {
+      if (this.isWin) {
         isPollingExecution = true;
         this.execFile('powershell.exe', [
           '-NoProfile',
           '-NonInteractive',
           '-Command',
-          `Get-PrintJob -PrinterName '${this.printerName}' -ErrorAction SilentlyContinue | Select-Object Id, DocumentName, JobStatus | ConvertTo-Json`
+          buildPrintJobQueryCommand(this.printerName)
         ], { timeout: 6000 }, (error, stdout) => {
           isPollingExecution = false;
           if (error) {
@@ -248,7 +269,7 @@ class SpoolerMonitor {
                   '-NoProfile',
                   '-NonInteractive',
                   '-Command',
-                  `Get-PrintJob -PrinterName '${this.printerName}' | Where-Object DocumentName -like '*${jobId}*' | Remove-PrintJob`
+                  buildRemovePrintJobCommand(this.printerName, jobId)
                 ], { timeout: 5000 });
                 if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
               }
@@ -295,5 +316,8 @@ class SpoolerMonitor {
 }
 
 SpoolerMonitor.classifyConnection = classifyConnection;
+SpoolerMonitor.buildPrinterStatusCommand = buildPrinterStatusCommand;
+SpoolerMonitor.buildPrintJobQueryCommand = buildPrintJobQueryCommand;
+SpoolerMonitor.buildRemovePrintJobCommand = buildRemovePrintJobCommand;
 
 module.exports = SpoolerMonitor;
