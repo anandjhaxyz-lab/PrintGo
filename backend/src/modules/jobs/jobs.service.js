@@ -279,6 +279,40 @@ const resolveAmbiguousJob = async (shortId, data = {}, user = null) => {
     // Row lock the job record
     await tx.$queryRaw`SELECT "id" FROM "PrintJob" WHERE "id" = ${currentJob.id} FOR UPDATE`;
 
+    // Re-read and validate current status after acquiring the row lock
+    let lockedJob = null;
+    if (typeof tx.printJob?.findUnique === 'function') {
+      lockedJob = await tx.printJob.findUnique({
+        where: { id: currentJob.id },
+        include: {
+          document: true,
+          machine: true,
+          payment: true,
+          invoice: true
+        }
+      });
+    }
+
+    if (!lockedJob) {
+      lockedJob = currentJob;
+    }
+
+    if (!lockedJob) {
+      throw new AppError('Job record not found.', 404);
+    }
+
+    if (lockedJob.status !== 'PRINTING') {
+      if (lockedJob.status === outcome) {
+        // Idempotent: already resolved to this outcome by a concurrent operator
+        logger.info(`Job ${shortId} was already resolved to ${outcome}; returning existing record idempotently`);
+        return lockedJob;
+      }
+      throw new AppError(
+        `Conflict: Job ${shortId} has already been resolved to '${lockedJob.status}'. Cannot overwrite with '${outcome}'.`,
+        409
+      );
+    }
+
     const updatedJob = await tx.printJob.update({
       where: { id: currentJob.id },
       data: { status: outcome },
@@ -302,30 +336,30 @@ const resolveAmbiguousJob = async (shortId, data = {}, user = null) => {
       }
     });
 
-    // Create durable ActivityLog entry
+    // Create durable ActivityLog entry using locked/current database state
     await tx.activityLog.create({
       data: {
         action: 'PRINT_JOB_STATUS_RESOLVED',
         details: JSON.stringify({
           jobId: currentJob.id,
           shortId: currentJob.shortId,
-          previousStatus: currentJob.status,
+          previousStatus: lockedJob.status,
           newStatus: outcome,
-          machineId: currentJob.machineId,
-          printerDeviceId: currentJob.printerDeviceId || null,
-          operatorId: user.id || 'SYSTEM_OPERATOR',
-          operatorRole: user.role,
+          machineId: lockedJob.machineId,
+          printerDeviceId: lockedJob.printerDeviceId || null,
+          operatorId: user?.id || 'SYSTEM_OPERATOR',
+          operatorRole: user?.role || 'UNKNOWN',
           operatorReason,
           physicalConfirmation: outcome === 'COMPLETED',
           timestamp: now.toISOString()
         }),
-        userId: user.id || null,
-        machineId: currentJob.machineId || null,
+        userId: user?.id || null,
+        machineId: lockedJob.machineId || null,
         ipAddress: data.ipAddress || null
       }
     });
 
-    logger.info(`Job ${shortId} resolved from PRINTING to ${outcome} by ${user.role} (${user.id})`);
+    logger.info(`Job ${shortId} resolved from PRINTING to ${outcome} by ${user?.role || 'UNKNOWN'} (${user?.id || 'SYSTEM'})`);
     return updatedJob;
   });
 };

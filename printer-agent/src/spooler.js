@@ -1,5 +1,6 @@
 const os = require('os');
 const fs = require('fs');
+const { interpretDetectedErrorState } = require('./printerStatusMapping');
 
 function encodePowerShellValue(value) {
   return Buffer.from(String(value), 'utf16le').toString('base64');
@@ -99,18 +100,29 @@ class SpoolerMonitor {
         let isError = false;
         let errorMessage = '';
 
-        if (stdout.includes('DetectedErrorState : 4') || stdout.includes('Paper Out')) {
-          isError = true;
-          errorMessage = 'Out of Paper';
-        } else if (stdout.includes('WorkOffline        : True') || stdout.includes('Offline')) { 
+        // Extract WorkOffline
+        const isWorkOffline = /WorkOffline\s*:\s*True/i.test(stdout) ||
+          (stdout.includes('Offline') && !/WorkOffline\s*:\s*False/i.test(stdout));
+
+        // Extract DetectedErrorState (e.g. "DetectedErrorState : 4" or "ErrorState: 4")
+        const errorStateMatch = stdout.match(/(?:DetectedErrorState|ErrorState)\s*:\s*(\d+)/i);
+        const detectedErrorState = errorStateMatch ? parseInt(errorStateMatch[1], 10) : null;
+
+        if (isWorkOffline) {
           isError = true;
           errorMessage = 'Printer Offline';
-        } else if (stdout.includes('DetectedErrorState : 5') || stdout.includes('ErrorState: 5') || stdout.includes('Jam')) {
+        } else if (detectedErrorState !== null) {
+          const interpreted = interpretDetectedErrorState(detectedErrorState);
+          if (interpreted) {
+            isError = interpreted.isError;
+            errorMessage = interpreted.message;
+          }
+        } else if (stdout.includes('Paper Out') || stdout.includes('Out of Paper')) {
+          isError = true;
+          errorMessage = 'Out of Paper';
+        } else if (stdout.includes('Jam')) {
           isError = true;
           errorMessage = 'Paper Jam';
-        } else if (/DetectedErrorState\s*:\s*[1-9]/.test(stdout)) {
-          isError = true;
-          errorMessage = 'Printer Error';
         }
 
         // Extract PortName and classify connection

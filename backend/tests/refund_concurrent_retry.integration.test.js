@@ -15,6 +15,7 @@ function assertDisposableDatabaseUrl() {
 
 describe('Actual Concurrent Refund Retry Integration & Gateway Idempotency', () => {
   const paymentId = 'pay_concurrent_retry_01';
+  const paymentId2 = 'pay_concurrent_retry_02';
   const idempotencyKey = 'idemp_concurrent_retry_01';
   let originalCreateRefund;
   let originalGetRefundDetails;
@@ -25,7 +26,7 @@ describe('Actual Concurrent Refund Retry Integration & Gateway Idempotency', () 
     originalCreateRefund = cashfreeGateway.createRefund;
     originalGetRefundDetails = cashfreeGateway.getRefundDetails;
 
-    // Seed Payment
+    // Seed Payment 1
     await prisma.payment.upsert({
       where: { id: paymentId },
       create: {
@@ -44,24 +45,44 @@ describe('Actual Concurrent Refund Retry Integration & Gateway Idempotency', () 
         amount: 100.0
       }
     });
+
+    // Seed Payment 2
+    await prisma.payment.upsert({
+      where: { id: paymentId2 },
+      create: {
+        id: paymentId2,
+        amount: 100.0,
+        currency: 'INR',
+        type: 'PRINT_JOB',
+        status: 'SUCCESS',
+        paymentMethod: 'cashfree_upi',
+        paymentGroup: 'upi',
+        gatewayOrderId: 'order_conc_002',
+        gatewayPaymentId: 'pay_conc_002'
+      },
+      update: {
+        status: 'SUCCESS',
+        amount: 100.0
+      }
+    });
   });
 
   afterAll(async () => {
     cashfreeGateway.createRefund = originalCreateRefund;
     cashfreeGateway.getRefundDetails = originalGetRefundDetails;
-    await prisma.reconciliationRecord.deleteMany({ where: { paymentId } }).catch(() => {});
-    await prisma.transaction.deleteMany({ where: { paymentId } }).catch(() => {});
-    await prisma.refund.deleteMany({ where: { paymentId } }).catch(() => {});
-    await prisma.payment.deleteMany({ where: { id: paymentId } }).catch(() => {});
+    await prisma.reconciliationRecord.deleteMany({ where: { paymentId: { in: [paymentId, paymentId2] } } }).catch(() => {});
+    await prisma.transaction.deleteMany({ where: { paymentId: { in: [paymentId, paymentId2] } } }).catch(() => {});
+    await prisma.refund.deleteMany({ where: { paymentId: { in: [paymentId, paymentId2] } } }).catch(() => {});
+    await prisma.payment.deleteMany({ where: { id: { in: [paymentId, paymentId2] } } }).catch(() => {});
     await prisma.$disconnect();
   });
 
   beforeEach(async () => {
-    await prisma.reconciliationRecord.deleteMany({ where: { paymentId } });
-    await prisma.transaction.deleteMany({ where: { paymentId } });
-    await prisma.refund.deleteMany({ where: { paymentId } });
-    await prisma.payment.update({
-      where: { id: paymentId },
+    await prisma.reconciliationRecord.deleteMany({ where: { paymentId: { in: [paymentId, paymentId2] } } });
+    await prisma.transaction.deleteMany({ where: { paymentId: { in: [paymentId, paymentId2] } } });
+    await prisma.refund.deleteMany({ where: { paymentId: { in: [paymentId, paymentId2] } } });
+    await prisma.payment.updateMany({
+      where: { id: { in: [paymentId, paymentId2] } },
       data: { status: 'SUCCESS' }
     });
   });
@@ -233,5 +254,56 @@ describe('Actual Concurrent Refund Retry Integration & Gateway Idempotency', () 
     });
     expect(recoveryTx).not.toBeNull();
     expect(recoveryTx.status).toBe('SUCCESS');
+  });
+
+  test('Finding 5 — proves cross-payment idempotency key reuse is rejected with 409 Conflict without triggering gateway or creating refund for payment 2', async () => {
+    const crossKey = 'idemp_cross_payment_integration_01';
+
+    // 1. First refund succeeds on payment 1
+    cashfreeGateway.createRefund = jest.fn(async ({ refundId, amount }) => ({
+      success: true,
+      status: 'SUCCESS',
+      cfRefundId: 'cf_cross_01',
+      rawResponse: { refund_id: refundId, amount, status: 'SUCCESS' }
+    }));
+
+    const refund1 = await refundService.createRefund({
+      paymentId,
+      amount: 40.0,
+      idempotencyKey: crossKey,
+      reason: 'Refund on payment 1'
+    });
+    expect(refund1.status).toBe('SUCCESS');
+    expect(cashfreeGateway.createRefund).toHaveBeenCalledTimes(1);
+
+    // 2. Second refund attempt uses the SAME idempotency key on payment 2
+    let crossError;
+    try {
+      await refundService.createRefund({
+        paymentId: paymentId2,
+        amount: 40.0,
+        idempotencyKey: crossKey,
+        reason: 'Attempt cross-payment reuse'
+      });
+    } catch (err) {
+      crossError = err;
+    }
+
+    // Must be rejected with 409 Conflict
+    expect(crossError).toBeDefined();
+    expect(crossError.statusCode).toBe(409);
+    expect(crossError.message).toMatch(/is already bound to another payment/);
+    expect(crossError.message).toContain(paymentId);
+
+    // Gateway must NOT have been called a second time
+    expect(cashfreeGateway.createRefund).toHaveBeenCalledTimes(1);
+
+    // Zero refund records exist for payment 2
+    const pay2Refunds = await prisma.refund.findMany({ where: { paymentId: paymentId2 } });
+    expect(pay2Refunds).toHaveLength(0);
+
+    // Zero transaction records exist for payment 2
+    const pay2Transactions = await prisma.transaction.findMany({ where: { paymentId: paymentId2 } });
+    expect(pay2Transactions).toHaveLength(0);
   });
 });

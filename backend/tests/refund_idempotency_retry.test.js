@@ -283,4 +283,90 @@ describe('Phase 4A Refund Idempotency Retry & Concurrency Safety', () => {
       })
     }));
   });
+
+  // =========================================================================
+  // Finding 5 — Bind refund idempotency keys to their owning payment
+  // =========================================================================
+  test('rejects cross-payment idempotency key reuse in pre-check with 409 Conflict and zero mutations', async () => {
+    const crossPaymentRefund = {
+      id: 'ref-existing-other',
+      idempotencyKey: 'cross_payment_key_01',
+      paymentId: 'pay-other-tenant',
+      amount: 100.0,
+      status: 'SUCCESS'
+    };
+
+    // Pre-check finds key already bound to a different payment
+    prisma.refund.findUnique.mockResolvedValueOnce(crossPaymentRefund);
+
+    let thrownError;
+    try {
+      await refundService.createRefund({
+        paymentId: 'pay-current-tenant',
+        amount: 100.0,
+        idempotencyKey: 'cross_payment_key_01'
+      });
+    } catch (err) {
+      thrownError = err;
+    }
+
+    expect(thrownError).toBeDefined();
+    expect(thrownError.statusCode).toBe(409);
+    expect(thrownError.message).toMatch(/is already bound to another payment \(pay-other-tenant\)\. Cross-payment key reuse is forbidden/);
+
+    expect(prisma.payment.findUnique).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(cashfreeGateway.createRefund).not.toHaveBeenCalled();
+  });
+
+  test('rejects cross-payment idempotency key claimed in concurrent race with 409 Conflict inside transaction', async () => {
+    // Step 1: Pre-check returns null (not yet claimed at start)
+    prisma.refund.findUnique.mockResolvedValueOnce(null);
+    // Step 2: Fetch payment
+    prisma.payment.findUnique.mockResolvedValueOnce(basePayment);
+
+    const concurrentClaimedRefund = {
+      id: 'ref-raced-by-other',
+      idempotencyKey: 'raced_key_01',
+      paymentId: 'pay-concurrent-rival',
+      amount: 100.0,
+      status: 'PROCESSING'
+    };
+
+    const txMock = {
+      $executeRawUnsafe: jest.fn().mockResolvedValue(),
+      refund: {
+        findUnique: jest.fn().mockResolvedValue(concurrentClaimedRefund),
+        create: jest.fn(),
+        update: jest.fn()
+      },
+      payment: {
+        update: jest.fn()
+      },
+      transaction: {
+        create: jest.fn()
+      }
+    };
+
+    prisma.$transaction.mockImplementationOnce(async (callback) => callback(txMock));
+
+    let thrownError;
+    try {
+      await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'raced_key_01'
+      });
+    } catch (err) {
+      thrownError = err;
+    }
+
+    expect(thrownError).toBeDefined();
+    expect(thrownError.statusCode).toBe(409);
+    expect(thrownError.message).toMatch(/is already bound to another payment \(pay-concurrent-rival\)\. Cross-payment key reuse is forbidden/);
+
+    expect(txMock.refund.create).not.toHaveBeenCalled();
+    expect(txMock.payment.update).not.toHaveBeenCalled();
+    expect(cashfreeGateway.createRefund).not.toHaveBeenCalled();
+  });
 });

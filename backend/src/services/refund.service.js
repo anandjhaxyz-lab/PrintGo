@@ -39,6 +39,10 @@ const createRefund = async (params) => {
       include: { creditNotes: true, payment: true }
     });
     if (existingRefund) {
+      // Validate payment ownership: key must belong to the requested payment
+      if (existingRefund.paymentId !== paymentId) {
+        throw new AppError(`Idempotency key '${idempotencyKey}' is already bound to another payment (${existingRefund.paymentId}). Cross-payment key reuse is forbidden.`, 409);
+      }
       if (existingRefund.status === 'SUCCESS' || existingRefund.status === 'PROCESSING') {
         logger.info(`Idempotent refund request recognized for key: ${idempotencyKey} (Status: ${existingRefund.status})`);
         return existingRefund;
@@ -124,6 +128,10 @@ const createRefund = async (params) => {
     if (idempotencyKey) {
       const freshExisting = await tx.refund.findUnique({ where: { idempotencyKey } });
       if (freshExisting) {
+        // Enforce payment ownership inside lock before any state change
+        if (freshExisting.paymentId !== payment.id) {
+          throw new AppError(`Idempotency key '${idempotencyKey}' is already bound to another payment (${freshExisting.paymentId}). Cross-payment key reuse is forbidden.`, 409);
+        }
         if (freshExisting.status === 'SUCCESS' || freshExisting.status === 'PROCESSING') {
           return freshExisting;
         }
