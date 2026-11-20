@@ -18,6 +18,123 @@ const {
   releasePrinterDeviceDispatchLease
 } = require('./services/printerDeviceJobBinding.service');
 
+// Module-level correlation and socket tracking for printer agents
+const authenticatedPrinterSockets = new Map(); // machineId -> Set<Socket>
+const pendingReconciliationsByRequestId = new Map(); // requestId -> correlationEntry
+const RECONCILIATION_EXPIRY_MS = 60000;
+const MAX_PENDING_PER_SOCKET = 50;
+const MAX_GLOBAL_PENDING = 500;
+
+const pruneExpiredRequests = () => {
+  const now = Date.now();
+  for (const [reqId, entry] of pendingReconciliationsByRequestId.entries()) {
+    if (now - entry.createdAt > RECONCILIATION_EXPIRY_MS || !entry.jobIds || entry.jobIds.size === 0) {
+      pendingReconciliationsByRequestId.delete(reqId);
+    }
+  }
+};
+
+const pruneSocketRequests = (socket) => {
+  if (!socket?.pendingReconciliations) return;
+  const now = Date.now();
+  for (const [reqId, entry] of socket.pendingReconciliations.entries()) {
+    if (now - entry.createdAt > RECONCILIATION_EXPIRY_MS || !entry.jobIds || entry.jobIds.size === 0) {
+      socket.pendingReconciliations.delete(reqId);
+    }
+  }
+};
+
+const registerReconciliationOnSocket = (socket, { requestId, jobIds, jobBindings }) => {
+  if (!socket || !requestId || !jobIds) return null;
+  pruneSocketRequests(socket);
+  pruneExpiredRequests();
+
+  const correlationEntry = {
+    requestId,
+    machineId: socket.machineId,
+    jobIds: new Set(jobIds),
+    jobBindings: jobBindings ? { ...jobBindings } : {},
+    createdAt: Date.now()
+  };
+
+  if (!socket.pendingReconciliations) {
+    socket.pendingReconciliations = new Map();
+  }
+
+  if (socket.pendingReconciliations.size >= MAX_PENDING_PER_SOCKET) {
+    const oldestKey = socket.pendingReconciliations.keys().next().value;
+    if (oldestKey) socket.pendingReconciliations.delete(oldestKey);
+  }
+  socket.pendingReconciliations.set(requestId, correlationEntry);
+  socket.activeReconciliation = correlationEntry;
+
+  if (pendingReconciliationsByRequestId.size >= MAX_GLOBAL_PENDING) {
+    const oldestKey = pendingReconciliationsByRequestId.keys().next().value;
+    if (oldestKey) pendingReconciliationsByRequestId.delete(oldestKey);
+  }
+  pendingReconciliationsByRequestId.set(requestId, correlationEntry);
+
+  return correlationEntry;
+};
+
+const requestPrinterReconciliation = (io, machineId, { requestId, jobIds, jobBindings } = {}) => {
+  if (!machineId || !Array.isArray(jobIds) || jobIds.length === 0) {
+    return { success: false, reason: 'INVALID_PARAMETERS' };
+  }
+
+  const effectiveRequestId = requestId || `rec_stuck_${machineId}_${Date.now()}_${crypto.randomUUID()}`;
+  pruneExpiredRequests();
+
+  const correlationEntry = {
+    requestId: effectiveRequestId,
+    machineId,
+    jobIds: new Set(jobIds),
+    jobBindings: jobBindings ? { ...jobBindings } : {},
+    createdAt: Date.now()
+  };
+
+  if (pendingReconciliationsByRequestId.size >= MAX_GLOBAL_PENDING) {
+    const oldestKey = pendingReconciliationsByRequestId.keys().next().value;
+    if (oldestKey) pendingReconciliationsByRequestId.delete(oldestKey);
+  }
+  pendingReconciliationsByRequestId.set(effectiveRequestId, correlationEntry);
+
+  const sockets = authenticatedPrinterSockets.get(machineId);
+  if (sockets && sockets.size > 0) {
+    for (const socket of sockets) {
+      if (!socket.pendingReconciliations) {
+        socket.pendingReconciliations = new Map();
+      }
+      pruneSocketRequests(socket);
+      if (socket.pendingReconciliations.size >= MAX_PENDING_PER_SOCKET) {
+        const oldestKey = socket.pendingReconciliations.keys().next().value;
+        if (oldestKey) socket.pendingReconciliations.delete(oldestKey);
+      }
+      socket.pendingReconciliations.set(effectiveRequestId, correlationEntry);
+      socket.activeReconciliation = correlationEntry;
+    }
+  }
+
+  if (io && typeof io.to === 'function') {
+    io.to(`machine_${machineId}`).emit('reconcile_active_jobs', {
+      requestId: effectiveRequestId,
+      jobIds,
+      jobBindings
+    });
+  }
+
+  return {
+    success: true,
+    requestId: effectiveRequestId,
+    socketCount: sockets ? sockets.size : 0
+  };
+};
+
+const clearAllReconciliationState = () => {
+  pendingReconciliationsByRequestId.clear();
+  authenticatedPrinterSockets.clear();
+};
+
 const setupSockets = (io) => {
   // WebSocket Authentication Middleware
   io.use(async (socket, next) => {
@@ -71,6 +188,14 @@ const setupSockets = (io) => {
 
     if (socket.userType === 'printer') {
       socket.join(`machine_${socket.machineId}`);
+      if (!authenticatedPrinterSockets.has(socket.machineId)) {
+        authenticatedPrinterSockets.set(socket.machineId, new Set());
+      }
+      authenticatedPrinterSockets.get(socket.machineId).add(socket);
+      if (!socket.pendingReconciliations) {
+        socket.pendingReconciliations = new Map();
+      }
+
       // Notify the printer it successfully registered
       socket.emit('printer_registered_success', { machineId: socket.machineId, name: socket.machineName });
 
@@ -116,12 +241,11 @@ const setupSockets = (io) => {
                 windowsPrinterName: job.printerWindowsQueueName || null
               } : null
             ]));
-            socket.activeReconciliation = {
+            registerReconciliationOnSocket(socket, {
               requestId,
-              jobIds: new Set(jobIds),
-              jobBindings,
-              createdAt: Date.now()
-            };
+              jobIds,
+              jobBindings
+            });
             logger.info(`Requesting reconciliation [ReqID: ${requestId}] for ${jobIds.length} active PRINTING job(s) from machine ${socket.machineId}: ${jobIds.join(', ')}`);
             socket.emit('reconcile_active_jobs', { requestId, jobIds, jobBindings });
           }
@@ -371,15 +495,33 @@ const setupSockets = (io) => {
       logger.info(`Agent on machine ${socket.machineId} reported reconciliation for job ${jobId}: ${status} [ReqID: ${requestId || 'none'}]`);
 
       // 2. Correlation verification: verify report matches active reconciliation request
-      const active = socket.activeReconciliation;
+      let active = null;
+      if (socket.pendingReconciliations && requestId && socket.pendingReconciliations.has(requestId)) {
+        active = socket.pendingReconciliations.get(requestId);
+      } else if (requestId && pendingReconciliationsByRequestId.has(requestId)) {
+        active = pendingReconciliationsByRequestId.get(requestId);
+      } else if (socket.activeReconciliation && (!requestId || socket.activeReconciliation.requestId === requestId)) {
+        active = socket.activeReconciliation;
+      }
+
       if (!active) {
-        logger.warn(`Rejected reconciliation report for job ${jobId}: No active reconciliation request on socket`);
+        logger.warn(`Rejected reconciliation report for job ${jobId}: No active reconciliation request matching ReqID ${requestId || 'none'}`);
+        return;
+      }
+
+      // Check machine ownership on the request
+      if (active.machineId && active.machineId !== socket.machineId) {
+        logger.warn(`Rejected cross-machine reconciliation report for job ${jobId}: Request belongs to machine ${active.machineId}, but reported by ${socket.machineId}`);
         return;
       }
 
       // Check request ID matching and timeout (60 seconds)
-      const isExpired = (Date.now() - active.createdAt) > 60000;
+      const isExpired = (Date.now() - active.createdAt) > RECONCILIATION_EXPIRY_MS;
       if (isExpired || active.requestId !== requestId || !active.jobIds || !active.jobIds.has(jobId)) {
+        if (isExpired && requestId) {
+          if (socket.pendingReconciliations) socket.pendingReconciliations.delete(requestId);
+          pendingReconciliationsByRequestId.delete(requestId);
+        }
         logger.warn(`Rejected stale/uncorrelated reconciliation report for job ${jobId} (ReqID match: ${active.requestId === requestId}, Expired: ${isExpired})`);
         return;
       }
@@ -458,6 +600,12 @@ const setupSockets = (io) => {
         return;
       }
 
+      // If all jobs in this request are now resolved/consumed, clean up the correlation entry
+      if (active.jobIds.size === 0 && requestId) {
+        if (socket.pendingReconciliations) socket.pendingReconciliations.delete(requestId);
+        pendingReconciliationsByRequestId.delete(requestId);
+      }
+
       // Never automatically reset jobs when Agent reports anything other than NOT_DISPATCHED.
       if (status !== 'NOT_DISPATCHED') {
         logger.info(`Job ${jobId} reported status "${status}". Not eligible for automatic NOT_DISPATCHED re-dispatch.`);
@@ -490,19 +638,23 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_physical_success', async (payload) => {
-      if (socket.userType !== 'printer') return;
-      const jobId = typeof payload === 'object' ? payload.jobId : payload;
-      logger.info(`Physical print success reported for job ${jobId}`);
+    const handleSpoolerClearance = async (payload, eventName = 'print_spooler_cleared') => {
+      if (socket.userType !== 'printer' || !socket.machineId) return;
+      const jobId = typeof payload === 'object' ? payload?.jobId : payload;
+      logger.info(`Spooler clearance (${eventName}) reported for job ${jobId} by machine ${socket.machineId}`);
       try {
         const normalizedReport = typeof payload === 'object' && payload !== null ? payload : { jobId };
         const currentJob = await prisma.printJob.findUnique({
           where: { shortId: jobId },
-          include: { document: true, printerDevice: true }
+          include: { document: true, printerDevice: true, machine: true }
         });
         if (!currentJob) return;
 
-        if (!verifyPrinterDeviceReport(currentJob, normalizedReport)) return;
+        // Device-bound and legacy jobs must report the exact expected printer identity.
+        if (!verifyPrinterDeviceReport(currentJob, normalizedReport)) {
+          logger.warn(`Spooler clearance rejected: PrinterDevice identity mismatch for job ${jobId}`);
+          return;
+        }
 
         // P0: Enforce Machine Ownership
         if (currentJob.machineId !== socket.machineId) {
@@ -510,7 +662,21 @@ const setupSockets = (io) => {
           return;
         }
 
-        // Idempotency: If already COMPLETED, acknowledge to agent and do nothing further
+        // V6 Architecture Contract: A spooler queue that was never observed must never be treated as successfully cleared
+        const wasSeenInQueue = normalizedReport.wasSeenInQueue === true;
+        const isReconciled = normalizedReport.reconciled === true;
+        const isSimulation = normalizedReport.mode === 'simulation';
+        if (!wasSeenInQueue && !isReconciled && !isSimulation) {
+          logger.warn(`Spooler clearance refused for job ${jobId}: Queue was never observed by spooler monitor.`);
+          socket.emit('print_physical_ambiguous', {
+            jobId,
+            reason: 'Spooler clearance rejected: Queue was never observed in Windows spooler.',
+            wasSeenInQueue: false
+          });
+          return;
+        }
+
+        // Idempotency: If already COMPLETED, acknowledge to agent and do nothing further (no duplicate history)
         if (currentJob.status === 'COMPLETED') {
           socket.emit('ack_job_completed', { jobId });
           return;
@@ -524,27 +690,67 @@ const setupSockets = (io) => {
         const completedJob = await prisma.printJob.update({
           where: { shortId: jobId },
           data: { status: 'COMPLETED' },
-          include: { document: true }
+          include: { document: true, machine: true }
         });
 
-        // Record verification in PrintHistory
+        // Store truthful evidence text in PrintHistory (never claiming sensor-verified paper ejection)
+        const evidenceDetails = isReconciled
+          ? 'Reconciled via agent journal evidence: Windows spooler transmission confirmed'
+          : (isSimulation
+            ? 'Simulation mode: spooler clearance simulated'
+            : 'Windows spooler transmission and queue clearance confirmed (sensor-verified physical paper ejection unverified)');
+
         await prisma.printHistory.create({
           data: {
             printJobId: currentJob.id,
             success: true,
-            errorDetails: payload?.reconciled 
-              ? 'Reconciled via agent journal evidence' 
-              : (payload?.wasSeenInQueue ? 'Verified via Windows spooler polling' : 'Verified via driver dispatch confirmation'),
+            errorDetails: evidenceDetails,
             completedAt: new Date()
           }
         }, { maxWait: 5000, timeout: 10000 });
 
+        // Clean up correlation request entry if this was a reconciled completion
+        if (normalizedReport?.requestId) {
+          const reqId = normalizedReport.requestId;
+          const active = (socket.pendingReconciliations && socket.pendingReconciliations.get(reqId)) || pendingReconciliationsByRequestId.get(reqId);
+          if (active && active.jobIds) {
+            active.jobIds.delete(jobId);
+            if (active.jobIds.size === 0) {
+              if (socket.pendingReconciliations) socket.pendingReconciliations.delete(reqId);
+              pendingReconciliationsByRequestId.delete(reqId);
+            }
+          }
+        }
+
         // Acknowledge receipt to the agent
         socket.emit('ack_job_completed', { jobId });
-        logger.info(`Job ${jobId} marked COMPLETED and acknowledged to machine ${socket.machineId}`);
+        logger.info(`Job ${jobId} marked COMPLETED (spooler cleared) and acknowledged to machine ${socket.machineId}`);
+
+        // Notify client and admin rooms
+        const statusEvent = {
+          id: completedJob.id,
+          shortId: completedJob.shortId,
+          status: 'COMPLETED',
+          message: 'Spooler transmission and queue clearance confirmed.'
+        };
+        io.to(`job_${jobId}`).emit('job_status_changed', statusEvent);
+        if (completedJob.machineId) io.to(`machine_${completedJob.machineId}`).emit('job_status_changed', statusEvent);
+        if (completedJob.machine?.companyId) io.to(`company_${completedJob.machine.companyId}`).emit('job_status_changed', statusEvent);
+        io.to('superadmins').emit('job_status_changed', statusEvent);
+        io.to('admins').emit('job_status_changed', statusEvent);
       } catch (err) {
-        logger.error(`Failed to update job ${jobId} to COMPLETED:`, err);
+        logger.error(`Failed to update job ${jobId} to COMPLETED on spooler clearance:`, err);
       }
+    };
+
+    // V6 Architecture Contract: print_spooler_cleared is the authoritative event
+    socket.on('print_spooler_cleared', async (payload) => {
+      await handleSpoolerClearance(payload, 'print_spooler_cleared');
+    });
+
+    // Backward-compatible alias: subject to identical ownership, evidence, and ambiguity checks
+    socket.on('print_physical_success', async (payload) => {
+      await handleSpoolerClearance(payload, 'print_physical_success');
     });
 
     socket.on('print_physical_ambiguous', async (report) => {
@@ -571,6 +777,23 @@ const setupSockets = (io) => {
               completedAt: new Date()
             }
           });
+
+          if (prisma.reconciliationRecord) {
+            await prisma.reconciliationRecord.create({
+              data: {
+                printJobId: currentJob.id,
+                paymentId: currentJob.paymentId || null,
+                status: 'MANUAL_REVIEW_REQUIRED',
+                discrepancyType: 'AMBIGUOUS_PHYSICAL_PRINT_OUTCOME',
+                details: JSON.stringify({
+                  shortId: jobId,
+                  machineId: socket.machineId,
+                  reason,
+                  wasSeenInQueue
+                })
+              }
+            }).catch(() => {});
+          }
         }
       } catch (e) {
         logger.error('Error logging ambiguous print outcome:', e);
@@ -580,20 +803,72 @@ const setupSockets = (io) => {
     socket.on('print_physical_error', async (report) => {
       if (socket.userType !== 'printer' || !socket.machineId) return;
       const { jobId, error } = report || {};
-      logger.error(`Physical print error for job ${jobId}: ${error}`);
+      logger.error(`Physical print error reported for job ${jobId}: ${error}`);
       try {
         const currentJob = await prisma.printJob.findUnique({
           where: { shortId: jobId },
-          include: { printerDevice: true }
+          include: { printerDevice: true, payment: true }
         });
-        if (currentJob && !verifyPrinterDeviceReport(currentJob, report)) return;
-        if (!currentJob || !isValidJobTransition(currentJob.status, 'FAILED')) return;
+        if (!currentJob) return;
+        if (!verifyPrinterDeviceReport(currentJob, report)) return;
 
         // P0: Enforce Machine Ownership
         if (currentJob.machineId !== socket.machineId) {
-          logger.warn(`Machine ${socket.machineId} attempted to mark job ${jobId} as FAILED, but job belongs to ${currentJob.machineId}`);
+          logger.warn(`Machine ${socket.machineId} attempted to report physical error for job ${jobId}, but job belongs to ${currentJob.machineId}`);
           return;
         }
+
+        // UP-03 & UP-06 Safety Rule: Once durable DISPATCH_INTENT exists (job is PRINTING),
+        // uncertain physical outcome must NEVER automatically become FAILED or trigger automatic refund.
+        // A paper jam or spooler glitch after dispatch means partial pages may have printed.
+        // Report such cases as ambiguous, retain PRINTING, and require authorized operator resolution.
+        if (currentJob.status === 'PRINTING') {
+          logger.warn(`Job ${jobId} reported physical error after handoff: ${error}. Retaining PRINTING status (ambiguity lock). Automatic refund suppressed.`);
+          
+          await prisma.printHistory.create({
+            data: {
+              printJobId: currentJob.id,
+              success: false,
+              errorDetails: `Ambiguous physical error after spooler handoff: ${error || 'Unknown error'}. Job retained in PRINTING for authorized operator inspection.`,
+              completedAt: new Date()
+            }
+          }).catch(() => {});
+
+          if (prisma.reconciliationRecord) {
+            await prisma.reconciliationRecord.create({
+              data: {
+                printJobId: currentJob.id,
+                paymentId: currentJob.paymentId || null,
+                status: 'MANUAL_REVIEW_REQUIRED',
+                discrepancyType: 'POST_HANDOFF_PHYSICAL_ERROR',
+                details: JSON.stringify({
+                  shortId: jobId,
+                  machineId: socket.machineId,
+                  error: error || 'Physical error after handoff',
+                  reason: 'Error occurred after job entered print spooler. Partial output may have been produced. Automatic refund withheld under fail-closed policy.'
+                })
+              }
+            }).catch(() => {});
+          }
+
+          io.to('superadmins').emit('job_status_changed', {
+            id: currentJob.id,
+            shortId: currentJob.shortId,
+            status: 'PRINTING',
+            ambiguous: true,
+            error: `Physical print error reported: ${error}. Job retained in PRINTING for operator verification.`
+          });
+          io.to('admins').emit('job_status_changed', {
+            id: currentJob.id,
+            shortId: currentJob.shortId,
+            status: 'PRINTING',
+            ambiguous: true,
+            error: `Physical print error reported: ${error}. Job retained in PRINTING for operator verification.`
+          });
+          return;
+        }
+
+        if (!isValidJobTransition(currentJob.status, 'FAILED')) return;
 
         const failedJob = await prisma.printJob.update({
           where: { shortId: jobId },
@@ -601,11 +876,13 @@ const setupSockets = (io) => {
           include: { document: true, payment: true }
         });
 
-        // P3-002: Automated Refund on Print Failure
-        if (failedJob.paymentId) {
-          logger.info(`Initiating automated refund for FAILED job ${jobId}...`);
+        // Pre-dispatch verified failures only: refund only if payment succeeded
+        if (failedJob.paymentId && failedJob.payment?.status === 'SUCCESS') {
+          logger.info(`Initiating automated refund for pre-dispatch FAILED job ${jobId}...`);
           const paymentsService = require('./modules/payments/payments.service');
-          await paymentsService.refundPayment(failedJob.shortId);
+          await paymentsService.refundPayment(failedJob.shortId).catch((refErr) => {
+            logger.error(`Automated refund failed for job ${jobId}:`, refErr.message);
+          });
         }
       } catch (err) {
         logger.error(`Failed to process physical error for job ${jobId}:`, err);
@@ -672,6 +949,19 @@ const setupSockets = (io) => {
     socket.on('disconnect', async () => {
       logger.info(`User disconnected: ${socket.id} (Type: ${socket.userType})`);
       if (socket.userType === 'printer' && socket.machineId) {
+        // Clean up socket from active printer sockets and invalidate pending requests
+        const set = authenticatedPrinterSockets.get(socket.machineId);
+        if (set) {
+          set.delete(socket);
+          if (set.size === 0) {
+            authenticatedPrinterSockets.delete(socket.machineId);
+          }
+        }
+        if (socket.pendingReconciliations) {
+          socket.pendingReconciliations.clear();
+        }
+        socket.activeReconciliation = null;
+
         try {
           const machine = await prisma.machine.findUnique({ where: { id: socket.machineId } });
           if (machine) {
@@ -696,5 +986,10 @@ const setupSockets = (io) => {
     });
   });
 };
+
+setupSockets.setupSockets = setupSockets;
+setupSockets.requestPrinterReconciliation = requestPrinterReconciliation;
+setupSockets.registerReconciliationOnSocket = registerReconciliationOnSocket;
+setupSockets.clearAllReconciliationState = clearAllReconciliationState;
 
 module.exports = setupSockets;

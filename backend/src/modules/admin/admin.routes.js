@@ -34,14 +34,112 @@ router.post('/jobs/:shortId/confirm-cash', restrictTo('SUPERADMIN', 'FRANCHISEE'
 
 router.post('/dispatch-job', restrictTo('SUPERADMIN'), async (req, res, next) => {
   try {
-    const { shortId } = req.body;
+    const { shortId } = req.body || {};
+    if (!shortId || typeof shortId !== 'string' || !shortId.trim()) {
+      return res.status(400).json({ success: false, error: 'shortId is required' });
+    }
+    const cleanShortId = shortId.trim();
+
     // Historical guard: job ab36197e must NEVER be dispatched or retried
-    if (shortId === 'ab36197e') {
+    if (cleanShortId === 'ab36197e') {
       return res.status(400).json({ success: false, error: 'Historical baseline job ab36197e is protected and cannot be retried or dispatched' });
     }
-    const { startPrintingProcess } = require('../../services/queueService');
-    await startPrintingProcess(shortId, req.app.get('io'));
-    res.json({ success: true, message: `Dispatched ${shortId}` });
+
+    const prisma = require('../../utils/prisma');
+    const existingJob = await prisma.printJob.findUnique({
+      where: { shortId: cleanShortId },
+      include: { machine: true }
+    });
+    if (!existingJob) {
+      return res.status(404).json({ success: false, error: 'Job not found' });
+    }
+
+    const { MAX_PRINT_ATTEMPTS, startPrintingProcess } = require('../../services/queueService');
+    const maxAttempts = MAX_PRINT_ATTEMPTS || 3;
+
+    // UP-02: Check job-level maximum attempts
+    const currentAttempts = existingJob.printAttempts || 0;
+    if (currentAttempts >= maxAttempts) {
+      return res.status(409).json({
+        success: false,
+        error: 'MAX_PRINT_ATTEMPTS_EXCEEDED',
+        message: `Maximum ${maxAttempts} print attempts exceeded for job ${cleanShortId}. Current attempts: ${currentAttempts}, maximum: ${maxAttempts}.`,
+        attempts: currentAttempts,
+        maxAttempts
+      });
+    }
+
+    // UP-02: Check transaction/payment-level maximum attempts across sibling jobs
+    if (existingJob.paymentId) {
+      const siblingJobs = await prisma.printJob.findMany({
+        where: { paymentId: existingJob.paymentId },
+        select: { id: true, printAttempts: true }
+      });
+      const totalTxAttempts = siblingJobs.reduce((sum, j) => sum + (j.printAttempts || 0), 0);
+      if (totalTxAttempts >= maxAttempts) {
+        return res.status(409).json({
+          success: false,
+          error: 'MAX_PRINT_ATTEMPTS_EXCEEDED',
+          message: `Maximum ${maxAttempts} print attempts exceeded for payment transaction ${existingJob.paymentId}. Total attempts: ${totalTxAttempts}, maximum: ${maxAttempts}.`,
+          attempts: totalTxAttempts,
+          maxAttempts
+        });
+      }
+    }
+
+    // UP-03: Ambiguity Lockout - a job in PRINTING cannot be redispatched while unresolved
+    if (existingJob.status === 'PRINTING') {
+      return res.status(409).json({
+        success: false,
+        error: 'AMBIGUOUS_JOB_LOCKED',
+        message: `Job ${cleanShortId} is currently in PRINTING (ambiguous physical outcome). Must be resolved by authorized operator before re-dispatch.`,
+        status: existingJob.status
+      });
+    }
+
+    // If job was in FAILED, allow authorized operator retry within attempt limit by restoring to WAITING
+    let restoredFromFailed = false;
+    if (existingJob.status === 'FAILED') {
+      await prisma.printJob.update({
+        where: { id: existingJob.id },
+        data: { status: 'WAITING' }
+      });
+      restoredFromFailed = true;
+    }
+
+    const dispatchResult = await startPrintingProcess(cleanShortId, req.app.get('io'));
+
+    if (dispatchResult && dispatchResult.success === false) {
+      if (restoredFromFailed) {
+        await prisma.printJob.update({
+          where: { id: existingJob.id },
+          data: { status: 'FAILED' }
+        });
+      }
+      const statusCode = (dispatchResult.code === 'MAX_PRINT_ATTEMPTS_EXCEEDED' || dispatchResult.code === 'LEGACY_ATTEMPTS_EXHAUSTED') ? 409 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: dispatchResult.code,
+        message: dispatchResult.message,
+        attempts: dispatchResult.attempts,
+        maxAttempts: dispatchResult.maxAttempts || maxAttempts
+      });
+    }
+
+    const freshJob = await prisma.printJob.findUnique({
+      where: { shortId: cleanShortId },
+      select: { shortId: true, status: true, printAttempts: true }
+    });
+
+    const finalAttempts = freshJob?.printAttempts || (currentAttempts + 1);
+
+    res.json({
+      success: true,
+      message: `Dispatched ${cleanShortId}`,
+      job: freshJob,
+      attempts: finalAttempts,
+      maxAttempts
+    });
   } catch (e) {
     next(e);
   }

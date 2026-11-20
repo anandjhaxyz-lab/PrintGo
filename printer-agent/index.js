@@ -27,6 +27,7 @@ const {
   buildAgentHello,
   validatePrinterDeviceRegistry
 } = require('./src/agentProtocol');
+const { acquireAgentMutex, MUTEX_NAME } = require('./src/windowsNamedMutex');
 const journal = new JobJournal();
 const agentPackage = require('./package.json');
 
@@ -73,25 +74,47 @@ async function validatePrinter() {
     }
 }
 
-if (PRINTER_NAME) {
-    validatePrinter();
-} else {
-  console.warn('⚠️  WARNING: PRINTER_NAME is not set. Running in simulation mode (no physical printing).');
+let agentMutexLock = null;
+
+async function bootstrap() {
+  try {
+    console.log(`🔒 [UP-05] Requesting Windows Named Mutex: ${MUTEX_NAME}...`);
+    agentMutexLock = await acquireAgentMutex();
+    console.log(`✅ [UP-05] Windows Named Mutex acquired and locked for process lifetime: ${MUTEX_NAME}`);
+  } catch (err) {
+    if (err.code === 'MUTEX_ALREADY_HELD') {
+      console.error(`\n❌ [UP-05 REJECTION] Another PrintGo/NEOX Agent process is already running on this machine.`);
+      console.error(`   The Windows Named Mutex '${MUTEX_NAME}' is currently locked.`);
+      console.error(`   To prevent duplicate physical prints, secondary instances fail closed and terminate immediately.\n`);
+      process.exit(1);
+    }
+    console.error(`\n❌ [UP-05 FATAL] Failed to acquire Windows Named Mutex '${MUTEX_NAME}': ${err.message}\n`);
+    process.exit(1);
+  }
+
+  if (PRINTER_NAME) {
+    await validatePrinter();
+  } else {
+    console.warn('⚠️  WARNING: PRINTER_NAME is not set. Running in simulation mode (no physical printing).');
+  }
+
+  startAgent();
 }
 
-console.log(`🖨️  PrintGo Enterprise Printer Agent Starting...`);
-console.log(`🔗 Connecting to cloud backend: ${BACKEND_URL}`);
+function startAgent() {
+  console.log(`🖨️  PrintGo Enterprise Printer Agent Starting...`);
+  console.log(`🔗 Connecting to cloud backend: ${BACKEND_URL}`);
 
-const tempDir = path.join(__dirname, 'temp');
-if (!fs.existsSync(tempDir)) {
-  fs.mkdirSync(tempDir);
-}
+  const tempDir = path.join(__dirname, 'temp');
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir);
+  }
 
-const socket = io(BACKEND_URL, { 
-  transports: ['websocket'],
-  auth: { machineKey: MACHINE_KEY }
-});
-const dispatchAuthorizer = new PrinterDispatchAuthorizer(socket);
+  const socket = io(BACKEND_URL, { 
+    transports: ['websocket'],
+    auth: { machineKey: MACHINE_KEY }
+  });
+  const dispatchAuthorizer = new PrinterDispatchAuthorizer(socket);
 
 // Persistent RSA Keypair for E2EE across restarts
 const keysDir = path.join(__dirname, 'keys');
@@ -454,10 +477,20 @@ socket.on('reconcile_active_jobs', ({ requestId, jobIds = [], jobBindings = {} }
       });
     } else if (['COMPLETED_LOCALLY', 'ACKNOWLEDGED'].includes(entry.state)) {
       console.log(`📡 Reporting existing completion evidence for Job ${jobId} (state: ${entry.state})`);
+      socket.emit('print_spooler_cleared', {
+        jobId,
+        requestId,
+        reconciled: true,
+        wasSeenInQueue: true,
+        dispatchedAt: entry.dispatchedAt || entry.dispatchIntentAt,
+        completedAt: entry.completedAt,
+        ...binding
+      });
       socket.emit('print_physical_success', {
         jobId,
         requestId,
         reconciled: true,
+        wasSeenInQueue: true,
         dispatchedAt: entry.dispatchedAt || entry.dispatchIntentAt,
         completedAt: entry.completedAt,
         ...binding
@@ -561,7 +594,8 @@ const processPhysicalPrintJob = async (jobData) => {
   const replayDisposition = journal.getReplayDisposition(jobData.jobId);
   if (replayDisposition === 'COMPLETED') {
     console.warn(`⚠️ IDEMPOTENCY GUARD: Job ${jobData.jobId} has durable local completion evidence. Refusing duplicate physical print.`);
-    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true, ...deviceBinding });
+    socket.emit('print_spooler_cleared', { jobId: jobData.jobId, alreadyDispatched: true, wasSeenInQueue: true, ...deviceBinding });
+    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true, wasSeenInQueue: true, ...deviceBinding });
     return;
   }
 
@@ -877,11 +911,22 @@ setInterval(() => {
 // P4-001: Render Free Tier Keep-Alive
 // Render spins down free instances after 15 mins of inactivity. 
 // A raw HTTP GET request every 10 minutes ensures the server stays awake while the kiosk is online.
-setInterval(async () => {
-  try {
-    await axios.get(`${BACKEND_URL}/api/health`);
-    console.log(`📡 Keep-Alive ping sent to ${BACKEND_URL}/api/health`);
-  } catch (error) {
-    console.error(`⚠️  Keep-Alive ping failed: ${error.message}`);
-  }
-}, 10 * 60 * 1000); // 10 minutes
+  setInterval(async () => {
+    try {
+      await axios.get(`${BACKEND_URL}/api/health`);
+      console.log(`📡 Keep-Alive ping sent to ${BACKEND_URL}/api/health`);
+    } catch (error) {
+      console.error(`⚠️  Keep-Alive ping failed: ${error.message}`);
+    }
+  }, 10 * 60 * 1000); // 10 minutes
+}
+
+if (require.main === module) {
+  bootstrap();
+}
+
+module.exports = {
+  bootstrap,
+  startAgent,
+  MUTEX_NAME
+};

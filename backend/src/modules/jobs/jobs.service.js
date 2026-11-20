@@ -361,7 +361,7 @@ const resolveAmbiguousJob = async (shortId, data = {}, user = null) => {
 
     logger.info(`Job ${shortId} resolved from PRINTING to ${outcome} by ${user?.role || 'UNKNOWN'} (${user?.id || 'SYSTEM'})`);
     return updatedJob;
-  });
+  }, { maxWait: 10000, timeout: 15000 });
 };
 
 const updateJobStatus = async (shortId, status, user = null, options = {}) => {

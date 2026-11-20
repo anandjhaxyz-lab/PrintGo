@@ -92,23 +92,45 @@ class CashfreeGatewayAdapter {
         rawResponse: data
       };
     } catch (err) {
+      const statusCode = err?.response?.status;
       const errResponse = err?.response?.data || { message: err.message };
       logger.error(`Cashfree refund API error for order ${orderId}:`, redactSensitiveData(errResponse));
 
-      // Check for duplicate refund ID
+      // 1. Check for duplicate refund ID
       const isDuplicate = errResponse?.code === 'refund_already_exists' || 
                           errResponse?.message?.includes('already exists') ||
-                          err?.response?.status === 409;
+                          statusCode === 409;
 
-      const isTimeout = err.code === 'ECONNABORTED' || err.message?.includes('timeout');
+      // 2. Classify timeouts and connection failures
+      const isTimeout = err.code === 'ECONNABORTED' || 
+                        err.message?.includes('timeout') || 
+                        err.code === 'ETIMEDOUT' || 
+                        err.code === 'ESOCKETTIMEDOUT';
+
+      const isConnectionReset = err.code === 'ECONNRESET' || 
+                                err.code === 'EPIPE' || 
+                                err.code === 'ENOTFOUND' || 
+                                err.code === 'ECONNREFUSED';
+
+      const isServerError = typeof statusCode === 'number' && statusCode >= 500 && statusCode < 600;
+
+      // Uncertain outcome: the request may have reached Cashfree and executed
+      const isUncertainOutcome = isTimeout || isConnectionReset || isServerError || (!statusCode && !err.response);
+
+      // Definitive failure: HTTP 4xx (excluding duplicate 409 and rate-limit 429) where Cashfree definitively rejected before execution
+      const isDefinitiveFailure = typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500 && !isDuplicate && statusCode !== 429;
 
       return {
         success: false,
         isDuplicate,
         isTimeout,
-        status: 'FAILED',
+        isConnectionReset,
+        isServerError,
+        isUncertainOutcome,
+        isDefinitiveFailure,
+        status: isUncertainOutcome || isDuplicate ? 'PROCESSING' : 'FAILED',
         error: errResponse?.message || err.message,
-        statusCode: err?.response?.status || 500,
+        statusCode: statusCode || (isTimeout ? 408 : 500),
         rawResponse: errResponse
       };
     }

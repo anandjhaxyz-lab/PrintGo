@@ -217,7 +217,8 @@ class SpoolerMonitor {
       socket.emit('print_spooler_success', { jobId, ...eventBinding });
       setTimeout(() => {
         if (this.journal) this.journal.recordCompleted(jobId, { mode: 'simulation', ...eventBinding });
-        socket.emit('print_physical_success', { jobId, mode: 'simulation', ...eventBinding });
+        socket.emit('print_spooler_cleared', { jobId, mode: 'simulation', wasSeenInQueue: true, ...eventBinding });
+        socket.emit('print_physical_success', { jobId, mode: 'simulation', wasSeenInQueue: true, ...eventBinding });
         if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
       }, 3000);
       return null;
@@ -280,6 +281,7 @@ class SpoolerMonitor {
               clearInterval(pollSpooler);
               console.log(`✅ Job ${jobId} physically completed (verified in spooler and cleared)!`);
               if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+              socket.emit('print_spooler_cleared', { jobId, wasSeenInQueue: true, ...eventBinding });
               socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             }
@@ -299,8 +301,16 @@ class SpoolerMonitor {
               const status = ourJob.JobStatus || '';
               if (status.includes('Error') || status.includes('PaperOut') || status.includes('PaperJam') || status.includes('Blocked')) {
                 clearInterval(pollSpooler);
-                console.error(`❌ Physical Print Error for Job ${jobId}: ${status}`);
-                socket.emit('print_physical_error', { jobId, error: status, ...eventBinding });
+                console.error(`⚠️ Spooler error reported for Job ${jobId} while in queue: ${status}. Outcome is ambiguous; partial printing may have occurred.`);
+                // Post-dispatch in-queue errors are ambiguous: partial pages may have printed.
+                // Never emit print_physical_error (which would trigger automatic failure and refund).
+                socket.emit('print_physical_ambiguous', {
+                  jobId,
+                  reason: `Spooler reported ${status} while job was in queue. Partial printing may have occurred.`,
+                  wasSeenInQueue: true,
+                  error: status,
+                  ...eventBinding
+                });
                 this.execFile('powershell.exe', [
                   '-NoProfile',
                   '-NonInteractive',
@@ -314,6 +324,7 @@ class SpoolerMonitor {
               clearInterval(pollSpooler);
               console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
               if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+              socket.emit('print_spooler_cleared', { jobId, wasSeenInQueue: true, ...eventBinding });
               socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             }
@@ -335,6 +346,7 @@ class SpoolerMonitor {
              clearInterval(pollSpooler);
              console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+             socket.emit('print_spooler_cleared', { jobId, wasSeenInQueue: true, ...eventBinding });
              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
           }
