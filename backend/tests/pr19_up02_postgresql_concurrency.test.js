@@ -1052,13 +1052,13 @@ describe('child-reconcile-worker DATABASE_URL Safety Guard Unit Tests', () => {
   test('A1. Production hostname with disposable database name is strictly rejected', () => {
     const res = validateDatabaseUrl('postgresql://postgres:pass@production-db:5433/printgo_disposable_target');
     expect(res.valid).toBe(false);
-    expect(res.error).toMatch(/hostname must be exactly '127.0.0.1'/);
+    expect(res.error).toMatch(/hostname must be '127\.0\.0\.1' or 'localhost'/);
   });
 
   test('A2. Production hostname with 5433 in query string is strictly rejected', () => {
     const res = validateDatabaseUrl('postgresql://postgres:pass@production-db:5432/printgo_disposable_target?port=5433');
     expect(res.valid).toBe(false);
-    expect(res.error).toMatch(/hostname must be exactly '127.0.0.1'/);
+    expect(res.error).toMatch(/hostname must be '127\.0\.0\.1' or 'localhost'/);
   });
 
   test('A3. Port 5432 with disposable database name is strictly rejected', () => {
@@ -1093,6 +1093,9 @@ describe('child-reconcile-worker DATABASE_URL Safety Guard Unit Tests', () => {
 
     const res2 = validateDatabaseUrl('postgresql://postgres@127.0.0.1:5433/printgo_disposable_target?schema=public');
     expect(res2.valid).toBe(true);
+
+    const res3 = validateDatabaseUrl('postgresql://postgres:postgres@localhost:5433/printgo_disposable_target?schema=public');
+    expect(res3.valid).toBe(true);
   });
 
   test('A7. Child worker execution with invalid URL exits with code 1 and never connects to DB', async () => {

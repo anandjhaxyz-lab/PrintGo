@@ -25,7 +25,7 @@ const { PrismaClient } = require('@prisma/client');
  * Validates database URL strictly using WHATWG URL parser.
  * Requires:
  *   protocol === 'postgresql:'
- *   hostname === '127.0.0.1'
+ *   hostname in ['127.0.0.1', 'localhost']
  *   port === '5433'
  *   pathname === '/printgo_disposable_target'
  *
@@ -47,8 +47,8 @@ function validateDatabaseUrl(rawUrl) {
   if (parsed.protocol !== 'postgresql:') {
     return { valid: false, error: `SAFETY REJECTION: protocol must be 'postgresql:' (received '${parsed.protocol}')` };
   }
-  if (parsed.hostname !== '127.0.0.1') {
-    return { valid: false, error: `SAFETY REJECTION: hostname must be exactly '127.0.0.1' (received '${parsed.hostname}')` };
+  if (!['127.0.0.1', 'localhost'].includes(parsed.hostname)) {
+    return { valid: false, error: `SAFETY REJECTION: hostname must be '127.0.0.1' or 'localhost' (received '${parsed.hostname}')` };
   }
   if (parsed.port !== '5433') {
     return { valid: false, error: `SAFETY REJECTION: port must be exactly '5433' (received '${parsed.port || 'default'}')` };
