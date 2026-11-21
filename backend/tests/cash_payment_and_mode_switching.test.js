@@ -863,7 +863,8 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
         },
         data: {
           status: 'PRINTING',
-          printAttempts: { increment: 1 }
+          printAttempts: { increment: 1 },
+          reservedForRetry: false
         }
       });
       expect(mockIo.to).toHaveBeenCalledWith('machine_mach-1');
