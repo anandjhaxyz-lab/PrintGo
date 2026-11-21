@@ -57,6 +57,26 @@ const createJobSchema = z.object({
 const updateJobStatusSchema = z.object({
   body: z.object({
     status: z.enum(['PENDING_PAYMENT', 'WAITING', 'PRINTING', 'COMPLETED', 'FAILED', 'CANCELLED']),
+    reason: z.string().optional(),
+    evidence: z.string().optional(),
+    physicalConfirmation: z.boolean().optional(),
+    physicalVerificationConfirmed: z.boolean().optional(),
+    spoolerEmptyOnly: z.boolean().optional(),
+  }).strip(),
+  query: z.any(),
+  params: z.object({
+    id: z.string(),
+  }).strip(),
+});
+
+const resolveAmbiguitySchema = z.object({
+  body: z.object({
+    outcome: z.enum(['COMPLETED', 'FAILED']),
+    reason: z.string().optional(),
+    evidence: z.string().optional(),
+    physicalConfirmation: z.boolean().optional(),
+    physicalVerificationConfirmed: z.boolean().optional(),
+    spoolerEmptyOnly: z.boolean().optional(),
   }).strip(),
   query: z.any(),
   params: z.object({
@@ -130,6 +150,7 @@ module.exports = {
   sessionSchema,
   createJobSchema,
   updateJobStatusSchema,
+  resolveAmbiguitySchema,
   createMachineSchema,
   updateMachineSchema,
   createCompanySchema,

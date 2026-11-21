@@ -123,6 +123,79 @@ describe('PrinterFleetManager', () => {
     expect(manager.resolveForPrint('device-online').windowsPrinterName).toBe('Online Queue');
   });
 
+  test('blocks dispatch eligibility when printer is marked WorkOffline or has error state', async () => {
+    const offlinePrinter = {
+      ...discovered('Offline Printer'),
+      workOffline: true
+    };
+    const errorPrinter = {
+      ...discovered('Error Printer'),
+      detectedErrorState: 4
+    };
+    const manager = new PrinterFleetManager({
+      discoverPrinters: async () => [offlinePrinter, errorPrinter],
+      getDeviceRegistry: async () => [
+        activeDevice('device-offline', 'Offline Printer'),
+        activeDevice('device-error', 'Error Printer')
+      ],
+      monitorFactory: () => ({ checkPrinterStatus: jest.fn() })
+    });
+
+    const devices = await manager.refresh();
+    const offlineDev = devices.find((d) => d.id === 'device-offline');
+    const errorDev = devices.find((d) => d.id === 'device-error');
+
+    expect(offlineDev.canPrint).toBe(false);
+    expect(offlineDev.reason).toBe('PRINTER_OFFLINE');
+    expect(errorDev.canPrint).toBe(false);
+    expect(errorDev.reason).toBe('PRINTER_ERROR_STATE');
+    expect(() => manager.resolveForPrint('device-offline')).toThrow();
+    expect(() => manager.resolveForPrint('device-error')).toThrow();
+  });
+
+  test('keeps healthy printer with DetectedErrorState 2 (No Error) eligible to print', async () => {
+    const healthyPrinter = {
+      ...discovered('Healthy Printer'),
+      detectedErrorState: 2
+    };
+    const lowPaperPrinter = {
+      ...discovered('Low Paper Printer'),
+      detectedErrorState: 3
+    };
+    const lowTonerPrinter = {
+      ...discovered('Low Toner Printer'),
+      detectedErrorState: 5
+    };
+
+    const manager = new PrinterFleetManager({
+      discoverPrinters: async () => [healthyPrinter, lowPaperPrinter, lowTonerPrinter],
+      getDeviceRegistry: async () => [
+        activeDevice('dev-healthy', 'Healthy Printer'),
+        activeDevice('dev-low-paper', 'Low Paper Printer'),
+        activeDevice('dev-low-toner', 'Low Toner Printer')
+      ],
+      monitorFactory: () => ({ checkPrinterStatus: jest.fn() })
+    });
+
+    const devices = await manager.refresh();
+    const devHealthy = devices.find((d) => d.id === 'dev-healthy');
+    const devLowPaper = devices.find((d) => d.id === 'dev-low-paper');
+    const devLowToner = devices.find((d) => d.id === 'dev-low-toner');
+
+    expect(devHealthy.canPrint).toBe(true);
+    expect(devHealthy.reason).toBeNull();
+
+    expect(devLowPaper.canPrint).toBe(true);
+    expect(devLowPaper.reason).toBeNull();
+
+    expect(devLowToner.canPrint).toBe(true);
+    expect(devLowToner.reason).toBeNull();
+
+    expect(manager.resolveForPrint('dev-healthy')).toBeDefined();
+    expect(manager.resolveForPrint('dev-low-paper')).toBeDefined();
+    expect(manager.resolveForPrint('dev-low-toner')).toBeDefined();
+  });
+
   test('rejects duplicate registered queue bindings and more than ten devices', async () => {
     const duplicateManager = new PrinterFleetManager({
       discoverPrinters: async () => [discovered('Queue A')],

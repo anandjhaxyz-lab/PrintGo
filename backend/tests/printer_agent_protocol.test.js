@@ -61,10 +61,41 @@ describe('Printer Agent protocol — negotiation and machine isolation', () => {
     }));
   });
 
-  test('keeps unsupported operating systems on legacy single-printer mode', () => {
-    const linux = windowsHello({
-      host: { platform: 'linux', arch: 'x64', release: '6.8.0' }
-    });
+  test('enforces explicit OS compatibility matrix (Win 10/11 x64 accepted; Win 8.1, ARM64, Linux rejected)', () => {
+    // Windows 10 x64: accepted
+    const win10 = windowsHello({ host: { platform: 'win32', arch: 'x64', release: '10.0.19045' } });
+    expect(validateAgentHello(win10)).toEqual(expect.objectContaining({
+      accepted: true,
+      supportsMultiPrinter: true,
+      maxPrinters: 10
+    }));
+
+    // Windows 11 x64: accepted
+    const win11 = windowsHello({ host: { platform: 'win32', arch: 'x64', release: '10.0.22631' } });
+    expect(validateAgentHello(win11)).toEqual(expect.objectContaining({
+      accepted: true,
+      supportsMultiPrinter: true,
+      maxPrinters: 10
+    }));
+
+    // Windows 8.1 x64: rejected (legacy mode)
+    const win81 = windowsHello({ host: { platform: 'win32', arch: 'x64', release: '6.3.9600' } });
+    expect(validateAgentHello(win81)).toEqual(expect.objectContaining({
+      accepted: true,
+      supportsMultiPrinter: false,
+      maxPrinters: 1
+    }));
+
+    // Windows 10 ARM64: rejected (legacy mode)
+    const win10Arm = windowsHello({ host: { platform: 'win32', arch: 'arm64', release: '10.0.19045' } });
+    expect(validateAgentHello(win10Arm)).toEqual(expect.objectContaining({
+      accepted: true,
+      supportsMultiPrinter: false,
+      maxPrinters: 1
+    }));
+
+    // Linux x64: rejected (legacy mode)
+    const linux = windowsHello({ host: { platform: 'linux', arch: 'x64', release: '6.8.0' } });
     expect(validateAgentHello(linux)).toEqual(expect.objectContaining({
       accepted: true,
       supportsMultiPrinter: false,
@@ -214,7 +245,7 @@ describe('Printer Agent protocol — per-device telemetry isolation', () => {
     };
     const prisma = {
       printerDevice: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'device-a' }),
+        findFirst: jest.fn().mockResolvedValue({ id: 'device-a', windowsPrinterName: 'Epson L6460' }),
         update: jest.fn().mockResolvedValue({})
       }
     };
@@ -243,7 +274,7 @@ describe('Printer Agent protocol — per-device telemetry isolation', () => {
     });
     expect(prisma.printerDevice.findFirst).toHaveBeenCalledWith({
       where: { id: 'device-a', machineId: 'machine-a' },
-      select: { id: true }
+      select: expect.objectContaining({ id: true, windowsPrinterName: true })
     });
     expect(prisma.printerDevice.update).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'device-a' },
@@ -256,6 +287,38 @@ describe('Printer Agent protocol — per-device telemetry isolation', () => {
       healthStatus: 'PAPER_OUT',
       telemetry: { connectionType: 'USB', portName: 'USB001' }
     }));
+  });
+
+  test('rejects telemetry and preserves health when Windows queue name does not match approved device queue', async () => {
+    const socket = {
+      userType: 'printer',
+      machineId: 'machine-a',
+      agentProtocol: { supportsMultiPrinter: true }
+    };
+    const prisma = {
+      printerDevice: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'device-a', windowsPrinterName: 'Epson L6460' }),
+        update: jest.fn()
+      }
+    };
+    const io = { to: jest.fn() };
+
+    const result = await handlePrinterDeviceTelemetry({
+      socket,
+      io,
+      prisma,
+      logger: { warn: jest.fn() },
+      status: {
+        printerDeviceId: 'device-a',
+        printerName: 'HP LaserJet Mismatched Queue',
+        isError: false,
+        connectionType: 'USB'
+      }
+    });
+
+    expect(result).toEqual({ accepted: false, code: 'QUEUE_IDENTITY_MISMATCH' });
+    expect(prisma.printerDevice.update).not.toHaveBeenCalled();
+    expect(io.to).not.toHaveBeenCalled();
   });
 
   test('rejects a device that belongs to a different Machine and does not update or broadcast', async () => {

@@ -94,9 +94,12 @@ function validateAgentHello(payload) {
 
   const capabilities = isPlainObject(payload.capabilities) ? payload.capabilities : {};
   const maxPrinters = Number.isInteger(capabilities.maxPrinters) ? capabilities.maxPrinters : 0;
+  const majorVersion = parseInt(String(host.release || '').split('.')[0], 10);
+  const isWindows10Or11 = Number.isFinite(majorVersion) && majorVersion >= 10;
   const supportsMultiPrinter =
     host.platform === 'win32' &&
     host.arch === 'x64' &&
+    isWindows10Or11 &&
     capabilities.multiPrinter === true &&
     capabilities.printerDiscovery === true &&
     maxPrinters >= 1 &&
@@ -334,9 +337,26 @@ async function handlePrinterInventoryReport({ socket, io, logger, prisma, payloa
       discoveredPrinters
     };
 
-    // Persist for Admin review only. Agent inventory never creates, approves,
-    // binds, activates or modifies PrinterDevice records.
-    io.to('admins').emit('printer_inventory_report', report);
+    // Persist for Admin review only. Emitted to tenant company room and superadmins.
+    let companyId = socket.companyId || null;
+    if (!companyId && prisma.machine && typeof prisma.machine.findUnique === 'function') {
+      try {
+        const machine = await prisma.machine.findUnique({
+          where: { id: socket.machineId },
+          select: { companyId: true }
+        });
+        companyId = machine?.companyId || null;
+      } catch {
+        // Fallback to general admin room if machine lookup not available
+      }
+    }
+
+    if (companyId) {
+      io.to(`company_${companyId}`).emit('printer_inventory_report', report);
+      io.to('superadmins').emit('printer_inventory_report', report);
+    } else {
+      io.to('admins').emit('printer_inventory_report', report);
+    }
     socket.emit('printer_inventory_report_ack', {
       accepted: true,
       machineId: socket.machineId,
@@ -373,12 +393,22 @@ async function handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status
         id: printerDeviceId,
         machineId: socket.machineId
       },
-      select: { id: true }
+      select: {
+        id: true,
+        windowsPrinterName: true,
+        machine: { select: { companyId: true } }
+      }
     });
 
     if (!device) {
       logger?.warn?.(`Rejected printer telemetry: device ${printerDeviceId} does not belong to Machine ${socket.machineId}`);
       return { accepted: false, code: 'DEVICE_MACHINE_MISMATCH' };
+    }
+
+    const printerName = boundedText(status.printerName, MAX_QUEUE_NAME_LENGTH, 'printerName');
+    if (!device.windowsPrinterName || !printerName || device.windowsPrinterName.toLowerCase() !== printerName.toLowerCase()) {
+      logger?.warn?.(`Rejected printer telemetry: reported queue "${printerName}" does not match approved queue "${device.windowsPrinterName}" for device ${device.id}`);
+      return { accepted: false, code: 'QUEUE_IDENTITY_MISMATCH' };
     }
 
     const errorMessage = boundedText(status.errorMessage, 128, 'errorMessage') || '';
@@ -400,7 +430,6 @@ async function handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status
     const connectionType = ['USB', 'Network', 'Unknown'].includes(status.connectionType)
       ? status.connectionType
       : 'Unknown';
-    const printerName = boundedText(status.printerName, MAX_QUEUE_NAME_LENGTH, 'printerName');
     const lastTelemetryAt = new Date();
 
     await prisma.printerDevice.update({
@@ -414,7 +443,8 @@ async function handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status
       portName: boundedText(sourceTelemetry.portName, MAX_QUEUE_NAME_LENGTH, 'telemetry.portName')
     };
 
-    io.to('admins').emit('printer_device_status_update', {
+    const companyId = socket.companyId || device.machine?.companyId || null;
+    const updatePayload = {
       machineId: socket.machineId,
       printerDeviceId: device.id,
       printerName,
@@ -424,7 +454,14 @@ async function handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status
       telemetry,
       healthStatus,
       lastTelemetryAt: lastTelemetryAt.toISOString()
-    });
+    };
+
+    if (companyId) {
+      io.to(`company_${companyId}`).emit('printer_device_status_update', updatePayload);
+      io.to('superadmins').emit('printer_device_status_update', updatePayload);
+    } else {
+      io.to('admins').emit('printer_device_status_update', updatePayload);
+    }
 
     return { accepted: true, printerDeviceId: device.id, healthStatus };
   } catch (error) {

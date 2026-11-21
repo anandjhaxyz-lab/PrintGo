@@ -71,10 +71,10 @@ describe('SpoolerMonitor', () => {
         isError: false
       }));
     });
-    it('should emit status OK when printer is healthy', () => {
+    it('should emit status OK when printer is healthy (DetectedErrorState: 2)', () => {
       mockExecFile.mockImplementation((cmd, args, a3, a4) => {
         const callback = typeof a3 === 'function' ? a3 : a4;
-        callback(null, 'PrinterStatus: 3, ErrorState: 0');
+        callback(null, 'PrinterStatus: 3, DetectedErrorState: 2');
       });
 
       monitor.checkPrinterStatus(mockSocket);
@@ -82,6 +82,36 @@ describe('SpoolerMonitor', () => {
       expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
         isError: false,
         errorMessage: '',
+        printerName: 'TestPrinter'
+      }));
+    });
+
+    it('should emit Printer State Unknown on DetectedErrorState 0 (Unknown)', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, 'PrinterStatus: 3, DetectedErrorState: 0');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: 'Printer State Unknown',
+        printerName: 'TestPrinter'
+      }));
+    });
+
+    it('should emit Printer Error on DetectedErrorState 1 (Other)', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, 'PrinterStatus: 3, DetectedErrorState: 1');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: 'Printer Error',
         printerName: 'TestPrinter'
       }));
     });
@@ -100,10 +130,10 @@ describe('SpoolerMonitor', () => {
       }));
     });
 
-    it('should emit Paper Jam error', () => {
+    it('should emit Paper Jam error on DetectedErrorState 8', () => {
       mockExecFile.mockImplementation((cmd, args, a3, a4) => {
         const callback = typeof a3 === 'function' ? a3 : a4;
-        callback(null, 'ErrorState: 5');
+        callback(null, 'DetectedErrorState : 8');
       });
 
       monitor.checkPrinterStatus(mockSocket);
@@ -111,6 +141,105 @@ describe('SpoolerMonitor', () => {
       expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
         isError: true,
         errorMessage: 'Paper Jam'
+      }));
+    });
+
+    it('should emit Low Toner warning (isError: false) on DetectedErrorState 5', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, 'DetectedErrorState : 5');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: false,
+        errorMessage: 'Low Toner'
+      }));
+    });
+
+    it('should emit Low Paper warning (isError: false) on DetectedErrorState 3', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, 'DetectedErrorState : 3');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: false,
+        errorMessage: 'Low Paper'
+      }));
+    });
+
+    it('should emit healthy status on DetectedErrorState 2 (No Error)', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, 'DetectedErrorState : 2');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: false,
+        errorMessage: ''
+      }));
+    });
+
+    it('should emit Door Open error on DetectedErrorState 7', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, 'DetectedErrorState : 7');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: 'Door Open'
+      }));
+    });
+
+    it('should emit Printer Offline error on WorkOffline True', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, 'WorkOffline : True\nDetectedErrorState : 2');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: 'Printer Offline'
+      }));
+    });
+
+    it('should emit missing or renamed queue error when PowerShell returns empty output', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(null, '   \r\n');
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: 'Printer Queue Missing or Renamed',
+        printerName: 'TestPrinter'
+      }));
+    });
+
+    it('should emit query error when PowerShell fails with an error', () => {
+      mockExecFile.mockImplementation((cmd, args, a3, a4) => {
+        const callback = typeof a3 === 'function' ? a3 : a4;
+        callback(new Error('PowerShell execution failed'));
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+
+      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+        isError: true,
+        errorMessage: expect.stringContaining('PowerShell execution failed')
       }));
     });
 

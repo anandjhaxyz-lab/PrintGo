@@ -211,11 +211,16 @@ const updateMachinePaymentMode = async (id, paymentMode, user, io) => {
   }
 
   if (io) {
-    io.to('admins').emit('printer_status_update', {
+    const payload = {
       machineId: id,
       paymentMode,
       timestamp: new Date().toISOString()
-    });
+    };
+    if (updatedMachine.companyId) {
+      io.to(`company_${updatedMachine.companyId}`).emit('printer_status_update', payload);
+    }
+    io.to('superadmins').emit('printer_status_update', payload);
+    io.to('admins').emit('printer_status_update', payload);
   }
 
   return {

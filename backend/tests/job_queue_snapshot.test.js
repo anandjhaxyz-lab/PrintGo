@@ -15,7 +15,11 @@ const { calculatePrice } = require('../src/services/pricing.service');
 const { createJob } = require('../src/modules/jobs/jobs.service');
 
 describe('Device-bound PrintJob queue snapshot', () => {
+  let prevFlag;
+
   beforeEach(() => {
+    prevFlag = process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    process.env.ENABLE_MULTI_PRINTER_DISPATCH = 'true';
     jest.clearAllMocks();
     prisma.session.findUnique.mockResolvedValue({
       machineId: 'machine-a',
@@ -136,5 +140,41 @@ describe('Device-bound PrintJob queue snapshot', () => {
       }),
       include: { document: true }
     });
+  });
+
+  test('refuses device-bound print job creation when ENABLE_MULTI_PRINTER_DISPATCH is disabled', async () => {
+    delete process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+
+    await expect(createJob({
+      sessionId: 'session-1',
+      machineId: 'machine-a',
+      file: {
+        originalName: 'document.pdf',
+        filename: 'stored-document.pdf',
+        mimetype: 'application/pdf',
+        size: 1024,
+        pages: 2
+      },
+      settings: {
+        color: 'bw',
+        duplex: 'single',
+        copies: 1,
+        pageRangeType: 'all',
+        paperSize: 'A4',
+        paperType: 'plain'
+      }
+    })).rejects.toMatchObject({
+      statusCode: 403,
+      message: expect.stringContaining('Multi-printer dispatch is currently disabled')
+    });
+    expect(prisma.printJob.create).not.toHaveBeenCalled();
+  });
+
+  afterEach(() => {
+    if (prevFlag === undefined) {
+      delete process.env.ENABLE_MULTI_PRINTER_DISPATCH;
+    } else {
+      process.env.ENABLE_MULTI_PRINTER_DISPATCH = prevFlag;
+    }
   });
 });

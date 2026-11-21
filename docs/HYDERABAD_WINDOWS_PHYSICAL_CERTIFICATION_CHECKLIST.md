@@ -12,7 +12,7 @@
 
 Do not begin physical certification until all are true:
 
-- [ ] PRs #12, #13 and #15 have been reviewed and merged in dependency order: #12 -> #13 -> #15.
+- [ ] PRs #9, #10, #11, #12, #13 and #15 have been reviewed and merged in complete dependency order: #9 → #10 → #11 → #12 → #13 → #15 (PR #14 remains excluded).
 - [ ] The resulting release candidate is deployed to **Staging**, and the required Prisma migrations have completed successfully there.
 - [ ] Backend and Windows Agent artifacts are built from the same reviewed release candidate; record their versions / commit SHA.
 - [ ] `ENABLE_MULTI_PRINTER_DISPATCH=true` is configured only in the isolated Staging environment for this controlled test.

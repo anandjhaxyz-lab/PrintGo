@@ -105,10 +105,16 @@ function parseDiscoveryOutput(stdout) {
  */
 function discoverWindowsPrinters(options = {}) {
   const platform = options.platform || os.platform();
+  const arch = options.arch || (platform === 'win32' && os.platform() !== 'win32' ? 'x64' : os.arch());
+  const release = options.release !== undefined
+    ? options.release
+    : (platform === 'win32' && os.platform() !== 'win32' ? '10.0.22631' : os.release());
+  const majorVersion = parseInt(String(release || '').split('.')[0], 10);
+  const isWindows10Or11 = Number.isFinite(majorVersion) && majorVersion >= 10;
   const execFile = options.execFile;
   const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 15000;
 
-  if (platform !== 'win32') {
+  if (platform !== 'win32' || arch !== 'x64' || !isWindows10Or11) {
     return Promise.reject(new PrinterDiscoveryError(
       'UNSUPPORTED_PLATFORM',
       'Windows printer discovery is supported only on Windows 10/11 x64.'

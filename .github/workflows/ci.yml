@@ -14,6 +14,8 @@ on:
       - feat/multi-printer-device-qr-session-binding
       - feat/multi-printer-agent-device-dispatch
       - docs/hyderabad-windows-physical-certification
+      - fix/multi-printer-release-review-blockers
+      - fix/ci-trigger-pr19-safety-followup
   pull_request:
     branches:
       - main
@@ -25,6 +27,8 @@ on:
       - feat/multi-printer-backend-agent-protocol
       - feat/multi-printer-device-routing
       - feat/multi-printer-device-qr-session-binding
+      - docs/hyderabad-windows-physical-certification
+      - fix/multi-printer-release-review-blockers
 
 jobs:
   # =========================================================================
@@ -57,10 +61,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20.x
+      - name: Setup Node.js 24.x
         uses: actions/setup-node@v4
         with:
-          node-version: 20.x
+          node-version: 24.x
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
@@ -150,6 +154,13 @@ jobs:
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
+
+      - name: Run Multi-Printer Release-Blocker Regression Suites (6 Suites)
+        run: npx jest tests/job_status_physical_verification.test.js tests/printer_device_dispatch_concurrency.integration.test.js tests/refund_concurrent_retry.integration.test.js tests/refund_idempotency_retry.test.js tests/socket_tenant_isolation.test.js tests/sql_migration_guard.test.js --runInBand --forceExit
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
 
       - name: Run Phase 3T Supervised Demo Payment Access Lock Suite (12 Tests)
         run: node tests/phase3t_demo_access_lock.test.js

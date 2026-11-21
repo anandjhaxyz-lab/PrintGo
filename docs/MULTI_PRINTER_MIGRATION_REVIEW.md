@@ -217,3 +217,25 @@ The exact source SQL for 00012–00016 was fetched again from the current candid
 
 ### Current decision
 Backup/restore, paused-traffic DB preflight, PITR-window screenshot evidence, automatic deployment containment and isolated PostgreSQL tests are PASS for their documented scope. Migration/deployment is **still NOT AUTHORIZED**: the complete implementation stack remains Draft and lacks submitted PR reviews; a named release approval / exact candidate SHA and exact candidate `npx prisma migrate status` against Staging in a secret-safe execution context are outstanding. Keep Maintenance Mode ON. No Staging migration/deploy or Production action has been performed.
+
+## Multi-Printer Release Blocker Remediation Summary — 2026-11-19
+
+- **Candidate Baseline SHA:** `b71ae079f3a6eabdd5a136fcda9a0a67dc74bed1`
+- **Remediation Worktree:** `C:\Users\DELL\PrintGo-ReleaseFixes`
+- **Remediation Branch:** `fix/multi-printer-release-review-blockers`
+- **Total Changed Files:** 32 files (31 modified tracked files, 1 new untracked test file `backend/tests/sql_migration_guard.test.js`)
+- **Remediation Items Addressed (1–14):**
+  1. **SQL Test Database Safety:** Added guard block ensuring `current_database() = 'printgo_disposable_target'` inside transaction before any schema teardown in `multi_printer_phase1_backfill.test.sql` and `multi_printer_full_migration_chain.test.sql`. Added `sql_migration_guard.test.js`.
+  2. **Default PrinterDevice Approval Collision:** Atomically demoted previous default device (`isDefault: false`) and logged `PRINTER_DEVICE_DEFAULT_TRANSFERRED` in `printerDiscovery.service.js` when approving a new default device.
+  3. **Tenant Isolation in Device Management:** Enforced strict company ID match (`user.companyId === targetCompanyId`) rejecting null-null equality in `printerDeviceAdmin.service.js`, `printerDiscovery.service.js`, `printerQr.service.js`, and `socket.js`. Isolated socket rooms to `company_${companyId}` and `superadmins`.
+  4. **Printer Health & Queue Identity Validation:** Added spooler error handling for missing/renamed queues in `spooler.js` and `printerFleetManager.js`. Backend validates `status.printerName` against `windowsPrinterName` rejecting mismatches with `QUEUE_IDENTITY_MISMATCH` in `printerAgentProtocol.service.js`.
+  5. **Dispatch Lease Renewal Safety & Correlated Ack:** Implemented lease renewal protocol tracking in `dispatchAuthorization.js`, backend correlated acks in `socket.js` and `printerDeviceJobBinding.service.js`, and operator force reconciliation override in `printerDeviceAdmin.service.js`.
+  6. **Feature Gate at Job Creation:** Enforced `ENABLE_MULTI_PRINTER_DISPATCH === 'true'` in `jobs.service.js` for device-bound jobs created from sessions.
+  7. **Per-Device Health on Public QR Screen:** Added `healthStatus` and `lastTelemetryAt` query in `printerQr.service.js` and freshness rendering in `frontend/src/pages/MobileView.jsx`.
+  8. **Windows 10/11 x64 OS Architecture Check:** Replaced bare `win32` checks with `win32`, `x64`, and major release >= 10 in `agentProtocol.js`, `windowsPrinterDiscovery.js`, and `printerAgentProtocol.service.js`.
+  9. **Automatic Refund Failure Persistence:** Durable `Refund` record created with status `FAILED` and `ReconciliationRecord` logged with `FAILED_AUTOMATIC_REFUND` in `queueService.js`.
+  10. **Session Backfill Machine Isolation:** Added machine isolation `AND s."machineId" = pq."machineId"` and existence check in migration `20261119000012_add_printer_devices/migration.sql`.
+  11. **Hyderabad Certification Dependency Order:** Documented full dependency order `#9 → #10 → #11 → #12 → #13 → #15` (excluding #14) in `docs/HYDERABAD_WINDOWS_PHYSICAL_CERTIFICATION_CHECKLIST.md`.
+  12. **Staging Runbook Configuration Update:** Updated Maintenance Mode ON, Auto-Deploy OFF (`autoDeploy=no`, `autoDeployTrigger=off`), pre-deploy `npx prisma migrate deploy` in `docs/PRINTGO_STAGING_DEPLOYMENT_AND_ROLLBACK_RUNBOOK.md`.
+  13. **Backend CI Alignment:** Aligned backend CI step to `Node.js 24.x` in `.github/workflows/ci.yml` while retaining PostgreSQL 18, migration chain test, and all test jobs.
+  14. **Candidate Documentation:** Updated candidate record with baseline SHA `b71ae079f3a6eabdd5a136fcda9a0a67dc74bed1` and 30 changed files.

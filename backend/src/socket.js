@@ -32,6 +32,10 @@ const setupSockets = (io) => {
         if (decoded.type === 'session') {
           socket.sessionId = decoded.sessionId;
           socket.machineId = decoded.machineId; // Optional
+        } else {
+          socket.userId = decoded.id;
+          socket.userRole = decoded.role;
+          socket.companyId = decoded.companyId;
         }
         return next();
       } 
@@ -50,6 +54,7 @@ const setupSockets = (io) => {
         socket.userType = 'printer';
         socket.machineId = machine.id;
         socket.machineName = machine.name;
+        socket.companyId = machine.companyId;
         logger.info(`Printer agent authenticated: ${machine.name} (${machine.id})`);
         return next();
       }
@@ -75,7 +80,10 @@ const setupSockets = (io) => {
           const availability = await getMachineAvailability(socket.machineId, prisma);
           if (availability) {
             io.to(`machine_${socket.machineId}`).emit('printer_status_update', availability);
-            io.to('admins').emit('printer_status_update', availability);
+            if (socket.companyId) {
+              io.to(`company_${socket.companyId}`).emit('printer_status_update', availability);
+            }
+            io.to('superadmins').emit('printer_status_update', availability);
           }
         } catch (err) {
           logger.error('Error broadcasting machine availability on connect:', err);
@@ -137,9 +145,15 @@ const setupSockets = (io) => {
       })();
     }
 
-    // Admin users join the 'admins' room for receiving printer status updates
+    // Admin users join their tenant company room; ONLY superadmins join global admin rooms
     if (socket.userType === 'admin') {
-      socket.join('admins');
+      if (socket.userRole === 'SUPERADMIN') {
+        socket.join('admins');
+        socket.join('superadmins');
+      }
+      if (socket.companyId) {
+        socket.join(`company_${socket.companyId}`);
+      }
     }
 
     socket.on('register_public_key', async ({ publicKey }) => {
@@ -181,6 +195,16 @@ const setupSockets = (io) => {
 
     socket.on('printer_device_dispatch_lease_renewal', async (payload = {}) => {
       const result = await renewPrinterDeviceDispatchLease({ socket, prisma, request: payload });
+      socket.emit('printer_device_dispatch_lease_renewal_result', {
+        requestId: payload?.requestId,
+        jobId: payload?.jobId,
+        printerDeviceId: payload?.printerDeviceId,
+        windowsPrinterName: payload?.windowsPrinterName,
+        renewed: result.renewed,
+        leaseId: result.leaseId || null,
+        expiresAt: result.expiresAt ? result.expiresAt.toISOString() : null,
+        code: result.code || null
+      });
       if (!result.renewed) {
         logger.warn(`Printer dispatch lease renewal refused for request ${payload?.requestId || 'unknown'}: ${result.code || 'unknown error'}`);
       }
@@ -318,17 +342,21 @@ const setupSockets = (io) => {
           };
 
           if (availability) {
-            // Broadcast authoritative availability to customer sessions AND admin sockets
+            // Broadcast authoritative availability to customer sessions AND tenant/superadmin sockets
             io.to(`machine_${socket.machineId}`).emit('printer_status_update', broadcastPayload);
-            io.to('admins').emit('printer_status_update', broadcastPayload);
-          } else {
-            io.to('admins').emit('printer_status_update', broadcastPayload);
           }
+          if (socket.companyId) {
+            io.to(`company_${socket.companyId}`).emit('printer_status_update', broadcastPayload);
+          }
+          io.to('superadmins').emit('printer_status_update', broadcastPayload);
         } catch(err) {
           logger.error('Error saving printer status', err);
         }
       } else {
-        io.to('admins').emit('printer_status_update', status);
+        if (socket.companyId) {
+          io.to(`company_${socket.companyId}`).emit('printer_status_update', status);
+        }
+        io.to('superadmins').emit('printer_status_update', status);
       }
     });
 
@@ -355,6 +383,9 @@ const setupSockets = (io) => {
         logger.warn(`Rejected stale/uncorrelated reconciliation report for job ${jobId} (ReqID match: ${active.requestId === requestId}, Expired: ${isExpired})`);
         return;
       }
+
+      // Immediately consume the jobId from the active set to prevent concurrent duplicate processing
+      active.jobIds.delete(jobId);
 
       // Do not consume the one-shot reconciliation slot until the authenticated
       // Agent has proven the exact DB job/device binding and Machine ownership.
@@ -423,9 +454,9 @@ const setupSockets = (io) => {
 
       if (!reportIdentityValidated) {
         // Leave the request slot available so a valid report can still reconcile it.
+        active.jobIds.add(jobId);
         return;
       }
-      active.jobIds.delete(jobId);
 
       // Never automatically reset jobs when Agent reports anything other than NOT_DISPATCHED.
       if (status !== 'NOT_DISPATCHED') {
@@ -653,7 +684,10 @@ const setupSockets = (io) => {
               ...offlineState
             };
             io.to(`machine_${socket.machineId}`).emit('printer_status_update', payload);
-            io.to('admins').emit('printer_status_update', payload);
+            if (machine.companyId) {
+              io.to(`company_${machine.companyId}`).emit('printer_status_update', payload);
+            }
+            io.to('superadmins').emit('printer_status_update', payload);
           }
         } catch (err) {
           logger.error('Error broadcasting printer disconnect:', err);

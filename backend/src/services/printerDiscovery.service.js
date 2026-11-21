@@ -140,8 +140,10 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
     });
 
     if (!discovery || !discovery.machine) throw new AppError('Printer discovery record not found.', 404);
-    if (user.role !== 'SUPERADMIN' && discovery.machine.companyId !== user.companyId) {
-      throw new AppError('Access denied: this printer belongs to another company.', 403);
+    if (user.role !== 'SUPERADMIN') {
+      if (!user.companyId || !discovery.machine.companyId || discovery.machine.companyId !== user.companyId) {
+        throw new AppError('Access denied: this printer discovery belongs to another company.', 403);
+      }
     }
 
     if (discovery.reviewStatus === 'APPROVED' && discovery.approvedPrinterDeviceId) {
@@ -184,6 +186,26 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
       throw new AppError(`A Machine can have at most ${MAX_PRINTER_DEVICES_PER_MACHINE} approved physical printers.`, 409);
     }
 
+    const willBeDefault = Boolean(data.isDefault !== undefined ? data.isDefault : discovery.isDefault);
+    const existingDefault = await tx.printerDevice.findFirst({
+      where: { machineId: discovery.machineId, isDefault: true }
+    });
+
+    let effectiveIsDefault = willBeDefault;
+    let previousDefaultDeviceId = null;
+
+    if (effectiveIsDefault) {
+      if (existingDefault) {
+        previousDefaultDeviceId = existingDefault.id;
+        await tx.printerDevice.update({
+          where: { id: existingDefault.id },
+          data: { isDefault: false }
+        });
+      }
+    } else if (!existingDefault && deviceCount === 0) {
+      effectiveIsDefault = true;
+    }
+
     const device = await tx.printerDevice.create({
       data: {
         machineId: discovery.machineId,
@@ -192,7 +214,7 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
         driverName: discovery.driverName,
         portName: discovery.portName,
         connectionType: discovery.connectionType,
-        isDefault: discovery.isDefault,
+        isDefault: effectiveIsDefault,
         status: 'ACTIVE',
         healthStatus: 'UNKNOWN',
         sortOrder: deviceCount,
@@ -201,6 +223,22 @@ const approvePrinterDiscovery = async (discoveryId, data = {}, user, prisma) => 
         lastDiscoveredAt: discovery.lastSeenAt
       }
     });
+
+    if (previousDefaultDeviceId) {
+      await tx.activityLog.create({
+        data: {
+          action: 'PRINTER_DEVICE_DEFAULT_TRANSFERRED',
+          details: JSON.stringify({
+            machineId: discovery.machineId,
+            previousDefaultDeviceId,
+            newDefaultDeviceId: device.id,
+            windowsPrinterName: discovery.windowsPrinterName
+          }),
+          userId: user.id || null,
+          machineId: discovery.machineId
+        }
+      });
+    }
 
     await tx.printerDiscovery.update({
       where: { id: discovery.id },

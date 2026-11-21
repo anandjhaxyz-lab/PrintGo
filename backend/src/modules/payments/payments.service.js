@@ -600,6 +600,14 @@ const refundPayment = async (jobId, user = null, refundReason = 'PrintGo Custome
 
   if (!job.payment) throw new AppError('No payment record found for this job', 400);
 
+  if (job.status === 'COMPLETED') {
+    throw new AppError('Completed jobs cannot be refunded through the failure workflow as physical printing was already fulfilled.', 400);
+  }
+
+  if (job.status === 'PRINTING') {
+    throw new AppError('Cannot refund a job currently in PRINTING status. Resolve the physical print outcome first.', 400);
+  }
+
   const refundRecord = await refundService.createRefund({
     paymentId: job.payment.id,
     amount: options.amount,
@@ -617,7 +625,7 @@ const refundPayment = async (jobId, user = null, refundReason = 'PrintGo Custome
     where: { id: job.payment.id }
   });
 
-  if (!options.preserveJobStatus && updatedPayment?.status === 'REFUNDED' && job.status !== 'CANCELLED' && job.status !== 'FAILED') {
+  if (!options.preserveJobStatus && updatedPayment?.status === 'REFUNDED' && job.status !== 'CANCELLED') {
     const updatedJob = await prisma.printJob.update({
       where: { id: job.id },
       data: { status: 'CANCELLED' },

@@ -1340,6 +1340,7 @@ const MobileView = () => {
                   </p>
                   <p className="text-[10.5px] text-slate-300 truncate mt-0.5 leading-none">
                     {printerInfo?.location || 'Counter Terminal'} • {customerStatusText}
+                    {printerInfo?.lastTelemetryAt && ` • Freshness: ${new Date(printerInfo.lastTelemetryAt).toLocaleTimeString()}`}
                   </p>
                 </div>
               </div>

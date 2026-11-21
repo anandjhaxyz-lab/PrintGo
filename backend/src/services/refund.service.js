@@ -39,8 +39,21 @@ const createRefund = async (params) => {
       include: { creditNotes: true, payment: true }
     });
     if (existingRefund) {
-      logger.info(`Idempotent refund request recognized for key: ${idempotencyKey}`);
-      return existingRefund;
+      // Validate payment ownership: key must belong to the requested payment
+      if (existingRefund.paymentId !== paymentId) {
+        throw new AppError(`Idempotency key '${idempotencyKey}' is already bound to another payment (${existingRefund.paymentId}). Cross-payment key reuse is forbidden.`, 409);
+      }
+      if (existingRefund.status === 'SUCCESS' || existingRefund.status === 'PROCESSING') {
+        logger.info(`Idempotent refund request recognized for key: ${idempotencyKey} (Status: ${existingRefund.status})`);
+        return existingRefund;
+      }
+      if (existingRefund.status === 'FAILED') {
+        if (!existingRefund.retryEligible) {
+          logger.warn(`Idempotent refund retry rejected: record ${existingRefund.id} is marked not retryEligible for key: ${idempotencyKey}`);
+          return existingRefund;
+        }
+        // retryEligible is true: proceed to transactional lock for atomic retry claim
+      }
     }
   }
 
@@ -111,16 +124,43 @@ const createRefund = async (params) => {
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('payment_refund_${payment.id}'))`);
 
     // Re-verify idempotency inside lock
+    let claimedRefund = null;
     if (idempotencyKey) {
       const freshExisting = await tx.refund.findUnique({ where: { idempotencyKey } });
-      if (freshExisting) return freshExisting;
+      if (freshExisting) {
+        // Enforce payment ownership inside lock before any state change
+        if (freshExisting.paymentId !== payment.id) {
+          throw new AppError(`Idempotency key '${idempotencyKey}' is already bound to another payment (${freshExisting.paymentId}). Cross-payment key reuse is forbidden.`, 409);
+        }
+        if (freshExisting.status === 'SUCCESS' || freshExisting.status === 'PROCESSING') {
+          return freshExisting;
+        }
+        if (freshExisting.status === 'FAILED') {
+          if (!freshExisting.retryEligible) {
+            return freshExisting;
+          }
+          // Atomic claim for retry: transition status to PROCESSING and clear retryEligible
+          claimedRefund = await tx.refund.update({
+            where: { id: freshExisting.id },
+            data: {
+              status: 'PROCESSING',
+              retryEligible: false,
+              amount: finalRefundAmount,
+              gatewayRefundId: uniqueRefundId,
+              failureReason: null,
+              initiatedBy: user?.id || initiatedBy
+            }
+          });
+        }
+      }
     }
 
     // Re-verify remaining balance inside lock to prevent concurrent over-refunds
     const freshRefunds = await tx.refund.findMany({
       where: {
         paymentId: payment.id,
-        status: { in: ['SUCCESS', 'PROCESSING', 'PENDING'] }
+        status: { in: ['SUCCESS', 'PROCESSING', 'PENDING'] },
+        ...(claimedRefund ? { id: { not: claimedRefund.id } } : {})
       }
     });
     const freshCreditedCents = freshRefunds.reduce((sum, r) => sum + toCents(r.amount), 0);
@@ -131,6 +171,20 @@ const createRefund = async (params) => {
         `Concurrent refund rejected: Requested Rs. ${finalRefundAmount.toFixed(2)} exceeds live remaining balance Rs. ${fromCents(freshRemainingCents).toFixed(2)}`,
         400
       );
+    }
+
+    if (claimedRefund) {
+      await tx.transaction.create({
+        data: {
+          paymentId: payment.id,
+          action: 'REFUND_RETRY_INITIATED',
+          status: 'PENDING',
+          amount: finalRefundAmount,
+          gatewayPaymentId: payment.gatewayPaymentId,
+          ipAddress: user?.ip || null
+        }
+      });
+      return claimedRefund;
     }
 
     // Create local PENDING Refund record
@@ -163,6 +217,11 @@ const createRefund = async (params) => {
 
     return createdRefund;
   });
+
+  // If another concurrent caller already completed the refund or is processing it with another gatewayRefundId:
+  if (result.status === 'SUCCESS' || (result.status === 'PROCESSING' && result.gatewayRefundId !== uniqueRefundId)) {
+    return result;
+  }
 
   // 6. CALL GATEWAY ADAPTER (OUTSIDE DB TRANSACTION TO PREVENT CONNECTION POOL EXHAUSTION)
   let gatewayResult;
@@ -225,6 +284,24 @@ const createRefund = async (params) => {
         where: { id: payment.id },
         data: { status: isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED' }
       });
+
+      if (tx.reconciliationRecord) {
+        await tx.reconciliationRecord.updateMany({
+          where: {
+            OR: [
+              { refundId: result.id },
+              { paymentId: payment.id, discrepancyType: 'FAILED_AUTOMATIC_REFUND' }
+            ],
+            resolved: false
+          },
+          data: {
+            resolved: true,
+            resolvedAt: new Date(),
+            resolvedBy: user?.id || initiatedBy || 'SYSTEM_RETRY',
+            resolutionNotes: 'Resolved automatically via successful refund retry'
+          }
+        }).catch(() => {});
+      }
 
       return updatedRefund;
     } else {

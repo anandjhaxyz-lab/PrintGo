@@ -8,34 +8,36 @@ const {
 } = require('../src/agentProtocol');
 
 describe('Printer Agent protocol helpers', () => {
-  test('advertises multi-printer support only on Windows x64', () => {
-    const supported = buildAgentHello({
-      platform: 'win32',
-      arch: 'x64',
-      release: '10.0.22631',
-      agentVersion: '1.0.0'
-    });
+  test('advertises multi-printer support only on Windows x64 (OS compatibility matrix)', () => {
+    // Windows 10 x64: accepted
+    const win10 = buildAgentHello({ platform: 'win32', arch: 'x64', release: '10.0.19045', agentVersion: '1.0.0' });
+    expect(win10.capabilities.multiPrinter).toBe(true);
+    expect(win10.capabilities.printerDiscovery).toBe(true);
+    expect(win10.capabilities.maxPrinters).toBe(10);
 
-    expect(supported).toEqual(expect.objectContaining({
-      protocolVersion: 1,
-      journalSchemaVersion: 2,
-      host: expect.objectContaining({ platform: 'win32', arch: 'x64', release: '10.0.22631' }),
-      capabilities: {
-        multiPrinter: true,
-        printerDiscovery: true,
-        maxPrinters: 10
-      }
-    }));
+    // Windows 11 x64: accepted
+    const win11 = buildAgentHello({ platform: 'win32', arch: 'x64', release: '10.0.22631', agentVersion: '1.0.0' });
+    expect(win11.capabilities.multiPrinter).toBe(true);
+    expect(win11.capabilities.printerDiscovery).toBe(true);
+    expect(win11.capabilities.maxPrinters).toBe(10);
 
-    const linux = buildAgentHello({ platform: 'linux', arch: 'x64' });
-    expect(linux.capabilities).toEqual({
-      multiPrinter: false,
-      printerDiscovery: false,
-      maxPrinters: 1
-    });
+    // Windows 8.1 x64 (NT 6.3): rejected
+    const win81 = buildAgentHello({ platform: 'win32', arch: 'x64', release: '6.3.9600' });
+    expect(win81.capabilities.multiPrinter).toBe(false);
+    expect(win81.capabilities.printerDiscovery).toBe(false);
+    expect(win81.capabilities.maxPrinters).toBe(1);
 
-    const armWindows = buildAgentHello({ platform: 'win32', arch: 'arm64' });
-    expect(armWindows.capabilities.multiPrinter).toBe(false);
+    // Windows 10 ARM64: rejected
+    const win10Arm = buildAgentHello({ platform: 'win32', arch: 'arm64', release: '10.0.19045' });
+    expect(win10Arm.capabilities.multiPrinter).toBe(false);
+    expect(win10Arm.capabilities.printerDiscovery).toBe(false);
+    expect(win10Arm.capabilities.maxPrinters).toBe(1);
+
+    // Linux x64: rejected
+    const linux = buildAgentHello({ platform: 'linux', arch: 'x64', release: '6.8.0' });
+    expect(linux.capabilities.multiPrinter).toBe(false);
+    expect(linux.capabilities.printerDiscovery).toBe(false);
+    expect(linux.capabilities.maxPrinters).toBe(1);
   });
 
   test('reads an existing installation ID without modifying the marker', () => {

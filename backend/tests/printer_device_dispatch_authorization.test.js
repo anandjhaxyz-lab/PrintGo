@@ -145,6 +145,120 @@ describe('Last-moment PrinterDevice dispatch authorization and lease lifecycle',
     }));
   });
 
+  test('blocks dispatch when an expired-but-unreleased lease exists for an unresolved job', async () => {
+    const expiredUnreleasedLease = {
+      printerDeviceId: request.printerDeviceId,
+      requestId: 'previous-request',
+      jobShortId: 'PREVIOUS_UNRESOLVED_JOB',
+      expiresAt: new Date(Date.now() - 30000), // Expired 30s ago
+      releasedAt: null
+    };
+    const socket = makeSocket();
+    const { prisma, tx } = makeDatabase({ lease: expiredUnreleasedLease });
+    // When queried for the previous job status, returns PRINTING
+    const origFindUnique = tx.printJob.findUnique;
+    tx.printJob.findUnique = jest.fn(async (args) => {
+      if (args.where?.shortId === 'PREVIOUS_UNRESOLVED_JOB') {
+        return { status: 'PRINTING' };
+      }
+      return origFindUnique(args);
+    });
+
+    const result = await authorizePrinterDeviceDispatch({ socket, prisma, request });
+
+    expect(result.code).toBe('DEVICE_UNRESOLVED_DISPATCH_LEASE');
+    expect(tx.printerDeviceDispatchLease.upsert).not.toHaveBeenCalled();
+    expect(socket.emit).toHaveBeenCalledWith('printer_device_dispatch_authorization_result', expect.objectContaining({
+      allowed: false,
+      code: 'DEVICE_UNRESOLVED_DISPATCH_LEASE'
+    }));
+  });
+
+  test('blocks dispatch when lease was force-reconciled (releasedAt set) but previous PrintJob remains PRINTING', async () => {
+    const forceReconciledLease = {
+      printerDeviceId: request.printerDeviceId,
+      requestId: 'previous-req-force-reconciled',
+      jobShortId: 'PREVIOUS_JOB_STILL_PRINTING',
+      expiresAt: new Date(Date.now() - 60000),
+      releasedAt: new Date(Date.now() - 30000) // Operator marked released
+    };
+    const socket = makeSocket();
+    const { prisma, tx } = makeDatabase({ lease: forceReconciledLease });
+    const origFindUnique = tx.printJob.findUnique;
+    tx.printJob.findUnique = jest.fn(async (args) => {
+      if (args.where?.shortId === 'PREVIOUS_JOB_STILL_PRINTING') {
+        return { status: 'PRINTING' };
+      }
+      return origFindUnique(args);
+    });
+
+    const result = await authorizePrinterDeviceDispatch({ socket, prisma, request });
+
+    expect(result.accepted).toBe(false);
+    expect(result.code).toBe('DEVICE_UNRESOLVED_DISPATCH_LEASE');
+    expect(tx.printerDeviceDispatchLease.upsert).not.toHaveBeenCalled();
+    expect(socket.emit).toHaveBeenCalledWith('printer_device_dispatch_authorization_result', expect.objectContaining({
+      allowed: false,
+      code: 'DEVICE_UNRESOLVED_DISPATCH_LEASE'
+    }));
+  });
+
+  test('permits subsequent dispatch when previous PrintJob was legitimately resolved to COMPLETED or FAILED', async () => {
+    for (const terminalStatus of ['COMPLETED', 'FAILED']) {
+      const priorLease = {
+        printerDeviceId: request.printerDeviceId,
+        requestId: 'previous-req-resolved',
+        jobShortId: 'PREVIOUS_RESOLVED_JOB',
+        expiresAt: new Date(Date.now() - 60000),
+        releasedAt: new Date(Date.now() - 30000)
+      };
+      const socket = makeSocket();
+      const { prisma, tx } = makeDatabase({ lease: priorLease });
+      const origFindUnique = tx.printJob.findUnique;
+      tx.printJob.findUnique = jest.fn(async (args) => {
+        if (args.where?.shortId === 'PREVIOUS_RESOLVED_JOB') {
+          return { status: terminalStatus };
+        }
+        return origFindUnique(args);
+      });
+
+      const result = await authorizePrinterDeviceDispatch({ socket, prisma, request });
+
+      expect(result.accepted).toBe(true);
+      expect(tx.printerDeviceDispatchLease.upsert).toHaveBeenCalled();
+      expect(socket.emit).toHaveBeenCalledWith('printer_device_dispatch_authorization_result', expect.objectContaining({
+        allowed: true,
+        requestId: request.requestId
+      }));
+    }
+  });
+
+  test('blocks dispatch when previous PrintJob physical outcome remains ambiguous', async () => {
+    const ambiguousLease = {
+      printerDeviceId: request.printerDeviceId,
+      requestId: 'previous-ambiguous-req',
+      jobShortId: 'PREVIOUS_AMBIGUOUS_JOB',
+      expiresAt: new Date(Date.now() - 10000),
+      releasedAt: new Date(Date.now() - 5000)
+    };
+    const socket = makeSocket();
+    const { prisma, tx } = makeDatabase({ lease: ambiguousLease });
+    const origFindUnique = tx.printJob.findUnique;
+    tx.printJob.findUnique = jest.fn(async (args) => {
+      if (args.where?.shortId === 'PREVIOUS_AMBIGUOUS_JOB') {
+        // Physical state ambiguous (still marked PRINTING in DB)
+        return { status: 'PRINTING' };
+      }
+      return origFindUnique(args);
+    });
+
+    const result = await authorizePrinterDeviceDispatch({ socket, prisma, request });
+
+    expect(result.accepted).toBe(false);
+    expect(result.code).toBe('DEVICE_UNRESOLVED_DISPATCH_LEASE');
+    expect(tx.printerDeviceDispatchLease.upsert).not.toHaveBeenCalled();
+  });
+
   test('allows the same correlated authorization request to be retried idempotently', async () => {
     const activeLease = {
       printerDeviceId: request.printerDeviceId,

@@ -615,6 +615,10 @@ exports.confirmCashPayment = async (req, res, next) => {
       }
       io.to(`job_${updatedJob.shortId}`).emit('kiosk_payment_success', { jobId: updatedJob.shortId });
       io.to(`job_${updatedJob.shortId}`).emit('job_status_changed', updatedJob);
+      if (updatedJob.machine?.companyId) {
+        io.to(`company_${updatedJob.machine.companyId}`).emit('job_status_changed', updatedJob);
+      }
+      io.to('superadmins').emit('job_status_changed', updatedJob);
       io.to('admins').emit('job_status_changed', updatedJob);
     }
 

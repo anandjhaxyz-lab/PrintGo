@@ -1,10 +1,18 @@
 \set ON_ERROR_STOP on
 
+BEGIN;
+
+DO $$
+BEGIN
+  IF current_database() <> 'printgo_disposable_target' THEN
+    RAISE EXCEPTION 'SAFETY CHECK FAILED: Refusing to execute migration test against database "%". Script can only run against "printgo_disposable_target".', current_database();
+  END IF;
+END $$;
+
 -- Full isolated migration-chain regression test.
 -- This creates a representative pre-multi-printer schema in a disposable schema,
 -- applies the exact production SQL for migrations 00012-00016, and rolls back.
 DROP SCHEMA IF EXISTS multi_printer_full_migration_test CASCADE;
-BEGIN;
 CREATE SCHEMA multi_printer_full_migration_test;
 SET LOCAL search_path TO multi_printer_full_migration_test, public;
 
