@@ -15,6 +15,7 @@ on:
       - feat/multi-printer-agent-device-dispatch
       - docs/hyderabad-windows-physical-certification
       - fix/multi-printer-release-review-blockers
+      - fix/ci-trigger-pr19-safety-followup
   pull_request:
     branches:
       - main
@@ -27,6 +28,7 @@ on:
       - feat/multi-printer-device-routing
       - feat/multi-printer-device-qr-session-binding
       - docs/hyderabad-windows-physical-certification
+      - fix/multi-printer-release-review-blockers
 
 jobs:
   # =========================================================================
