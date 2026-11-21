@@ -82,8 +82,16 @@ async function bootstrap() {
   try {
     console.log(`🔒 [UP-05] Requesting Windows Named Mutex: ${MUTEX_NAME}...`);
     agentMutexLock = await acquireAgentMutex({
-      isOperational: () => isAcceptingJobs && !isShuttingDown
+      onShutdown: shutdownAgent,
+      isOperational: () => {
+        const activeLanes = printerDeviceQueue ? printerDeviceQueue.getActiveLaneCount() : 0;
+        const activeMonitors = spoolerMonitor ? spoolerMonitor.getActiveMonitorCount() : 0;
+        return (isAcceptingJobs && !isShuttingDown) || activeLanes > 0 || activeMonitors > 0;
+      }
     });
+    if (agentMutexLock && typeof agentMutexLock.registerShutdown === 'function') {
+      agentMutexLock.registerShutdown(shutdownAgent);
+    }
     console.log(`✅ [UP-05] Windows Named Mutex acquired and locked for process lifetime: ${MUTEX_NAME}`);
   } catch (err) {
     if (err.code === 'MUTEX_ALREADY_HELD') {
@@ -164,12 +172,33 @@ async function shutdownAgent(signal) {
   isAcceptingJobs = false;
   console.log(`🛑 [Agent Shutdown] Received ${signal || 'shutdown signal'}. Executing graceful teardown...`);
 
-  // 1. Stop heartbeat and keep-alive timers
+  // 1. Stop heartbeat and keep-alive timers immediately
   if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
   if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
   if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
 
-  // 2. Disconnect socket cleanly
+  // 2. Deterministic queue drain (bounded timeout: 10s)
+  const laneCount = printerDeviceQueue ? printerDeviceQueue.getActiveLaneCount() : 0;
+  if (laneCount > 0) {
+    console.log(`⏳ [Agent Shutdown] Draining printer device queues (${laneCount} active lanes)...`);
+    await printerDeviceQueue.drain({ timeoutMs: 10000 });
+    console.log(`✅ [Agent Shutdown] Printer device queues drained successfully.`);
+  }
+
+  // 3. Safely settle active spooler monitors (bounded timeout)
+  if (spoolerMonitor && typeof spoolerMonitor.settleActiveMonitors === 'function') {
+    await spoolerMonitor.settleActiveMonitors({
+      socket,
+      reason: `AGENT_SHUTDOWN_${signal || 'SIGINT'}`
+    });
+  }
+
+  // 4. Settle pending registry refresh
+  if (pendingRegistryRefresh) {
+    settleRegistryRefresh(pendingRegistryRefresh.requestId, false, { code: 'AGENT_SHUTDOWN', message: 'Agent shutting down' });
+  }
+
+  // 5. Disconnect socket cleanly
   if (socket) {
     try {
       if (socket.connected) {

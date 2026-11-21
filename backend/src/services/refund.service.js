@@ -123,6 +123,24 @@ const createRefund = async (params) => {
     // Acquire exclusive transaction advisory lock scoped to this specific payment
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('payment_refund_${payment.id}'))`);
 
+    // Mutual safety with retry: cannot refund payment if any associated print job is WAITING or PRINTING
+    if (tx.printJob && typeof tx.printJob.findMany === 'function') {
+      const activeJobs = await tx.printJob.findMany({
+        where: {
+          paymentId: payment.id,
+          status: { in: ['WAITING', 'PRINTING'] }
+        },
+        select: { shortId: true, status: true }
+      });
+      if (activeJobs.length > 0) {
+        const activeDescs = activeJobs.map(j => `${j.shortId} (${j.status})`).join(', ');
+        throw new AppError(
+          `Cannot refund payment ${payment.id}: Active print job is currently in progress: ${activeDescs}.`,
+          409
+        );
+      }
+    }
+
     // Re-verify idempotency inside lock
     let claimedRefund = null;
     if (idempotencyKey) {

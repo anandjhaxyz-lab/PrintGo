@@ -22,7 +22,9 @@ jest.mock('../src/middlewares/readOnlyGuard', () => ({
 
 const mockJobs = new Map();
 const mockPayments = new Map();
+const mockRefunds = new Map();
 const mockActivityLogs = [];
+const mockPrintHistories = [];
 
 const mockPrisma = {
   printJob: {
@@ -53,8 +55,13 @@ const mockPrisma = {
       return results;
     }),
     updateMany: jest.fn(async ({ where, data }) => {
-      const shortId = where.shortId;
-      const job = mockJobs.get(shortId);
+      let job = null;
+      if (where.shortId) job = mockJobs.get(where.shortId);
+      else if (where.id) {
+        for (const j of mockJobs.values()) {
+          if (j.id === where.id) { job = j; break; }
+        }
+      }
       if (!job) return { count: 0 };
 
       if (where.status && job.status !== where.status) return { count: 0 };
@@ -114,8 +121,41 @@ const mockPrisma = {
       return { id: `log-${Date.now()}`, ...data };
     })
   },
+  printHistory: {
+    create: jest.fn(async ({ data }) => {
+      mockPrintHistories.push(data);
+      return { id: `hist-${Date.now()}`, ...data };
+    })
+  },
+  refund: {
+    findFirst: jest.fn(async ({ where }) => {
+      for (const r of mockRefunds.values()) {
+        if (where.paymentId && r.paymentId === where.paymentId) {
+          if (where.status?.in && where.status.in.includes(r.status)) {
+            return { ...r };
+          }
+        }
+      }
+      return null;
+    })
+  },
   $transaction: jest.fn(async (callback) => {
-    return await callback(mockPrisma);
+    // Snapshot state for transaction rollback simulation
+    const jobsSnapshot = new Map([...mockJobs.entries()].map(([k, v]) => [k, { ...v }]));
+    const paymentsSnapshot = new Map([...mockPayments.entries()].map(([k, v]) => [k, { ...v }]));
+    const logsLengthSnapshot = mockActivityLogs.length;
+    const historyLengthSnapshot = mockPrintHistories.length;
+    try {
+      return await callback(mockPrisma);
+    } catch (err) {
+      mockJobs.clear();
+      for (const [k, v] of jobsSnapshot) mockJobs.set(k, v);
+      mockPayments.clear();
+      for (const [k, v] of paymentsSnapshot) mockPayments.set(k, v);
+      mockActivityLogs.length = logsLengthSnapshot;
+      mockPrintHistories.length = historyLengthSnapshot;
+      throw err;
+    }
   })
 };
 
@@ -139,8 +179,18 @@ describe('UP-02: Transaction-Wide Maximum Attempts Enforcement (Max 3 Total Atte
     jest.clearAllMocks();
     mockJobs.clear();
     mockPayments.clear();
+    mockRefunds.clear();
     mockActivityLogs.length = 0;
+    mockPrintHistories.length = 0;
     mockCurrentUser = superadmin;
+    mockPrisma.activityLog.create.mockImplementation(async ({ data }) => {
+      mockActivityLogs.push(data);
+      return { id: `log-${Date.now()}`, ...data };
+    });
+    mockPrisma.printHistory.create.mockImplementation(async ({ data }) => {
+      mockPrintHistories.push(data);
+      return { id: `hist-${Date.now()}`, ...data };
+    });
   });
 
   test('1. Original dispatch reserves attempt 1 atomically and transitions WAITING to PRINTING', async () => {
@@ -305,11 +355,12 @@ describe('UP-02: Transaction-Wide Maximum Attempts Enforcement (Max 3 Total Atte
     expect(res.body.maxAttempts).toBe(3);
   });
 
-  test('6. Admin dispatch allows authorized retry from FAILED when attempts < 3', async () => {
+  test('6. Admin dispatch allows authorized retry from FAILED when attempts < 3 and valid reason provided', async () => {
     const shortId = 'job-admin-retry';
     const paymentId = 'pay-admin-retry';
     mockPayments.set(paymentId, {
       id: paymentId,
+      status: 'SUCCESS',
       authorizedPrintAttempts: 1,
       legacyAttemptsUnknown: false
     });
@@ -327,7 +378,7 @@ describe('UP-02: Transaction-Wide Maximum Attempts Enforcement (Max 3 Total Atte
 
     const res = await request(app)
       .post('/api/admin/dispatch-job')
-      .send({ shortId });
+      .send({ shortId, reason: 'Paper jam cleared by operator, retrying print' });
 
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
@@ -337,6 +388,415 @@ describe('UP-02: Transaction-Wide Maximum Attempts Enforcement (Max 3 Total Atte
     const saved = mockJobs.get(shortId);
     expect(saved.status).toBe('PRINTING');
     expect(saved.printAttempts).toBe(2);
+
+    const auditLog = mockActivityLogs.find(l => l.action === 'PRINT_JOB_AUTHORIZED_RETRY');
+    expect(auditLog).toBeDefined();
+    const details = JSON.parse(auditLog.details);
+    expect(details.operatorReason).toBe('Paper jam cleared by operator, retrying print');
+    expect(details.currentAttempts).toBe(1);
+    expect(details.maxAttempts).toBe(3);
+    expect(details.previousStatus).toBe('FAILED');
+    expect(details.newStatus).toBe('WAITING');
+  });
+
+  test('6a. Admin dispatch rejects retry from FAILED if operator reason is missing', async () => {
+    const shortId = 'job-admin-no-reason';
+    const paymentId = 'pay-admin-no-reason';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-no-reason',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId }); // No reason
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('INVALID_OPERATOR_REASON');
+  });
+
+  test('6b. Admin dispatch rejects retry from FAILED if operator reason is less than 10 non-whitespace characters', async () => {
+    const shortId = 'job-admin-short-reason';
+    const paymentId = 'pay-admin-short-reason';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-short-reason',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: '   retry   ' }); // 5 non-whitespace chars
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('INVALID_OPERATOR_REASON');
+  });
+
+  test('6c. Admin dispatch rejects retry from FAILED if payment status is not SUCCESS', async () => {
+    const shortId = 'job-admin-bad-payment';
+    const paymentId = 'pay-admin-bad-payment';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'FAILED', // Payment not confirmed
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-bad-payment',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('PAYMENT_NOT_CONFIRMED');
+  });
+
+  test('6d. Admin dispatch rejects retry from FAILED if job has legacyAttemptsUnknown: true', async () => {
+    const shortId = 'job-admin-legacy-fail';
+    const paymentId = 'pay-admin-legacy-fail';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-legacy-fail',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: true, // Legacy unknown attempt count
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('LEGACY_ATTEMPTS_EXHAUSTED');
+  });
+
+  test('6e. Admin dispatch rejects concurrent retry if job is no longer in FAILED', async () => {
+    const shortId = 'job-admin-concurrent-retry';
+    const paymentId = 'pay-admin-concurrent-retry';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-concurrent-retry',
+      shortId,
+      status: 'PRINTING', // Concurrently already claimed by another operator
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('AMBIGUOUS_JOB_LOCKED');
+  });
+
+  test('6f. Admin dispatch rolls back to FAILED if queue submission throws exception', async () => {
+    const shortId = 'job-admin-queue-crash';
+    const paymentId = 'pay-admin-queue-crash';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-queue-crash',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    // Mock startPrintingProcess throwing an unexpected error
+    const spy = jest.spyOn(queueService, 'startPrintingProcess').mockImplementationOnce(async () => {
+      throw new Error('Redis connection dropped during queue submission');
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    // Internal server error or caught error
+    expect(res.status).toBe(500);
+
+    // Job must be rolled back to FAILED, NOT stranded in WAITING
+    const saved = mockJobs.get(shortId);
+    expect(saved.status).toBe('FAILED');
+    spy.mockRestore();
+  });
+
+  test('6g. Admin dispatch rejects retry of commercial job (cost > 0, !isTest) when payment record is missing', async () => {
+    const shortId = 'job-admin-no-payment-commercial';
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-no-pay',
+      shortId,
+      status: 'FAILED',
+      paymentId: null,
+      payment: null,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 15,
+      isTest: false,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('PAYMENT_REQUIRED');
+  });
+
+  test('6h. Admin dispatch permits retry of zero-cost or test print without payment record', async () => {
+    const shortId = 'job-admin-test-print-no-pay';
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-test-no-pay',
+      shortId,
+      status: 'FAILED',
+      paymentId: null,
+      payment: null,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 0,
+      isTest: true,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Hardware diagnostic test print re-dispatch' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.attempts).toBe(2);
+  });
+
+  test('6i. Admin dispatch rolls back retry and fails if ActivityLog write fails', async () => {
+    const shortId = 'job-admin-audit-fail-act';
+    const paymentId = 'pay-admin-audit-fail-act';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-audit-fail-act',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const spy = jest.spyOn(mockPrisma.activityLog, 'create').mockImplementationOnce(async () => {
+      throw new Error('Database disk full: cannot commit ActivityLog record');
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    expect(res.status).toBe(500);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('RETRY_TRANSACTION_FAILED');
+
+    // Job MUST remain in FAILED status (transaction was rolled back)
+    const jobAfter = mockJobs.get(shortId);
+    expect(jobAfter.status).toBe('FAILED');
+    spy.mockRestore();
+  });
+
+  test('6j. Admin dispatch rolls back retry and fails if PrintHistory write fails', async () => {
+    const shortId = 'job-admin-audit-fail-hist';
+    const paymentId = 'pay-admin-audit-fail-hist';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-audit-fail-hist',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const spy = jest.spyOn(mockPrisma.printHistory, 'create').mockImplementationOnce(async () => {
+      throw new Error('Database constraint error: cannot commit PrintHistory record');
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    expect(res.status).toBe(500);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('RETRY_TRANSACTION_FAILED');
+
+    // Job MUST remain in FAILED status (transaction was rolled back)
+    const jobAfter = mockJobs.get(shortId);
+    expect(jobAfter.status).toBe('FAILED');
+    spy.mockRestore();
+  });
+
+  test('6k. Admin dispatch rejects retry if payment has an active or completed refund', async () => {
+    const shortId = 'job-admin-refunded-pay';
+    const paymentId = 'pay-admin-refunded-pay';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockRefunds.set('ref-01', {
+      id: 'ref-01',
+      paymentId,
+      status: 'SUCCESS'
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-refunded-pay',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified hardware resolved and retrying' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toBe('PAYMENT_ALREADY_REFUNDED');
+
+    // Job MUST remain in FAILED
+    const jobAfter = mockJobs.get(shortId);
+    expect(jobAfter.status).toBe('FAILED');
+  });
+
+  test('6l. Successful retry durably commits both ActivityLog and PrintHistory records', async () => {
+    const shortId = 'job-admin-audit-success';
+    const paymentId = 'pay-admin-audit-success';
+    mockPayments.set(paymentId, {
+      id: paymentId,
+      status: 'SUCCESS',
+      authorizedPrintAttempts: 1,
+      legacyAttemptsUnknown: false
+    });
+    mockJobs.set(shortId, {
+      id: 'uuid-admin-audit-success',
+      shortId,
+      status: 'FAILED',
+      paymentId,
+      printAttempts: 1,
+      legacyAttemptsUnknown: false,
+      cost: 10,
+      machineId: 'm-01',
+      document: { filename: 'doc.pdf', originalName: 'doc.pdf' }
+    });
+
+    const res = await request(app)
+      .post('/api/admin/dispatch-job')
+      .send({ shortId, reason: 'Operator verified paper tray replenished and ready' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+
+    // Verify ActivityLog was durably committed
+    expect(mockActivityLogs.length).toBeGreaterThan(0);
+    const retryLog = mockActivityLogs.find(l => l.action === 'PRINT_JOB_AUTHORIZED_RETRY');
+    expect(retryLog).toBeDefined();
+    const details = JSON.parse(retryLog.details);
+    expect(details.operatorReason).toBe('Operator verified paper tray replenished and ready');
+    expect(details.previousStatus).toBe('FAILED');
+    expect(details.newStatus).toBe('WAITING');
+
+    // Verify PrintHistory was durably committed
+    expect(mockPrintHistories.length).toBeGreaterThan(0);
+    const retryHist = mockPrintHistories.find(h => h.errorDetails && h.errorDetails.includes('Authorized operator retry'));
+    expect(retryHist).toBeDefined();
+    expect(retryHist.printJobId).toBe('uuid-admin-audit-success');
   });
 
   test('7. UP-03 check: Admin dispatch rejects re-dispatch when job is currently in PRINTING', async () => {
