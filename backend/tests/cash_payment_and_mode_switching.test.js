@@ -854,8 +854,18 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
       await queueService.startPrintingProcess('job_q_1', mockIo);
 
       expect(mockPrisma.printJob.updateMany).toHaveBeenCalledWith({
-        where: { shortId: 'job_q_1', status: 'WAITING', printerDeviceId: null },
-        data: { status: 'PRINTING' }
+        where: {
+          shortId: 'job_q_1',
+          status: 'WAITING',
+          printerDeviceId: null,
+          printAttempts: { lt: 3 },
+          legacyAttemptsUnknown: false
+        },
+        data: {
+          status: 'PRINTING',
+          printAttempts: { increment: 1 },
+          reservedForRetry: false
+        }
       });
       expect(mockIo.to).toHaveBeenCalledWith('machine_mach-1');
       expect(mockIo.emit).toHaveBeenCalledWith('physical_print_job', expect.objectContaining({
@@ -875,9 +885,11 @@ describe('PrintGo — Cash Payment Mode & Payment Mode Switcher', () => {
       // Simulate DB failure before accepting
       mockPrisma.printJob.updateMany.mockRejectedValue(new Error('DB connection timeout'));
 
-      await queueService.startPrintingProcess('job_q_fail', mockIo);
+      await expect(
+        queueService.startPrintingProcess('job_q_fail', mockIo)
+      ).rejects.toThrow('DB connection timeout');
 
-      // Emitted physical print job must NOT have been called
+      // A failed database reservation must not emit a physical print job
       expect(mockIo.emit).not.toHaveBeenCalledWith('physical_print_job', expect.anything());
     });
 

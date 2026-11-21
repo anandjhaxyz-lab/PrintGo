@@ -7,6 +7,32 @@
 
 const logger = require('./logger');
 
+const MIN_OPERATOR_REASON_LENGTH = 10;
+
+/**
+ * Validates that an operator reason meets UP-04 requirements:
+ * String with at least 10 non-whitespace characters.
+ * @param {string} reason
+ * @returns {{ valid: boolean, sanitized?: string, error?: string }}
+ */
+const validateOperatorReason = (reason) => {
+  if (!reason || typeof reason !== 'string') {
+    return {
+      valid: false,
+      error: 'An operator reason containing at least 10 non-whitespace characters is required.'
+    };
+  }
+  const sanitized = reason.trim();
+  const nonWhitespaceLength = sanitized.replace(/\s/g, '').length;
+  if (nonWhitespaceLength < MIN_OPERATOR_REASON_LENGTH) {
+    return {
+      valid: false,
+      error: `An operator reason containing at least ${MIN_OPERATOR_REASON_LENGTH} non-whitespace characters is required (received ${nonWhitespaceLength}).`
+    };
+  }
+  return { valid: true, sanitized };
+};
+
 // ============================================================
 // Print Job State Machine
 // ============================================================
@@ -19,13 +45,20 @@ const logger = require('./logger');
 //                                    ▼
 //                                CANCELLED
 //
+// Explicit Authorized Retry (UP-04 Operator Governed):
+//  FAILED ──(Authorized Operator Retry with >= 10 char reason)──► WAITING
+//
 const PRINT_JOB_TRANSITIONS = {
   'PENDING_PAYMENT': ['WAITING', 'CANCELLED'],
   'WAITING':         ['PRINTING', 'CANCELLED'],
   'PRINTING':        ['COMPLETED', 'FAILED'],
   'COMPLETED':       [],  // Terminal state
-  'FAILED':          ['CANCELLED'],  // Can be cancelled for refund processing
+  'FAILED':          ['CANCELLED'],  // Normal transitions only allow CANCELLED
   'CANCELLED':       [],  // Terminal state
+};
+
+const AUTHORIZED_RETRY_TRANSITIONS = {
+  'FAILED': ['WAITING']
 };
 
 // ============================================================
@@ -74,8 +107,16 @@ const isValidTransition = (transitions, entityType, currentStatus, newStatus) =>
 
 /**
  * Validate a PrintJob status transition.
+ * Supports explicit authorized retry from FAILED -> WAITING when options.authorizedRetry = true.
  */
-const isValidJobTransition = (currentStatus, newStatus) => {
+const isValidJobTransition = (currentStatus, newStatus, options = {}) => {
+  if (currentStatus === 'FAILED' && newStatus === 'WAITING') {
+    if (options && (options.authorizedRetry === true || options.isAuthorizedRetry === true)) {
+      return true;
+    }
+    logger.warn(`PrintJob: Retry transition "FAILED" → "WAITING" requires explicit operator authorization.`);
+    return false;
+  }
   return isValidTransition(PRINT_JOB_TRANSITIONS, 'PrintJob', currentStatus, newStatus);
 };
 
@@ -98,6 +139,9 @@ const PAYMENT_STATUSES = Object.keys(PAYMENT_TRANSITIONS);
 
 module.exports = {
   PRINT_JOB_TRANSITIONS,
+  AUTHORIZED_RETRY_TRANSITIONS,
+  MIN_OPERATOR_REASON_LENGTH,
+  validateOperatorReason,
   PAYMENT_TRANSITIONS,
   isValidJobTransition,
   isValidPaymentTransition,

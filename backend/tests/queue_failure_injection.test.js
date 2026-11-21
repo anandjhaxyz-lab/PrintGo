@@ -364,9 +364,22 @@ async function runTests() {
 
     mockIo.clear();
 
+    const requestId = `rec_${socketA.machineId}_${Date.now()}_${crypto.randomUUID()}`;
+    socketA.activeReconciliation = {
+      requestId,
+      machineId: socketA.machineId,
+      jobIds: new Set([shortId]),
+      validatedCompletions: new Map(),
+      consumedJobs: new Set(),
+      createdAt: Date.now()
+    };
+    if (!socketA.pendingReconciliations) socketA.pendingReconciliations = new Map();
+    socketA.pendingReconciliations.set(requestId, socketA.activeReconciliation);
+
     // Agent reconnects and sends completion proof
     await socketA.trigger('print_physical_success', {
       jobId: shortId,
+      requestId,
       reconciled: true,
       wasSeenInQueue: true
     });

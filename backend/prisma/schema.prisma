@@ -307,6 +307,8 @@ model Payment {
   type             String
   confirmedBy      String?       // Admin / Operator user ID or email for cash confirmation
   confirmedAt      DateTime?     // Cash confirmation timestamp
+  authorizedPrintAttempts Int   @default(0) // UP-02: Transaction-wide print attempt counter (max 3 total attempts)
+  legacyAttemptsUnknown   Boolean @default(false) // UP-02: Fail-closed flag for legacy transactions with unverified attempt history
 
   transactions     Transaction[]
   refunds          Refund[]
@@ -446,6 +448,9 @@ model PrintJob {
   iv            String?
   
   isTest        Boolean       @default(false)
+  printAttempts Int           @default(0) // UP-02: Persistent dispatch attempt counter (max 3 total attempts)
+  legacyAttemptsUnknown Boolean @default(false) // UP-02: Fail-closed flag for legacy jobs with unverified attempt history
+  reservedForRetry  Boolean  @default(false) // UP-02: Set atomically by admin retry transaction; cleared after WAITING→PRINTING claim
   
   invoice       Invoice?
   printHistory  PrintHistory[]

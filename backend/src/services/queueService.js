@@ -1,4 +1,5 @@
 const { Queue, Worker } = require('bullmq');
+const crypto = require('crypto');
 const { connection } = require('./redisClient');
 const prisma = require('../utils/prisma');
 const { isValidJobTransition } = require('../utils/stateMachine');
@@ -160,13 +161,59 @@ if (!useRedis) {
 
 let globalIo = null;
 
-const processJob = async (shortId) => {
+const MAX_PRINT_ATTEMPTS = 3;
+
+const processJob = async (shortId, options = {}) => {
+  const isAuthorizedRetry = Boolean(options.isAuthorizedRetry);
   try {
     const dbJob = await prisma.printJob.findUnique({
       where: { shortId },
       include: { document: true, printerDevice: true, payment: true }
     });
-    if (!dbJob) return;
+    if (!dbJob) return { success: false, code: 'JOB_NOT_FOUND', message: `Job ${shortId} not found` };
+
+    // UP-02: Fast fail-closed check for legacy unverified attempts
+    if (dbJob.legacyAttemptsUnknown || (dbJob.payment && dbJob.payment.legacyAttemptsUnknown)) {
+      console.warn(`Job ${shortId}: Legacy transaction has unverified historical attempts. Re-dispatch is disallowed under UP-02.`);
+      return {
+        success: false,
+        code: 'LEGACY_ATTEMPTS_EXHAUSTED',
+        message: `Job ${shortId} belongs to a legacy transaction with unverified historical attempts. Re-dispatch is disallowed under fail-closed policy UP-02.`,
+        attempts: MAX_PRINT_ATTEMPTS,
+        maxAttempts: MAX_PRINT_ATTEMPTS
+      };
+    }
+
+    // UP-02 Canonical Policy: Maximum 3 total authorized print attempts per transaction (including original)
+    const currentAttempts = dbJob.printAttempts || 0;
+    if (currentAttempts >= MAX_PRINT_ATTEMPTS) {
+      console.warn(`Job ${shortId}: Maximum print attempts reached (${currentAttempts}/${MAX_PRINT_ATTEMPTS}). Disallowing physical print dispatch.`);
+      return {
+        success: false,
+        code: 'MAX_PRINT_ATTEMPTS_EXCEEDED',
+        message: `Maximum ${MAX_PRINT_ATTEMPTS} print attempts exceeded for job ${shortId}. Current attempts: ${currentAttempts}.`,
+        attempts: currentAttempts,
+        maxAttempts: MAX_PRINT_ATTEMPTS
+      };
+    }
+
+    // Fast check on payment level if payment is already exhausted
+    if (dbJob.payment) {
+      const isExhausted = isAuthorizedRetry
+        ? dbJob.payment.authorizedPrintAttempts > MAX_PRINT_ATTEMPTS
+        : dbJob.payment.authorizedPrintAttempts >= MAX_PRINT_ATTEMPTS;
+
+      if (isExhausted) {
+        console.warn(`Payment ${dbJob.paymentId}: Transaction print attempts cap reached (${dbJob.payment.authorizedPrintAttempts}/${MAX_PRINT_ATTEMPTS}). Disallowing dispatch for job ${shortId}.`);
+        return {
+          success: false,
+          code: 'MAX_PRINT_ATTEMPTS_EXCEEDED',
+          message: `Maximum ${MAX_PRINT_ATTEMPTS} print attempts exceeded for payment transaction ${dbJob.paymentId}. Total attempts: ${dbJob.payment.authorizedPrintAttempts}.`,
+          attempts: dbJob.payment.authorizedPrintAttempts,
+          maxAttempts: MAX_PRINT_ATTEMPTS
+        };
+      }
+    }
 
     // Device-bound jobs are dispatched only after the explicit feature gate and
     // a fresh DB check of Machine ownership, approval evidence and exact queue.
@@ -200,36 +247,170 @@ const processJob = async (shortId) => {
 
       if (blockedCode) {
         await failBlockedDeviceDispatch(dbJob, 'WAITING', blockedCode, blockedReason);
-        return;
+        return { success: false, code: blockedCode, message: blockedReason };
       }
     }
 
     // Validate state transition using state machine
     if (!isValidJobTransition(dbJob.status, 'PRINTING')) {
       console.warn(`Job ${shortId}: cannot transition from ${dbJob.status} to PRINTING, skipping`);
-      return;
+      return {
+        success: false,
+        code: 'INVALID_TRANSITION',
+        message: `Job ${shortId}: cannot transition from ${dbJob.status} to PRINTING.`
+      };
     }
 
-    // Atomic test-and-set: guarantee exactly-once transition from WAITING to PRINTING
-    // Ensures concurrent dispatches, interruptions, and admin retries cannot duplicate physical prints
-    const updateResult = await prisma.printJob.updateMany({
-      where: {
-        shortId,
-        status: 'WAITING',
-        printerDeviceId: dbJob.printerDeviceId || null
-      },
-      data: { status: 'PRINTING' }
-    });
+    // Authoritative Database Transaction-level Atomic Reservation:
+    // Guarantees serialization across sibling jobs sharing the same paymentId,
+    // and atomic claim of the PrintJob from WAITING to PRINTING.
+    const executeReservation = async (client) => {
+      // Step A: If paymentId is present, check and reserve attempts.
+      // If isAuthorizedRetry is true:
+      // The retry transaction in admin.routes.js already atomically incremented Payment.authorizedPrintAttempts before commit.
+      // Therefore, we do not double-increment Payment.authorizedPrintAttempts here.
+      // If isAuthorizedRetry is false:
+      // This is a fresh/standard dispatch that must atomically claim an attempt on the Payment row.
+      if (dbJob.paymentId) {
+        if (!isAuthorizedRetry) {
+          const payRes = await client.payment.updateMany({
+            where: {
+              id: dbJob.paymentId,
+              authorizedPrintAttempts: { lt: MAX_PRINT_ATTEMPTS },
+              legacyAttemptsUnknown: false
+            },
+            data: {
+              authorizedPrintAttempts: { increment: 1 }
+            }
+          });
 
-    if (updateResult.count === 0) {
-      console.warn(`Job ${shortId}: cannot claim WAITING lock (job is already printing or processed), skipping physical print dispatch`);
-      return;
+          if (payRes.count === 0) {
+            const currentPayment = await client.payment.findUnique({
+              where: { id: dbJob.paymentId },
+              select: { authorizedPrintAttempts: true, legacyAttemptsUnknown: true }
+            });
+            if (currentPayment?.legacyAttemptsUnknown) {
+              const err = new Error(`Payment transaction ${dbJob.paymentId} has unverified legacy attempt history.`);
+              err.code = 'LEGACY_ATTEMPTS_EXHAUSTED';
+              throw err;
+            }
+            const reservedAttempts = currentPayment?.authorizedPrintAttempts ?? MAX_PRINT_ATTEMPTS;
+            const err = new Error(`Maximum ${MAX_PRINT_ATTEMPTS} print attempts exceeded for payment transaction ${dbJob.paymentId}. Total attempts: ${reservedAttempts}.`);
+            err.code = 'MAX_PRINT_ATTEMPTS_EXCEEDED';
+            err.attempts = reservedAttempts;
+            err.maxAttempts = MAX_PRINT_ATTEMPTS;
+            throw err;
+          }
+        } else {
+          // For authorized retries, ensure payment does not have unverified legacy history or exceed cap
+          const currentPayment = await client.payment.findUnique({
+            where: { id: dbJob.paymentId },
+            select: { authorizedPrintAttempts: true, legacyAttemptsUnknown: true }
+          });
+          if (currentPayment?.legacyAttemptsUnknown) {
+            const err = new Error(`Payment transaction ${dbJob.paymentId} has unverified legacy attempt history.`);
+            err.code = 'LEGACY_ATTEMPTS_EXHAUSTED';
+            throw err;
+          }
+          if ((currentPayment?.authorizedPrintAttempts ?? 0) > MAX_PRINT_ATTEMPTS) {
+            const err = new Error(`Maximum ${MAX_PRINT_ATTEMPTS} print attempts exceeded for payment transaction ${dbJob.paymentId}. Total attempts: ${currentPayment.authorizedPrintAttempts}.`);
+            err.code = 'MAX_PRINT_ATTEMPTS_EXCEEDED';
+            err.attempts = currentPayment.authorizedPrintAttempts;
+            err.maxAttempts = MAX_PRINT_ATTEMPTS;
+            throw err;
+          }
+        }
+      }
+
+      // Step B: Atomically claim PrintJob WAITING -> PRINTING and increment its printAttempts
+      const jobRes = await client.printJob.updateMany({
+        where: {
+          shortId,
+          status: 'WAITING',
+          printerDeviceId: dbJob.printerDeviceId || null,
+          printAttempts: { lt: MAX_PRINT_ATTEMPTS },
+          legacyAttemptsUnknown: false
+        },
+        data: {
+          status: 'PRINTING',
+          printAttempts: { increment: 1 },
+          reservedForRetry: false  // Clear reservation flag atomically with the WAITING→PRINTING transition
+        }
+      });
+
+      if (jobRes.count === 0) {
+        const err = new Error(`Cannot claim WAITING lock or maximum attempts reached for job ${shortId}.`);
+        err.code = 'DISPATCH_CLAIM_FAILED';
+        throw err;
+      }
+
+      const updated = await client.printJob.findUnique({
+        where: { shortId },
+        include: { document: true, printerDevice: true, payment: true }
+      });
+
+      return updated;
+    };
+
+    let updatedJob = null;
+    try {
+      if (typeof prisma.$transaction === 'function') {
+        updatedJob = await prisma.$transaction(async (tx) => {
+          return await executeReservation(tx);
+        }, { maxWait: 5000, timeout: 10000 });
+      } else {
+        updatedJob = await executeReservation(prisma);
+      }
+    } catch (resErr) {
+      if (resErr.code === 'MAX_PRINT_ATTEMPTS_EXCEEDED') {
+        console.warn(`Job ${shortId}: Transaction print attempts cap reached. Disallowing dispatch.`);
+        return {
+          success: false,
+          code: 'MAX_PRINT_ATTEMPTS_EXCEEDED',
+          message: resErr.message,
+          attempts: resErr.attempts || MAX_PRINT_ATTEMPTS,
+          maxAttempts: MAX_PRINT_ATTEMPTS
+        };
+      }
+      if (resErr.code === 'LEGACY_ATTEMPTS_EXHAUSTED') {
+        console.warn(`Job ${shortId}: ${resErr.message}`);
+        return {
+          success: false,
+          code: 'LEGACY_ATTEMPTS_EXHAUSTED',
+          message: resErr.message,
+          attempts: MAX_PRINT_ATTEMPTS,
+          maxAttempts: MAX_PRINT_ATTEMPTS
+        };
+      }
+      if (resErr.code === 'DISPATCH_CLAIM_FAILED') {
+        console.warn(`Job ${shortId}: cannot claim WAITING lock or attempt limit reached, skipping physical print dispatch`);
+        return {
+          success: false,
+          code: 'DISPATCH_CLAIM_FAILED',
+          message: resErr.message
+        };
+      }
+      throw resErr;
     }
 
-    const updatedJob = await prisma.printJob.findUnique({
-      where: { shortId },
-      include: { document: true, printerDevice: true, payment: true }
-    });
+    // Record persistent attempt audit trail in ActivityLog
+    if (prisma.activityLog && typeof prisma.activityLog.create === 'function') {
+      await prisma.activityLog.create({
+        data: {
+          action: 'PRINT_ATTEMPT_DISPATCHED',
+          details: JSON.stringify({
+            jobId: updatedJob.id,
+            shortId: updatedJob.shortId,
+            attempt: updatedJob.printAttempts,
+            maxAttempts: MAX_PRINT_ATTEMPTS,
+            machineId: updatedJob.machineId,
+            printerDeviceId: updatedJob.printerDeviceId || null,
+            timestamp: new Date().toISOString()
+          }),
+          machineId: updatedJob.machineId || null
+        }
+      }).catch((logErr) => console.error('Failed to log attempt in ActivityLog:', logErr.message));
+    }
 
     // Re-check immediately before sending the Agent event. A concurrent Admin
     // disable/remap after the initial read must fail closed, never fall back.
@@ -296,6 +477,12 @@ const processJob = async (shortId) => {
       console.log(`Job ${shortId} is now PRINTING. Waiting for agent feedback...`);
       // The physical printer agent will now respond with 'print_spooler_success' or 'print_spooler_error'
       // which will be handled in socket.js to mark the job as COMPLETED or FAILED.
+      return {
+        success: true,
+        shortId,
+        attempts: updatedJob.printAttempts,
+        maxAttempts: MAX_PRINT_ATTEMPTS
+      };
   } catch(e) {
     console.error(`Error processing job ${shortId}:`, e);
     throw e;
@@ -312,8 +499,8 @@ const initWorker = async (io) => {
     // deterministic. Per-device lanes in the Agent serialize same-printer work
     // while allowing independent printers to download/submit in parallel.
     printWorker = new Worker('printQueue', async (job) => {
-      const { shortId } = job.data;
-      await processJob(shortId);
+      const { shortId, isAuthorizedRetry } = job.data;
+      await processJob(shortId, { isAuthorizedRetry });
     }, { connection, concurrency: 1 });
 
     printWorker.on('failed', (job, err) => {
@@ -325,6 +512,9 @@ const initWorker = async (io) => {
       printWorker.waitUntilReady()
     ]);
     workerReady = true;
+    reconcileStrandedWaitingJobs({ io }).catch(err => {
+      console.error('[STRANDED_JOB_RECONCILER] Initial worker startup sweep failed:', err.message);
+    });
     return printWorker;
   } catch (error) {
     workerReady = false;
@@ -341,13 +531,16 @@ const initWorker = async (io) => {
   }
 };
 
-const startPrintingProcess = async (shortId, io) => {
+const startPrintingProcess = async (shortId, io, options = {}) => {
   if (io) globalIo = io;
 
   if (useRedis && printQueue) {
     let timeoutId;
     try {
-      const enqueuePromise = printQueue.add('printJob', { shortId }, {
+      const enqueuePromise = printQueue.add('printJob', {
+        shortId,
+        isAuthorizedRetry: Boolean(options.isAuthorizedRetry)
+      }, {
         jobId: `print_${shortId}`,
         attempts: 1, // Preserve the no-automatic-reprint safety policy.
         removeOnComplete: true,
@@ -370,7 +563,7 @@ const startPrintingProcess = async (shortId, io) => {
       }
       console.warn(`Redis queue unavailable (${error.message}), using the development/test in-memory fallback.`);
       try {
-        await processJob(shortId);
+        await processJob(shortId, options);
       } catch (processingError) {
         // Preserve the existing non-production fallback contract. BullMQ Worker
         // executions still receive the rethrow from processJob above.
@@ -383,11 +576,12 @@ const startPrintingProcess = async (shortId, io) => {
     throw new Error('Durable print queue is not ready; refusing an in-memory physical print dispatch.');
   } else {
     try {
-      await processJob(shortId);
+      return await processJob(shortId, options);
     } catch (processingError) {
       // Keep development/test callers non-throwing on local direct dispatch.
       // The durable BullMQ Worker path still records thrown processor errors.
       console.error(`Development/test in-memory fallback failed for job ${shortId}:`, processingError);
+      throw processingError;
     }
   }
 };
@@ -624,49 +818,253 @@ const cleanupAbandonedJobs = async (options = {}) => {
   return summary;
 };
 
-// Cleanup abandoned jobs and stuck PRINTING jobs every 15 minutes
+/**
+ * Safely handles PRINTING jobs that have exceeded the active execution threshold.
+ *
+ * UP-03 Ambiguity Lockout & UP-06 Fail-Closed Policy:
+ * 1. NEVER marks PRINTING as FAILED solely because a time threshold elapsed.
+ * 2. NEVER automatically refunds a PRINTING job merely because it is old.
+ * 3. Does not delete, reset or redispatch an ambiguous job.
+ * 4. Keeps unresolved physical outcomes in PRINTING until trustworthy Agent
+ *    journal reconciliation or authorized operator resolution.
+ * 5. Records a structured recovery incident (ReconciliationRecord) and alerts administrators.
+ * 6. If the authenticated Agent is connected, requests journal reconciliation (reconcile_active_jobs).
+ * 7. If the Agent is offline or journal evidence is unavailable, retains fail-closed state (PRINTING).
+ */
+const reconcileStuckPrintingJobs = async (options = {}) => {
+  const db = options.prismaClient || prisma;
+  const nowMs = options.now instanceof Date ? options.now.getTime() : (typeof options.now === 'number' ? options.now : Date.now());
+  const thresholdMs = typeof options.thresholdMs === 'number' ? options.thresholdMs : 15 * 60000;
+  const cutoffDate = new Date(nowMs - thresholdMs);
+  const io = options.io !== undefined ? options.io : globalIo;
+
+  const stuckJobs = await db.printJob.findMany({
+    where: {
+      status: 'PRINTING',
+      updatedAt: { lt: cutoffDate }
+    },
+    include: {
+      payment: true,
+      printerDevice: true,
+      machine: true
+    }
+  });
+
+  const summary = {
+    scannedCount: stuckJobs.length,
+    reconciliationRequestedCount: 0,
+    failClosedRetainedCount: 0,
+    incidentLoggedCount: 0
+  };
+
+  for (const job of stuckJobs) {
+    summary.failClosedRetainedCount++;
+    const durationMins = Math.round((nowMs - new Date(job.updatedAt).getTime()) / 60000);
+    console.warn(`⚠️ [AMBIGUITY LOCKOUT] Job ${job.shortId} has remained in PRINTING for ~${durationMins}m. Retaining PRINTING status (no automatic failure or refund).`);
+
+    // 1. Record persistent structured reconciliation incident if one does not already exist
+    if (db.reconciliationRecord && typeof db.reconciliationRecord.findFirst === 'function') {
+      try {
+        const existingIncident = await db.reconciliationRecord.findFirst({
+          where: {
+            printJobId: job.id,
+            discrepancyType: 'STUCK_PRINTING_JOB',
+            resolved: false
+          }
+        });
+
+        if (!existingIncident) {
+          await db.reconciliationRecord.create({
+            data: {
+              printJobId: job.id,
+              paymentId: job.paymentId || null,
+              status: 'MANUAL_REVIEW_REQUIRED',
+              discrepancyType: 'STUCK_PRINTING_JOB',
+              details: JSON.stringify({
+                jobId: job.id,
+                shortId: job.shortId,
+                machineId: job.machineId,
+                printerDeviceId: job.printerDeviceId || null,
+                windowsPrinterName: job.printerWindowsQueueName || job.printerDevice?.windowsPrinterName || null,
+                stuckDurationMinutes: durationMins,
+                reason: `Job remained in PRINTING state beyond ${Math.round(thresholdMs / 60000)} minute threshold. Physical outcome is unverified; fail-closed policy locks job in PRINTING until authenticated journal reconciliation or authorized operator resolution.`
+              })
+            }
+          });
+          summary.incidentLoggedCount++;
+        }
+      } catch (recErr) {
+        console.error(`Failed to record structured reconciliation incident for stuck job ${job.shortId}:`, recErr.message);
+      }
+    }
+
+    // 2. Alert Administrators via WebSocket
+    if (io) {
+      const alertPayload = {
+        type: 'STUCK_PRINTING_JOB',
+        jobId: job.id,
+        shortId: job.shortId,
+        machineId: job.machineId,
+        printerDeviceId: job.printerDeviceId || null,
+        durationMinutes: durationMins,
+        status: 'PRINTING',
+        ambiguous: true,
+        message: `Print job ${job.shortId} is ambiguous in PRINTING for >${Math.round(thresholdMs / 60000)} mins. Automatic refund suppressed. Requires agent journal reconciliation or physical operator inspection.`
+      };
+      if (typeof io.to === 'function') {
+        io.to('superadmins').emit('job_status_changed', alertPayload);
+        io.to('admins').emit('job_status_changed', alertPayload);
+        if (job.machine?.companyId) {
+          io.to(`company_${job.machine.companyId}`).emit('job_status_changed', alertPayload);
+        }
+      }
+    }
+
+    // 3. If authenticated agent is connected on socket, request journal reconciliation
+    if (job.machineId) {
+      try {
+        const requestId = `rec_stuck_${job.machineId}_${Date.now()}_${crypto.randomUUID()}`;
+        const jobBindings = {
+          [job.shortId]: job.printerDeviceId ? {
+            printerDeviceId: job.printerDeviceId,
+            windowsPrinterName: job.printerWindowsQueueName || job.printerDevice?.windowsPrinterName || null
+          } : null
+        };
+
+        const socketModule = require('../socket');
+        const requestPrinterReconciliation = socketModule?.requestPrinterReconciliation;
+
+        if (typeof requestPrinterReconciliation === 'function') {
+          const recResult = requestPrinterReconciliation(io, job.machineId, {
+            requestId,
+            jobIds: [job.shortId],
+            jobBindings
+          });
+          if (recResult?.success) {
+            summary.reconciliationRequestedCount++;
+          }
+        } else if (io && typeof io.to === 'function') {
+          io.to(`machine_${job.machineId}`).emit('reconcile_active_jobs', {
+            requestId,
+            jobIds: [job.shortId],
+            jobBindings
+          });
+          summary.reconciliationRequestedCount++;
+        }
+      } catch (emitErr) {
+        console.error(`Could not emit reconciliation request for stuck job ${job.shortId}:`, emitErr.message);
+      }
+    }
+  }
+
+  return summary;
+};
+
+/**
+ * UP-02 / Concern B: Reconciles and safely dispatches any jobs stranded in WAITING.
+ * Resolves the crash window between admin retry DB commit (FAILED -> WAITING) and queue dispatch.
+ * Scans for jobs with status: 'WAITING', legacyAttemptsUnknown: false, printAttempts: { lt: MAX_PRINT_ATTEMPTS }.
+ * Re-verifies payment validity, refund status, and attempt caps before delegating to startPrintingProcess.
+ */
+const reconcileStrandedWaitingJobs = async (options = {}) => {
+  const db = options.prismaClient || prisma;
+  const io = options.io !== undefined ? options.io : globalIo;
+  const nowMs = options.now instanceof Date ? options.now.getTime() : Date.now();
+  const thresholdMs = typeof options.thresholdMs === 'number' ? options.thresholdMs : 30000; // 30s threshold default
+  const cutoffDate = new Date(nowMs - thresholdMs);
+
+  const strandedJobs = await db.printJob.findMany({
+    where: {
+      status: 'WAITING',
+      updatedAt: { lt: cutoffDate },
+      legacyAttemptsUnknown: false,
+      printAttempts: { lt: MAX_PRINT_ATTEMPTS }
+    },
+    include: {
+      payment: true,
+      printerDevice: true,
+      machine: true
+    }
+  });
+
+  const summary = {
+    scannedCount: strandedJobs.length,
+    dispatchedCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    errors: []
+  };
+
+  for (const job of strandedJobs) {
+    // 1. Payment sanity: if payment is linked, must be SUCCESS
+    if (job.payment && job.payment.status !== 'SUCCESS') {
+      summary.skippedCount++;
+      continue;
+    }
+
+    // 2. Mutual safety with refunds: cannot dispatch if active or completed refund exists
+    if (job.paymentId && db.refund) {
+      try {
+        const activeRefund = await db.refund.findFirst({
+          where: {
+            paymentId: job.paymentId,
+            status: { in: ['SUCCESS', 'PROCESSING', 'PENDING'] }
+          }
+        });
+        if (activeRefund) {
+          summary.skippedCount++;
+          continue;
+        }
+      } catch (refErr) {
+        summary.failedCount++;
+        summary.errors.push({ shortId: job.shortId, error: refErr.message });
+        continue;
+      }
+    }
+
+    // 3. Attempt ceiling check on payment
+    if (job.payment && (job.payment.authorizedPrintAttempts > MAX_PRINT_ATTEMPTS || job.payment.legacyAttemptsUnknown)) {
+      summary.skippedCount++;
+      continue;
+    }
+
+    // Determine whether this attempt was already reserved on this specific PrintJob row
+    // by an authorized admin retry transaction prior to crash. Uses the per-job
+    // reservedForRetry flag set atomically in admin.routes.js — eliminates the aggregate
+    // heuristic that could not distinguish which sibling owns the reservation.
+    const alreadyReserved = Boolean(job.reservedForRetry);
+
+    // 4. Safe dispatch via startPrintingProcess (which atomically claims WAITING -> PRINTING)
+    try {
+      console.log(`[STRANDED_JOB_RECONCILER] Resuming stranded WAITING job ${job.shortId}...`);
+      await startPrintingProcess(job.shortId, io, { isAuthorizedRetry: alreadyReserved });
+      summary.dispatchedCount++;
+    } catch (dispatchErr) {
+      summary.failedCount++;
+      summary.errors.push({ shortId: job.shortId, error: dispatchErr.message });
+      console.error(`[STRANDED_JOB_RECONCILER] Error dispatching stranded job ${job.shortId}:`, dispatchErr.message);
+    }
+  }
+
+  return summary;
+};
+
+// Cleanup abandoned jobs, audit stuck PRINTING jobs, and cleanup expired files every 15 minutes
 const cleanupTimer = setInterval(async () => {
   try {
-    const oneHourAgo = new Date(Date.now() - ABANDONED_JOB_TTL_MS);
-    const fifteenMinsAgo = new Date(Date.now() - 15 * 60000);
     const { deleteFile } = require('../utils/storage');
 
     // 1. Delete genuinely abandoned unlinked PENDING_PAYMENT jobs safely
     await cleanupAbandonedJobs({ deleteFileFn: deleteFile });
 
-    // 2. P3-004: Fail and refund stuck PRINTING jobs (Agent crash recovery)
-    const stuckJobs = await prisma.printJob.findMany({
-      where: {
-        status: 'PRINTING',
-        updatedAt: { lt: fifteenMinsAgo }
-      }
-    });
-
-    for (const job of stuckJobs) {
-      console.error(`⚠️  Job ${job.shortId} stuck in PRINTING for >15 mins. Marking FAILED.`);
-      await prisma.printJob.update({
-        where: { id: job.id },
-        data: { status: 'FAILED' }
-      });
-
-      if (job.paymentId) {
-        try {
-          console.log(`Initiating automated recovery refund via refund.service for stuck job ${job.shortId}...`);
-          const refundService = require('./refund.service');
-          await refundService.createRefund({
-            paymentId: job.paymentId,
-            reason: 'Automated crash recovery refund: print job stuck in PRINTING for >15 minutes',
-            idempotencyKey: `auto_recovery_${job.id}_${job.paymentId}`,
-            initiatedBy: 'SYSTEM'
-          });
-        } catch (refundErr) {
-          console.error(`Automated refund failed/skipped for stuck job ${job.shortId}:`, refundErr.message);
-        }
-      }
-    }
+    // 2. Audit stuck PRINTING jobs (Ambiguity lockout - fail-closed retention, NO auto-failure, NO auto-refund)
+    await reconcileStuckPrintingJobs();
 
     // 3. Delete files for COMPLETED, FAILED, and REFUNDED jobs older than 1 hour
     await cleanupExpiredJobFiles({ deleteFileFn: deleteFile });
+
+    // 4. Reconcile stranded WAITING jobs (addresses crash window between retry DB commit and queue dispatch)
+    await reconcileStrandedWaitingJobs();
   } catch (error) {
     console.error('Error during cleanup:', error);
   }
@@ -767,11 +1165,15 @@ const cleanupExpiredJobFiles = async (options = {}) => {
 };
 
 module.exports = {
+  MAX_PRINT_ATTEMPTS,
+  processJob,
   startPrintingProcess,
   calculateEstimatedWaitTime,
   initWorker,
   cleanupAbandonedJobs,
   cleanupExpiredJobFiles,
+  reconcileStuckPrintingJobs,
+  reconcileStrandedWaitingJobs,
   buildAbandonedJobWhere,
   hasProtectedJobReferences,
   getQueueHealth,

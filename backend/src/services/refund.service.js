@@ -123,6 +123,24 @@ const createRefund = async (params) => {
     // Acquire exclusive transaction advisory lock scoped to this specific payment
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('payment_refund_${payment.id}'))`);
 
+    // Mutual safety with retry: cannot refund payment if any associated print job is WAITING or PRINTING
+    if (tx.printJob && typeof tx.printJob.findMany === 'function') {
+      const activeJobs = await tx.printJob.findMany({
+        where: {
+          paymentId: payment.id,
+          status: { in: ['WAITING', 'PRINTING'] }
+        },
+        select: { shortId: true, status: true }
+      });
+      if (activeJobs.length > 0) {
+        const activeDescs = activeJobs.map(j => `${j.shortId} (${j.status})`).join(', ');
+        throw new AppError(
+          `Cannot refund payment ${payment.id}: Active print job is currently in progress: ${activeDescs}.`,
+          409
+        );
+      }
+    }
+
     // Re-verify idempotency inside lock
     let claimedRefund = null;
     if (idempotencyKey) {
@@ -133,24 +151,26 @@ const createRefund = async (params) => {
           throw new AppError(`Idempotency key '${idempotencyKey}' is already bound to another payment (${freshExisting.paymentId}). Cross-payment key reuse is forbidden.`, 409);
         }
         if (freshExisting.status === 'SUCCESS' || freshExisting.status === 'PROCESSING') {
-          return freshExisting;
+          return { refund: freshExisting, shouldDispatchGateway: false };
         }
         if (freshExisting.status === 'FAILED') {
           if (!freshExisting.retryEligible) {
-            return freshExisting;
+            return { refund: freshExisting, shouldDispatchGateway: false };
           }
-          // Atomic claim for retry: transition status to PROCESSING and clear retryEligible
+          // Atomic claim for retry: transition status to PROCESSING, clear retryEligible, and RETAIN existing gatewayRefundId!
           claimedRefund = await tx.refund.update({
             where: { id: freshExisting.id },
             data: {
               status: 'PROCESSING',
               retryEligible: false,
               amount: finalRefundAmount,
-              gatewayRefundId: uniqueRefundId,
+              gatewayRefundId: freshExisting.gatewayRefundId || uniqueRefundId,
               failureReason: null,
               initiatedBy: user?.id || initiatedBy
             }
           });
+        } else {
+          return { refund: freshExisting, shouldDispatchGateway: false };
         }
       }
     }
@@ -184,7 +204,7 @@ const createRefund = async (params) => {
           ipAddress: user?.ip || null
         }
       });
-      return claimedRefund;
+      return { refund: claimedRefund, shouldDispatchGateway: true };
     }
 
     // Create local PENDING Refund record
@@ -215,20 +235,25 @@ const createRefund = async (params) => {
       }
     });
 
-    return createdRefund;
-  });
+    return { refund: createdRefund, shouldDispatchGateway: true };
+  }, { maxWait: 10000, timeout: 15000 });
 
-  // If another concurrent caller already completed the refund or is processing it with another gatewayRefundId:
-  if (result.status === 'SUCCESS' || (result.status === 'PROCESSING' && result.gatewayRefundId !== uniqueRefundId)) {
-    return result;
+  const { refund, shouldDispatchGateway } = result;
+
+  // If another concurrent caller already completed the refund or is processing it:
+  if (!shouldDispatchGateway) {
+    return refund;
   }
+
+  // Use the exact persisted gatewayRefundId from the database record (never overwrite or regenerate)
+  const refundIdForGateway = refund.gatewayRefundId;
 
   // 6. CALL GATEWAY ADAPTER (OUTSIDE DB TRANSACTION TO PREVENT CONNECTION POOL EXHAUSTION)
   let gatewayResult;
   try {
     gatewayResult = await cashfreeGateway.createRefund({
       orderId: payment.gatewayOrderId,
-      refundId: uniqueRefundId,
+      refundId: refundIdForGateway,
       amount: finalRefundAmount,
       reason
     });
@@ -236,7 +261,8 @@ const createRefund = async (params) => {
     logger.error(`Cashfree Gateway refund invocation threw unexpected error: ${err.message}`);
     gatewayResult = {
       success: false,
-      status: 'FAILED',
+      isUncertainOutcome: true,
+      status: 'PROCESSING',
       error: err.message,
       rawResponse: { error: err.message }
     };
@@ -252,7 +278,7 @@ const createRefund = async (params) => {
       const finalStatus = isGatewayPending ? 'PROCESSING' : 'SUCCESS';
 
       const updatedRefund = await tx.refund.update({
-        where: { id: result.id },
+        where: { id: refund.id },
         data: {
           status: finalStatus,
           cfRefundId: gatewayResult.cfRefundId || null,
@@ -274,9 +300,9 @@ const createRefund = async (params) => {
       });
 
       // Calculate new remaining balance
-      const allSuccessfulRefunds = await tx.refund.findMany({
+      const allSuccessfulRefunds = (await tx.refund.findMany({
         where: { paymentId: payment.id, status: 'SUCCESS' }
-      });
+      })) || [];
       const totalSuccessfulCents = allSuccessfulRefunds.reduce((sum, r) => sum + toCents(r.amount), 0);
       const isFullyRefunded = totalSuccessfulCents >= paymentCents;
 
@@ -289,7 +315,7 @@ const createRefund = async (params) => {
         await tx.reconciliationRecord.updateMany({
           where: {
             OR: [
-              { refundId: result.id },
+              { refundId: refund.id },
               { paymentId: payment.id, discrepancyType: 'FAILED_AUTOMATIC_REFUND' }
             ],
             resolved: false
@@ -304,17 +330,105 @@ const createRefund = async (params) => {
       }
 
       return updatedRefund;
-    } else {
-      // Gateway Failure or Timeout
-      const isTimeout = gatewayResult.isTimeout;
-      const finalStatus = isTimeout ? 'PROCESSING' : 'FAILED';
+    } else if (gatewayResult.isDuplicate) {
+      // Provider returned HTTP 409 or refund_already_exists
+      // Do NOT create a new gateway refund identity! Reconcile the existing persisted gatewayRefundId!
+      let recDetails = null;
+      try {
+        recDetails = await cashfreeGateway.getRefundDetails(payment.gatewayOrderId, refundIdForGateway);
+      } catch (recErr) {
+        logger.warn(`Could not fetch details for duplicate refund ${refundIdForGateway}: ${recErr.message}`);
+      }
 
+      if (recDetails && recDetails.success && (recDetails.status === 'SUCCESS' || recDetails.status === 'PENDING')) {
+        const isGwPending = recDetails.status === 'PENDING';
+        const finalStatus = isGwPending ? 'PROCESSING' : 'SUCCESS';
+
+        const updatedRefund = await tx.refund.update({
+          where: { id: refund.id },
+          data: {
+            status: finalStatus,
+            cfRefundId: recDetails.cfRefundId || null,
+            gatewayResponse: redactSensitiveData(recDetails.rawResponse || gatewayResult.rawResponse),
+            processedAt: new Date()
+          }
+        });
+
+        await tx.transaction.create({
+          data: {
+            paymentId: payment.id,
+            action: isGwPending ? 'REFUND_DUPLICATE_RECONCILED_PROCESSING' : 'REFUND_DUPLICATE_RECONCILED_SUCCESS',
+            status: finalStatus,
+            amount: finalRefundAmount,
+            gatewayPaymentId: payment.gatewayPaymentId,
+            gatewayResponse: redactSensitiveData(recDetails.rawResponse || gatewayResult.rawResponse)
+          }
+        });
+
+        if (finalStatus === 'SUCCESS') {
+          const allSuccessfulRefunds = await tx.refund.findMany({
+            where: { paymentId: payment.id, status: 'SUCCESS' }
+          });
+          const totalSuccessfulCents = allSuccessfulRefunds.reduce((sum, r) => sum + toCents(r.amount), 0);
+          const isFullyRefunded = totalSuccessfulCents >= paymentCents;
+
+          await tx.payment.update({
+            where: { id: payment.id },
+            data: { status: isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED' }
+          });
+        }
+
+        return updatedRefund;
+      } else {
+        // Provider reported duplicate, but could not confirm terminal state:
+        // Retain PROCESSING, retryEligible = false, fail-closed.
+        const updatedRefund = await tx.refund.update({
+          where: { id: refund.id },
+          data: {
+            status: 'PROCESSING',
+            retryEligible: false,
+            failureReason: 'Provider reported refund already exists. Retained in PROCESSING for external reconciliation.',
+            gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
+          }
+        });
+
+        await tx.transaction.create({
+          data: {
+            paymentId: payment.id,
+            action: 'REFUND_DUPLICATE_REPORTED_PENDING',
+            status: 'PENDING',
+            amount: finalRefundAmount,
+            errorMessage: 'Provider reported duplicate refund; awaiting external verification.',
+            gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
+          }
+        });
+
+        if (tx.reconciliationRecord) {
+          await tx.reconciliationRecord.create({
+            data: {
+              paymentId: payment.id,
+              refundId: refund.id,
+              status: 'PENDING_RECONCILIATION',
+              discrepancyType: 'DUPLICATE_REFUND_REPORTED',
+              details: JSON.stringify({
+                gatewayRefundId: refundIdForGateway,
+                error: gatewayResult.error
+              })
+            }
+          }).catch(() => {});
+        }
+
+        return updatedRefund;
+      }
+    } else if (gatewayResult.isDefinitiveFailure && !gatewayResult.isUncertainOutcome && !gatewayResult.isTimeout && !gatewayResult.isRateLimited) {
+      // Definitive failure: Provider explicitly and safely rejected before execution (e.g. 400 invalid order).
+      // Only documented & verified definitive provider failures are classified as FAILED.
       const updatedRefund = await tx.refund.update({
-        where: { id: result.id },
+        where: { id: refund.id },
         data: {
-          status: finalStatus,
+          status: 'FAILED',
           failureReason: gatewayResult.error || 'Gateway rejected refund',
-          retryEligible: !isTimeout,
+          retryEligible: false,
           gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
         }
       });
@@ -322,7 +436,7 @@ const createRefund = async (params) => {
       await tx.transaction.create({
         data: {
           paymentId: payment.id,
-          action: isTimeout ? 'REFUND_TIMEOUT_RETAINED' : 'REFUND_FAILED',
+          action: 'REFUND_FAILED',
           status: 'FAILED',
           amount: finalRefundAmount,
           errorMessage: gatewayResult.error || 'Gateway refund failure',
@@ -331,8 +445,62 @@ const createRefund = async (params) => {
       });
 
       return updatedRefund;
+    } else {
+      // Uncertain external outcome / Rate-limited (HTTP 429) / Timeout (HTTP 408) / Network disconnect / Unclassified:
+      // UP-03/UP-06 Fail-Closed: Keep refund in PROCESSING, retryEligible = false, retain exact gatewayRefundId.
+      // Do NOT create a new gatewayRefundId. Do NOT perform automatic retry that could cause duplicate refund.
+      const isRateLimited = gatewayResult.isRateLimited || gatewayResult.statusCode === 429;
+      const isTimeout = gatewayResult.isTimeout || gatewayResult.statusCode === 408;
+      const failureReasonText = isRateLimited
+        ? `Rate limited by gateway (HTTP 429): ${gatewayResult.error || 'Too Many Requests'}. Retained in PROCESSING for manual/scheduled reconciliation without automatic retry.`
+        : (isTimeout
+          ? `Gateway timeout (HTTP 408/ECONNABORTED): ${gatewayResult.error || 'Request timeout'}. Retained in PROCESSING without retry release.`
+          : `Uncertain gateway outcome (${gatewayResult.statusCode || 'network/unclassified'}): ${gatewayResult.error || 'Network error/Timeout'}. Retained in PROCESSING without retry release.`);
+
+      const updatedRefund = await tx.refund.update({
+        where: { id: refund.id },
+        data: {
+          status: 'PROCESSING',
+          retryEligible: false,
+          failureReason: failureReasonText,
+          gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
+        }
+      });
+
+      await tx.transaction.create({
+        data: {
+          paymentId: payment.id,
+          action: isRateLimited ? 'REFUND_RATE_LIMITED' : 'REFUND_UNCERTAIN_OUTCOME',
+          status: 'PENDING',
+          amount: finalRefundAmount,
+          errorMessage: gatewayResult.error || (isRateLimited ? 'Gateway rate limit' : 'Gateway uncertain outcome'),
+          gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
+        }
+      });
+
+      if (tx.reconciliationRecord) {
+        await tx.reconciliationRecord.create({
+          data: {
+            paymentId: payment.id,
+            refundId: refund.id,
+            status: 'PENDING_RECONCILIATION',
+            discrepancyType: isRateLimited ? 'GATEWAY_RATE_LIMITED' : (isTimeout ? 'GATEWAY_TIMEOUT' : 'UNCERTAIN_GATEWAY_REFUND_OUTCOME'),
+            details: JSON.stringify({
+              gatewayRefundId: refundIdForGateway,
+              statusCode: gatewayResult.statusCode,
+              isRateLimited,
+              isTimeout,
+              isConnectionReset: gatewayResult.isConnectionReset,
+              isServerError: gatewayResult.isServerError,
+              error: gatewayResult.error
+            })
+          }
+        }).catch(() => {});
+      }
+
+      return updatedRefund;
     }
-  });
+  }, { maxWait: 10000, timeout: 15000 });
 
   // 8. AUTOMATIC CREDIT NOTE GENERATION UPON SUCCESSFUL REFUND
   if (finalized.status === 'SUCCESS') {

@@ -352,7 +352,8 @@ describe('SpoolerMonitor', () => {
       
       // Advance timers by 2 seconds (2nd poll: cleared from queue)
       jest.advanceTimersByTime(2000);
-      expect(mockSocket.emit).toHaveBeenCalledWith('print_physical_success', expect.objectContaining({ jobId }));
+      expect(mockSocket.emit).toHaveBeenCalledWith('print_spooler_cleared', expect.objectContaining({ jobId, wasSeenInQueue: true }));
+      expect(mockSocket.emit).toHaveBeenCalledWith('print_physical_success', expect.objectContaining({ jobId, wasSeenInQueue: true }));
       expect(fs.unlinkSync).toHaveBeenCalledWith('temp.pdf');
     });
 
@@ -381,7 +382,7 @@ describe('SpoolerMonitor', () => {
       expect(mockSocket.emit).not.toHaveBeenCalledWith('print_physical_success', expect.any(Object));
     });
 
-    it('should emit physical error if spooler reports PaperJam', () => {
+    it('should emit physical ambiguous if spooler reports PaperJam while in queue (preventing automatic failure/refund)', () => {
       const jobId = 'job456';
       
       mockExecFile.mockImplementation((cmd, args, a3, a4) => {
@@ -393,7 +394,12 @@ describe('SpoolerMonitor', () => {
       monitor.startPollingJob(jobId, 'temp.pdf', mockSocket);
       
       jest.advanceTimersByTime(2000);
-      expect(mockSocket.emit).toHaveBeenCalledWith('print_physical_error', { jobId, error: 'PaperJam' });
+      expect(mockSocket.emit).toHaveBeenCalledWith('print_physical_ambiguous', expect.objectContaining({
+        jobId,
+        wasSeenInQueue: true,
+        error: 'PaperJam'
+      }));
+      expect(mockSocket.emit).not.toHaveBeenCalledWith('print_physical_error', expect.any(Object));
       expect(fs.unlinkSync).toHaveBeenCalledWith('temp.pdf');
     });
 

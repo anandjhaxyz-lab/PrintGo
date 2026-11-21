@@ -3,7 +3,7 @@ const crypto = require('crypto');
 const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
 const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
-const { isValidJobTransition, PRINT_JOB_TRANSITIONS } = require('../../utils/stateMachine');
+const { isValidJobTransition, PRINT_JOB_TRANSITIONS, validateOperatorReason } = require('../../utils/stateMachine');
 
 const generateShortId = () => crypto.randomBytes(4).toString('hex');
 
@@ -361,7 +361,7 @@ const resolveAmbiguousJob = async (shortId, data = {}, user = null) => {
 
     logger.info(`Job ${shortId} resolved from PRINTING to ${outcome} by ${user?.role || 'UNKNOWN'} (${user?.id || 'SYSTEM'})`);
     return updatedJob;
-  });
+  }, { maxWait: 10000, timeout: 15000 });
 };
 
 const updateJobStatus = async (shortId, status, user = null, options = {}) => {
@@ -374,7 +374,7 @@ const updateJobStatus = async (shortId, status, user = null, options = {}) => {
   }
 
   // 1. Enforce State Machine Transitions
-  if (!isValidJobTransition(currentJob.status, status)) {
+  if (!isValidJobTransition(currentJob.status, status, options)) {
     const allowed = PRINT_JOB_TRANSITIONS[currentJob.status] || [];
     throw new AppError(
       `Invalid status transition from "${currentJob.status}" to "${status}". Allowed transitions: [${allowed.join(', ')}]`,
@@ -394,7 +394,76 @@ const updateJobStatus = async (shortId, status, user = null, options = {}) => {
     }, user);
   }
 
-  // 3. For other valid transitions (e.g. PENDING_PAYMENT -> WAITING, WAITING -> CANCELLED, FAILED -> CANCELLED)
+  // 3. Authorized operator retry: FAILED -> WAITING
+  if (currentJob.status === 'FAILED' && status === 'WAITING') {
+    const reasonValidation = validateOperatorReason(options.reason);
+    if (!reasonValidation.valid) {
+      throw new AppError(reasonValidation.error, 400);
+    }
+
+    if (currentJob.legacyAttemptsUnknown) {
+      throw new AppError(`Job ${shortId} has unverified legacy attempt history. Re-dispatch is disallowed under UP-02.`, 409);
+    }
+
+    if ((currentJob.printAttempts || 0) >= 3) {
+      throw new AppError(`Maximum 3 print attempts exceeded for job ${shortId}.`, 409);
+    }
+
+    // Durable atomic transaction: retry claim + mandatory audit logging
+    const refreshedJob = await prisma.$transaction(async (tx) => {
+      const updateCount = await tx.printJob.updateMany({
+        where: {
+          id: currentJob.id,
+          status: 'FAILED',
+          legacyAttemptsUnknown: false,
+          printAttempts: { lt: 3 }
+        },
+        data: { status: 'WAITING' }
+      });
+
+      if (updateCount.count === 0) {
+        throw new AppError(`Conflict: Job ${shortId} is no longer in FAILED status or has reached attempt limit. Cannot retry.`, 409);
+      }
+
+      if (tx.activityLog) {
+        await tx.activityLog.create({
+          data: {
+            action: 'PRINT_JOB_AUTHORIZED_RETRY',
+            details: JSON.stringify({
+              jobId: currentJob.id,
+              shortId,
+              operatorId: user?.id || 'SYSTEM_OPERATOR',
+              operatorRole: user?.role || 'UNKNOWN',
+              operatorReason: reasonValidation.sanitized,
+              previousStatus: 'FAILED',
+              newStatus: 'WAITING'
+            }),
+            userId: user?.id || null,
+            machineId: currentJob.machineId || null,
+            ipAddress: options.ipAddress || null
+          }
+        });
+      }
+
+      if (tx.printHistory) {
+        await tx.printHistory.create({
+          data: {
+            printJobId: currentJob.id,
+            success: false,
+            errorDetails: `Authorized operator retry: ${reasonValidation.sanitized}`,
+            completedAt: new Date()
+          }
+        });
+      }
+
+      return await tx.printJob.findUnique({ where: { shortId } });
+    });
+
+    logger.info(`Job ${shortId} authorized retry from FAILED to WAITING by ${user?.role || 'UNKNOWN'} (${user?.id || 'SYSTEM'})`);
+    return refreshedJob;
+  }
+
+  // 4. For other valid transitions (e.g. PENDING_PAYMENT -> WAITING, WAITING -> CANCELLED, FAILED -> CANCELLED)
   const job = await prisma.printJob.update({
     where: { shortId },
     data: { status }

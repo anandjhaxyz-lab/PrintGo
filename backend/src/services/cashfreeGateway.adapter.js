@@ -92,23 +92,49 @@ class CashfreeGatewayAdapter {
         rawResponse: data
       };
     } catch (err) {
+      const statusCode = err?.response?.status;
       const errResponse = err?.response?.data || { message: err.message };
       logger.error(`Cashfree refund API error for order ${orderId}:`, redactSensitiveData(errResponse));
 
-      // Check for duplicate refund ID
+      // 1. Check for duplicate refund ID
       const isDuplicate = errResponse?.code === 'refund_already_exists' || 
                           errResponse?.message?.includes('already exists') ||
-                          err?.response?.status === 409;
+                          statusCode === 409;
 
-      const isTimeout = err.code === 'ECONNABORTED' || err.message?.includes('timeout');
+      // 2. Classify timeouts and connection failures
+      const isTimeout = err.code === 'ECONNABORTED' || 
+                        err.message?.includes('timeout') || 
+                        err.code === 'ETIMEDOUT' || 
+                        err.code === 'ESOCKETTIMEDOUT' ||
+                        statusCode === 408;
+
+      const isRateLimited = statusCode === 429;
+
+      const isConnectionReset = err.code === 'ECONNRESET' || 
+                                err.code === 'EPIPE' || 
+                                err.code === 'ENOTFOUND' || 
+                                err.code === 'ECONNREFUSED';
+
+      const isServerError = typeof statusCode === 'number' && statusCode >= 500 && statusCode < 600;
+
+      // Uncertain outcome: the request may have reached Cashfree and executed, or rate-limited/timed-out
+      const isUncertainOutcome = isTimeout || isConnectionReset || isServerError || isRateLimited || (!statusCode && !err.response);
+
+      // Definitive failure: HTTP 4xx (excluding duplicate 409, rate-limit 429, and request timeout 408) where Cashfree definitively rejected before execution
+      const isDefinitiveFailure = typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500 && !isDuplicate && statusCode !== 429 && statusCode !== 408;
 
       return {
         success: false,
         isDuplicate,
         isTimeout,
-        status: 'FAILED',
+        isRateLimited,
+        isConnectionReset,
+        isServerError,
+        isUncertainOutcome,
+        isDefinitiveFailure,
+        status: (isUncertainOutcome || isDuplicate) ? 'PROCESSING' : (isDefinitiveFailure ? 'FAILED' : 'PROCESSING'),
         error: errResponse?.message || err.message,
-        statusCode: err?.response?.status || 500,
+        statusCode: statusCode || (isTimeout ? 408 : 500),
         rawResponse: errResponse
       };
     }
