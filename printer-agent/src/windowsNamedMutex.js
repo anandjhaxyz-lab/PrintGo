@@ -36,9 +36,125 @@ try {
 `;
 }
 
+function createMutexHandle({
+  mutexName,
+  platform,
+  pid,
+  processHelper,
+  isSimulated = false,
+  options = {}
+}) {
+  let released = false;
+  let isShuttingDown = false;
+  let shutdownPromise = null;
+  const shutdownHandlers = [];
+  if (typeof options.onShutdown === 'function') {
+    shutdownHandlers.push(options.onShutdown);
+  }
+
+  const defaultExitOnShutdown = process.env.JEST_WORKER_ID === undefined && process.env.NODE_ENV !== 'test';
+  const shouldExitOnShutdown = options.exitOnShutdown !== undefined
+    ? Boolean(options.exitOnShutdown)
+    : defaultExitOnShutdown;
+
+  let detachSignalHandlers = () => {};
+
+  const rawRelease = () => {
+    if (!released) {
+      released = true;
+      detachSignalHandlers();
+      if (processHelper) {
+        try { processHelper.stdin.end(); } catch (_) {}
+        try { processHelper.kill(); } catch (_) {}
+      }
+    }
+  };
+
+  const handle = {
+    acquired: true,
+    mutexName,
+    platform,
+    pid: pid || (processHelper ? processHelper.pid : process.pid),
+    process: processHelper,
+    isSimulated,
+    get released() { return released; },
+    set released(v) { released = Boolean(v); },
+    get isShuttingDown() { return isShuttingDown; },
+    shutdownHandlers,
+    registerShutdown: (fn) => {
+      if (typeof fn === 'function' && !shutdownHandlers.includes(fn)) {
+        shutdownHandlers.push(fn);
+      }
+    },
+    isOperational: () => {
+      if (typeof options.isOperational === 'function') {
+        return Boolean(options.isOperational());
+      }
+      if (typeof options.isOperational === 'boolean') {
+        return options.isOperational;
+      }
+      return false;
+    },
+    release: (force = false) => {
+      if (!force && handle.isOperational()) {
+        throw new Error('Illegal state: Mutex ownership cannot be released while an operational Agent continues running. Invoke graceful shutdown lifecycle first.');
+      }
+      rawRelease();
+    },
+    _rawRelease: rawRelease,
+    shutdown: async (signal = 'SIGINT', exitCode = 0) => {
+      if (shutdownPromise) return shutdownPromise;
+      isShuttingDown = true;
+      shutdownPromise = (async () => {
+        for (const handler of shutdownHandlers) {
+          try {
+            await handler(signal);
+          } catch (err) {
+            console.error(`Error in shutdown handler for signal ${signal}:`, err);
+          }
+        }
+        rawRelease();
+        if (shouldExitOnShutdown && !options.suppressFatalOnExit) {
+          process.exit(exitCode);
+        }
+      })();
+      return shutdownPromise;
+    }
+  };
+
+  // Signal & exit listeners
+  const onSignal = async (signal) => {
+    try {
+      await handle.shutdown(signal, 0);
+    } catch (err) {
+      console.error(`Error during Agent ${signal} shutdown:`, err);
+      if (shouldExitOnShutdown && !options.suppressFatalOnExit) {
+        process.exit(1);
+      }
+    }
+  };
+
+  const onExit = () => {
+    rawRelease();
+  };
+
+  process.once('exit', onExit);
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  detachSignalHandlers = () => {
+    process.removeListener('exit', onExit);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+  };
+  handle.detachSignalHandlers = detachSignalHandlers;
+
+  return handle;
+}
+
 /**
  * UP-05: Acquires and holds the exact Windows Named Mutex:
- * Global\\NEOX_UniversalPrintAgent_Running
+ * Global\NEOX_UniversalPrintAgent_Running
  * 
  * Guarantees a single active Agent process per machine across all user sessions.
  * Holds kernel mutex ownership for the entire process lifetime.
@@ -51,13 +167,12 @@ function acquireAgentMutex(options = {}) {
 
     if (platform !== 'win32' && !options.force) {
       // In non-Windows test environments, return mock ownership
-      return resolve({
-        acquired: true,
+      return resolve(createMutexHandle({
         mutexName,
         platform,
         isSimulated: true,
-        release: () => {}
-      });
+        options
+      }));
     }
 
     const script = options.script || buildPowerShellScript(mutexName);
@@ -74,39 +189,25 @@ function acquireAgentMutex(options = {}) {
       const text = chunk.toString();
       if (text.includes('MUTEX_ACQUIRED') && !acquired) {
         acquired = true;
-        handle = {
-          acquired: true,
+        handle = createMutexHandle({
           mutexName,
           platform: 'win32',
           pid: helper.pid,
-          process: helper,
-          released: false,
-          release: () => {
-            if (handle && !handle.released) {
-              handle.released = true;
-              try { helper.stdin.end(); } catch (_) {}
-              try { helper.kill(); } catch (_) {}
-            }
-          }
-        };
+          processHelper: helper,
+          isSimulated: false,
+          options
+        });
 
         // Fail-closed rule: if the mutex helper process dies unexpectedly, the Agent must shut down
-        helper.on('exit', (code, signal) => {
+        helper.on('exit', async (code, signal) => {
           if (!handle.released && !options.suppressFatalOnExit) {
             console.error(`🔥 CRITICAL ERROR: [UP-05] Windows named mutex helper process terminated unexpectedly (code: ${code}, signal: ${signal}). Failing closed.`);
+            try {
+              await handle.shutdown('MUTEX_HELPER_EXIT', 1);
+            } catch (_) {}
             process.exit(1);
           }
         });
-
-        // Register process cleanup handlers
-        const cleanup = () => {
-          if (handle && !handle.released) {
-            handle.release();
-          }
-        };
-        process.once('exit', cleanup);
-        process.once('SIGINT', cleanup);
-        process.once('SIGTERM', cleanup);
 
         resolve(handle);
       }

@@ -109,5 +109,140 @@ describe('UP-05: Windows Named Mutex (Global\\NEOX_UniversalPrintAgent_Running)'
 
     await new Promise((r) => setTimeout(r, 500));
     expect(exited).toBe(true);
+    handle.detachSignalHandlers();
+  });
+
+  (isWindows ? test : test.skip)('9. Mutex ownership cannot be released while an operational Agent continues running', async () => {
+    const uniqueMutex = `${testMutexPrefix}OperationalGuard_${Date.now()}`;
+    let isAgentRunning = true;
+
+    const handle = await acquireAgentMutex({
+      mutexName: uniqueMutex,
+      force: true,
+      isOperational: () => isAgentRunning,
+      exitOnShutdown: false
+    });
+
+    expect(handle.acquired).toBe(true);
+    expect(handle.isOperational()).toBe(true);
+
+    // Calling release() directly while operational must throw
+    expect(() => handle.release()).toThrow(/Mutex ownership cannot be released while an operational Agent continues running/);
+    expect(handle.released).toBe(false);
+
+    // Initiating shutdown lifecycle stops operations and releases mutex cleanly
+    await handle.shutdown('TEST_SHUTDOWN');
+    isAgentRunning = false;
+    expect(handle.released).toBe(true);
+    expect(handle.isShuttingDown).toBe(true);
+    handle.detachSignalHandlers();
+  });
+
+  (isWindows ? test : test.skip)('10. SIGINT triggers explicit Agent shutdown lifecycle before mutex release', async () => {
+    const uniqueMutex = `${testMutexPrefix}SigintLifecycle_${Date.now()}`;
+    const lifecycleEvents = [];
+
+    const handle = await acquireAgentMutex({
+      mutexName: uniqueMutex,
+      force: true,
+      exitOnShutdown: false,
+      onShutdown: async (signal) => {
+        lifecycleEvents.push(`shutdown_start_${signal}`);
+        // Simulate stopping timers and closing connections
+        lifecycleEvents.push('timers_stopped');
+        lifecycleEvents.push('socket_disconnected');
+      }
+    });
+
+    expect(handle.acquired).toBe(true);
+
+    // Emit SIGINT to process
+    process.emit('SIGINT');
+
+    // Wait for async shutdown to complete
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(lifecycleEvents).toEqual([
+      'shutdown_start_SIGINT',
+      'timers_stopped',
+      'socket_disconnected'
+    ]);
+    expect(handle.released).toBe(true);
+
+    // Now that first agent shut down and released mutex, a second agent can acquire
+    const handle2 = await acquireAgentMutex({ mutexName: uniqueMutex, force: true, exitOnShutdown: false });
+    expect(handle2.acquired).toBe(true);
+    await handle2.shutdown('TEST_CLEANUP');
+    handle.detachSignalHandlers();
+    handle2.detachSignalHandlers();
+  });
+
+  (isWindows ? test : test.skip)('11. SIGTERM triggers shutdown lifecycle without duplicate execution on multiple signals', async () => {
+    const uniqueMutex = `${testMutexPrefix}SigtermDuplicate_${Date.now()}`;
+    let shutdownCount = 0;
+
+    const handle = await acquireAgentMutex({
+      mutexName: uniqueMutex,
+      force: true,
+      exitOnShutdown: false,
+      onShutdown: async () => {
+        shutdownCount++;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    });
+
+    // Send SIGTERM twice rapidly
+    process.emit('SIGTERM');
+    process.emit('SIGTERM');
+    process.emit('SIGINT');
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(shutdownCount).toBe(1);
+    expect(handle.released).toBe(true);
+    handle.detachSignalHandlers();
+  });
+
+  (isWindows ? test : test.skip)('12. Second Agent cannot acquire mutex until first Agent shutdown completes', async () => {
+    const uniqueMutex = `${testMutexPrefix}SecondAgentWait_${Date.now()}`;
+    let operational = true;
+
+    const agent1 = await acquireAgentMutex({
+      mutexName: uniqueMutex,
+      force: true,
+      exitOnShutdown: false,
+      isOperational: () => operational,
+      onShutdown: async () => {
+        // Hold work for 100ms
+        await new Promise((r) => setTimeout(r, 100));
+        operational = false;
+      }
+    });
+
+    // Attempt second agent acquisition while Agent 1 is running: must fail
+    let errWhileRunning = null;
+    try {
+      await acquireAgentMutex({ mutexName: uniqueMutex, force: true, exitOnShutdown: false });
+    } catch (err) {
+      errWhileRunning = err;
+    }
+    expect(errWhileRunning).not.toBeNull();
+    expect(errWhileRunning.code).toBe('MUTEX_ALREADY_HELD');
+
+    // Trigger Agent 1 shutdown
+    await agent1.shutdown('AGENT1_EXIT');
+    expect(operational).toBe(false);
+    expect(agent1.released).toBe(true);
+
+    // Delay for OS cleanup
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Agent 2 can now acquire
+    const agent2 = await acquireAgentMutex({ mutexName: uniqueMutex, force: true, exitOnShutdown: false });
+    expect(agent2.acquired).toBe(true);
+    await agent2.shutdown('AGENT2_EXIT');
+
+    agent1.detachSignalHandlers();
+    agent2.detachSignalHandlers();
   });
 });

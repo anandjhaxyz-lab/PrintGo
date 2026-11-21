@@ -75,11 +75,15 @@ async function validatePrinter() {
 }
 
 let agentMutexLock = null;
+let isShuttingDown = false;
+let isAcceptingJobs = true;
 
 async function bootstrap() {
   try {
     console.log(`🔒 [UP-05] Requesting Windows Named Mutex: ${MUTEX_NAME}...`);
-    agentMutexLock = await acquireAgentMutex();
+    agentMutexLock = await acquireAgentMutex({
+      isOperational: () => isAcceptingJobs && !isShuttingDown
+    });
     console.log(`✅ [UP-05] Windows Named Mutex acquired and locked for process lifetime: ${MUTEX_NAME}`);
   } catch (err) {
     if (err.code === 'MUTEX_ALREADY_HELD') {
@@ -146,11 +150,40 @@ const printerDeviceQueue = new PrinterDeviceQueue();
 const activePrintJobIds = new Set();
 
 let statusInterval = null;
+let heartbeatInterval = null;
+let keepAliveInterval = null;
 let registeredMachineId = null;
 let fleetProtocolAccepted = false;
 let fleetManager = null;
 let latestRegistryIssuedAt = 0;
 let pendingRegistryRefresh = null;
+
+async function shutdownAgent(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  isAcceptingJobs = false;
+  console.log(`🛑 [Agent Shutdown] Received ${signal || 'shutdown signal'}. Executing graceful teardown...`);
+
+  // 1. Stop heartbeat and keep-alive timers
+  if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
+  if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+  if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
+
+  // 2. Disconnect socket cleanly
+  if (socket) {
+    try {
+      if (socket.connected) {
+        socket.emit('agent_disconnecting', { machineKey: MACHINE_KEY, reason: signal || 'SHUTDOWN' });
+        socket.disconnect();
+      }
+    } catch (_) {}
+  }
+  console.log(`✅ [Agent Shutdown] Teardown complete.`);
+}
+
+if (agentMutexLock && typeof agentMutexLock.registerShutdown === 'function') {
+  agentMutexLock.registerShutdown(shutdownAgent);
+}
 
 const settleRegistryRefresh = (requestId, accepted, details = {}) => {
   const pending = pendingRegistryRefresh;
@@ -518,6 +551,10 @@ socket.on('reconcile_active_jobs', ({ requestId, jobIds = [], jobBindings = {} }
 // checkPrinterStatus logic has been moved to src/spooler.js
 
 socket.on('physical_print_job', (jobData) => {
+  if (isShuttingDown || !isAcceptingJobs) {
+    console.warn(`⚠️ [Agent Shutdown] Refusing new print work for Job ${jobData?.jobId}: Agent is shutting down.`);
+    return;
+  }
   const jobId = jobData?.jobId;
   if (!jobId || typeof jobId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
     console.error(`❌ REJECTED Job: Invalid jobId format (potential injection): ${jobId}`);
@@ -904,14 +941,14 @@ const processPhysicalPrintJob = async (jobData) => {
 };
 
 // Send heartbeat every 30 seconds to keep machine online status active
-setInterval(() => {
+heartbeatInterval = setInterval(() => {
   socket.emit('heartbeat');
 }, 30000);
 
 // P4-001: Render Free Tier Keep-Alive
 // Render spins down free instances after 15 mins of inactivity. 
 // A raw HTTP GET request every 10 minutes ensures the server stays awake while the kiosk is online.
-  setInterval(async () => {
+  keepAliveInterval = setInterval(async () => {
     try {
       await axios.get(`${BACKEND_URL}/api/health`);
       console.log(`📡 Keep-Alive ping sent to ${BACKEND_URL}/api/health`);
@@ -928,5 +965,6 @@ if (require.main === module) {
 module.exports = {
   bootstrap,
   startAgent,
+  shutdownAgent,
   MUTEX_NAME
 };

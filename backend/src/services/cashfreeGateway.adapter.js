@@ -105,7 +105,10 @@ class CashfreeGatewayAdapter {
       const isTimeout = err.code === 'ECONNABORTED' || 
                         err.message?.includes('timeout') || 
                         err.code === 'ETIMEDOUT' || 
-                        err.code === 'ESOCKETTIMEDOUT';
+                        err.code === 'ESOCKETTIMEDOUT' ||
+                        statusCode === 408;
+
+      const isRateLimited = statusCode === 429;
 
       const isConnectionReset = err.code === 'ECONNRESET' || 
                                 err.code === 'EPIPE' || 
@@ -114,21 +117,22 @@ class CashfreeGatewayAdapter {
 
       const isServerError = typeof statusCode === 'number' && statusCode >= 500 && statusCode < 600;
 
-      // Uncertain outcome: the request may have reached Cashfree and executed
-      const isUncertainOutcome = isTimeout || isConnectionReset || isServerError || (!statusCode && !err.response);
+      // Uncertain outcome: the request may have reached Cashfree and executed, or rate-limited/timed-out
+      const isUncertainOutcome = isTimeout || isConnectionReset || isServerError || isRateLimited || (!statusCode && !err.response);
 
-      // Definitive failure: HTTP 4xx (excluding duplicate 409 and rate-limit 429) where Cashfree definitively rejected before execution
-      const isDefinitiveFailure = typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500 && !isDuplicate && statusCode !== 429;
+      // Definitive failure: HTTP 4xx (excluding duplicate 409, rate-limit 429, and request timeout 408) where Cashfree definitively rejected before execution
+      const isDefinitiveFailure = typeof statusCode === 'number' && statusCode >= 400 && statusCode < 500 && !isDuplicate && statusCode !== 429 && statusCode !== 408;
 
       return {
         success: false,
         isDuplicate,
         isTimeout,
+        isRateLimited,
         isConnectionReset,
         isServerError,
         isUncertainOutcome,
         isDefinitiveFailure,
-        status: isUncertainOutcome || isDuplicate ? 'PROCESSING' : 'FAILED',
+        status: (isUncertainOutcome || isDuplicate) ? 'PROCESSING' : (isDefinitiveFailure ? 'FAILED' : 'PROCESSING'),
         error: errResponse?.message || err.message,
         statusCode: statusCode || (isTimeout ? 408 : 500),
         rawResponse: errResponse

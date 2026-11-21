@@ -25,10 +25,19 @@ const RECONCILIATION_EXPIRY_MS = 60000;
 const MAX_PENDING_PER_SOCKET = 50;
 const MAX_GLOBAL_PENDING = 500;
 
+const isSimulationAllowed = () => {
+  if (process.env.ALLOW_SIMULATED_PRINTER === 'true') return true;
+  const env = (process.env.NODE_ENV || '').toLowerCase();
+  const appEnv = (process.env.APP_ENV || '').toLowerCase();
+  return env === 'test' || env === 'development' || (env !== 'production' && appEnv !== 'production');
+};
+
 const pruneExpiredRequests = () => {
   const now = Date.now();
   for (const [reqId, entry] of pendingReconciliationsByRequestId.entries()) {
-    if (now - entry.createdAt > RECONCILIATION_EXPIRY_MS || !entry.jobIds || entry.jobIds.size === 0) {
+    const hasPendingJobs = entry.jobIds && entry.jobIds.size > 0;
+    const hasValidatedJobs = entry.validatedCompletions && entry.validatedCompletions.size > 0;
+    if (now - entry.createdAt > RECONCILIATION_EXPIRY_MS || (!hasPendingJobs && !hasValidatedJobs)) {
       pendingReconciliationsByRequestId.delete(reqId);
     }
   }
@@ -38,7 +47,9 @@ const pruneSocketRequests = (socket) => {
   if (!socket?.pendingReconciliations) return;
   const now = Date.now();
   for (const [reqId, entry] of socket.pendingReconciliations.entries()) {
-    if (now - entry.createdAt > RECONCILIATION_EXPIRY_MS || !entry.jobIds || entry.jobIds.size === 0) {
+    const hasPendingJobs = entry.jobIds && entry.jobIds.size > 0;
+    const hasValidatedJobs = entry.validatedCompletions && entry.validatedCompletions.size > 0;
+    if (now - entry.createdAt > RECONCILIATION_EXPIRY_MS || (!hasPendingJobs && !hasValidatedJobs)) {
       socket.pendingReconciliations.delete(reqId);
     }
   }
@@ -54,6 +65,8 @@ const registerReconciliationOnSocket = (socket, { requestId, jobIds, jobBindings
     machineId: socket.machineId,
     jobIds: new Set(jobIds),
     jobBindings: jobBindings ? { ...jobBindings } : {},
+    validatedCompletions: new Map(),
+    consumedJobs: new Set(),
     createdAt: Date.now()
   };
 
@@ -90,6 +103,8 @@ const requestPrinterReconciliation = (io, machineId, { requestId, jobIds, jobBin
     machineId,
     jobIds: new Set(jobIds),
     jobBindings: jobBindings ? { ...jobBindings } : {},
+    validatedCompletions: new Map(),
+    consumedJobs: new Set(),
     createdAt: Date.now()
   };
 
@@ -558,6 +573,35 @@ const setupSockets = (io) => {
           }
           reportIdentityValidated = true;
 
+          if (status === 'COMPLETED_LOCALLY') {
+            // Physical completion clearance strictly requires the job to have been dispatched and in PRINTING state.
+            // WAITING jobs were never claimed or dispatched to the physical printer and cannot transition directly to COMPLETED (violates state machine).
+            if (job.status !== 'PRINTING') {
+              logger.warn(`Reconciliation rejected: Job ${jobId} status is ${job.status}, expected PRINTING for COMPLETED_LOCALLY`);
+              reportIdentityValidated = false;
+              return;
+            }
+
+            // Verify payment was successfully confirmed
+            if (!job.payment || job.payment.status !== 'SUCCESS') {
+              logger.warn(`Reconciliation rejected: Job ${jobId} payment is not SUCCESS (payment status: ${job.payment?.status})`);
+              reportIdentityValidated = false;
+              return;
+            }
+
+            if (!active.validatedCompletions) {
+              active.validatedCompletions = new Map();
+            }
+            active.validatedCompletions.set(jobId, {
+              jobId,
+              machineId: socket.machineId,
+              printerDeviceId: job.printerDeviceId,
+              validatedAt: Date.now()
+            });
+            logger.info(`Job ${jobId} validated as COMPLETED_LOCALLY under request ${requestId}. Awaiting spooler clearance.`);
+            return;
+          }
+
           // Valid non-NOT_DISPATCHED reports consume the slot but never trigger a reprint.
           if (status !== 'NOT_DISPATCHED') return;
 
@@ -601,7 +645,9 @@ const setupSockets = (io) => {
       }
 
       // If all jobs in this request are now resolved/consumed, clean up the correlation entry
-      if (active.jobIds.size === 0 && requestId) {
+      const hasPendingJobIds = active.jobIds && active.jobIds.size > 0;
+      const hasValidated = active.validatedCompletions && active.validatedCompletions.size > 0;
+      if (!hasPendingJobIds && !hasValidated && requestId) {
         if (socket.pendingReconciliations) socket.pendingReconciliations.delete(requestId);
         pendingReconciliationsByRequestId.delete(requestId);
       }
@@ -653,19 +699,145 @@ const setupSockets = (io) => {
         // Device-bound and legacy jobs must report the exact expected printer identity.
         if (!verifyPrinterDeviceReport(currentJob, normalizedReport)) {
           logger.warn(`Spooler clearance rejected: PrinterDevice identity mismatch for job ${jobId}`);
+          socket.emit('print_physical_ambiguous', {
+            jobId,
+            requestId: normalizedReport?.requestId,
+            reason: 'Spooler clearance rejected: PrinterDevice identity mismatch',
+            wasSeenInQueue: normalizedReport?.wasSeenInQueue === true
+          });
           return;
         }
 
         // P0: Enforce Machine Ownership
         if (currentJob.machineId !== socket.machineId) {
           logger.warn(`Machine ${socket.machineId} attempted to mark job ${jobId} as COMPLETED, but job belongs to ${currentJob.machineId}`);
+          socket.emit('print_physical_ambiguous', {
+            jobId,
+            requestId: normalizedReport?.requestId,
+            reason: 'Spooler clearance rejected: Machine ownership mismatch',
+            wasSeenInQueue: normalizedReport?.wasSeenInQueue === true
+          });
           return;
         }
 
         // V6 Architecture Contract: A spooler queue that was never observed must never be treated as successfully cleared
         const wasSeenInQueue = normalizedReport.wasSeenInQueue === true;
-        const isReconciled = normalizedReport.reconciled === true;
+        const isReconciled = normalizedReport.reconciled === true || Boolean(normalizedReport.requestId);
         const isSimulation = normalizedReport.mode === 'simulation';
+
+        // Simulation mode security check: must be explicitly allowed by backend environment policy
+        if (isSimulation && !isSimulationAllowed()) {
+          logger.warn(`Spooler clearance refused for job ${jobId}: Simulation mode is not permitted by backend policy in current environment.`);
+          socket.emit('print_physical_ambiguous', {
+            jobId,
+            reason: 'Spooler clearance rejected: Simulation mode not permitted in current environment.',
+            wasSeenInQueue: false
+          });
+          return;
+        }
+
+        // Reconciliation completion correlation: must strictly correlate to active server-side request
+        let activeCorrelation = null;
+        if (isReconciled) {
+          const reqId = normalizedReport.requestId;
+          if (!reqId || typeof reqId !== 'string') {
+            logger.warn(`Spooler clearance refused for job ${jobId}: Missing or invalid requestId for reconciled completion.`);
+            socket.emit('print_physical_ambiguous', {
+              jobId,
+              reason: 'Spooler clearance rejected: Missing requestId for reconciliation.',
+              wasSeenInQueue
+            });
+            return;
+          }
+
+          if (socket.pendingReconciliations && socket.pendingReconciliations.has(reqId)) {
+            activeCorrelation = socket.pendingReconciliations.get(reqId);
+          } else if (pendingReconciliationsByRequestId.has(reqId)) {
+            activeCorrelation = pendingReconciliationsByRequestId.get(reqId);
+          } else if (socket.activeReconciliation && socket.activeReconciliation.requestId === reqId) {
+            activeCorrelation = socket.activeReconciliation;
+          }
+
+          if (!activeCorrelation) {
+            logger.warn(`Spooler clearance refused for job ${jobId}: No active reconciliation request found for reqId ${reqId}.`);
+            socket.emit('print_physical_ambiguous', {
+              jobId,
+              requestId: reqId,
+              reason: 'Spooler clearance rejected: No matching active reconciliation request.',
+              wasSeenInQueue
+            });
+            return;
+          }
+
+          if (activeCorrelation.machineId && activeCorrelation.machineId !== socket.machineId) {
+            logger.warn(`Spooler clearance refused for job ${jobId}: Request ${reqId} belongs to machine ${activeCorrelation.machineId}, reported by ${socket.machineId}.`);
+            socket.emit('print_physical_ambiguous', {
+              jobId,
+              requestId: reqId,
+              reason: 'Spooler clearance rejected: Machine mismatch on reconciliation request.',
+              wasSeenInQueue
+            });
+            return;
+          }
+
+          const isExpired = (Date.now() - activeCorrelation.createdAt) > RECONCILIATION_EXPIRY_MS;
+          if (isExpired) {
+            logger.warn(`Spooler clearance refused for job ${jobId}: Reconciliation request ${reqId} has expired.`);
+            if (socket.pendingReconciliations) socket.pendingReconciliations.delete(reqId);
+            pendingReconciliationsByRequestId.delete(reqId);
+            socket.emit('print_physical_ambiguous', {
+              jobId,
+              requestId: reqId,
+              reason: 'Spooler clearance rejected: Reconciliation request expired.',
+              wasSeenInQueue
+            });
+            return;
+          }
+
+          // Check for replay of already consumed job
+          if (activeCorrelation.consumedJobs && activeCorrelation.consumedJobs.has(jobId)) {
+            logger.warn(`Spooler clearance refused for job ${jobId}: Replayed completion report for requestId ${reqId}.`);
+            socket.emit('print_physical_ambiguous', {
+              jobId,
+              requestId: reqId,
+              reason: 'Spooler clearance rejected: Replayed completion report.',
+              wasSeenInQueue
+            });
+            return;
+          }
+
+          // Must be present in either jobIds or validatedCompletions
+          const inJobIds = activeCorrelation.jobIds && activeCorrelation.jobIds.has(jobId);
+          const isValidatedLocally = activeCorrelation.validatedCompletions && activeCorrelation.validatedCompletions.has(jobId);
+
+          if (!inJobIds && !isValidatedLocally) {
+            logger.warn(`Spooler clearance refused for job ${jobId}: Job not included in reconciliation request ${reqId}.`);
+            socket.emit('print_physical_ambiguous', {
+              jobId,
+              requestId: reqId,
+              reason: 'Spooler clearance rejected: Job not in reconciliation request.',
+              wasSeenInQueue
+            });
+            return;
+          }
+
+          // Check multi-printer binding if recorded in request
+          if (activeCorrelation.jobBindings && activeCorrelation.jobBindings[jobId]) {
+            const expectedBinding = activeCorrelation.jobBindings[jobId];
+            const reportedDeviceId = normalizedReport.printerDeviceId;
+            if (expectedBinding.printerDeviceId && reportedDeviceId && reportedDeviceId !== expectedBinding.printerDeviceId) {
+              logger.warn(`Spooler clearance refused for job ${jobId}: Reported device ${reportedDeviceId} does not match expected binding ${expectedBinding.printerDeviceId}.`);
+              socket.emit('print_physical_ambiguous', {
+                jobId,
+                requestId: reqId,
+                reason: 'Spooler clearance rejected: PrinterDevice binding mismatch.',
+                wasSeenInQueue
+              });
+              return;
+            }
+          }
+        }
+
         if (!wasSeenInQueue && !isReconciled && !isSimulation) {
           logger.warn(`Spooler clearance refused for job ${jobId}: Queue was never observed by spooler monitor.`);
           socket.emit('print_physical_ambiguous', {
@@ -709,16 +881,24 @@ const setupSockets = (io) => {
           }
         }, { maxWait: 5000, timeout: 10000 });
 
-        // Clean up correlation request entry if this was a reconciled completion
-        if (normalizedReport?.requestId) {
-          const reqId = normalizedReport.requestId;
-          const active = (socket.pendingReconciliations && socket.pendingReconciliations.get(reqId)) || pendingReconciliationsByRequestId.get(reqId);
-          if (active && active.jobIds) {
-            active.jobIds.delete(jobId);
-            if (active.jobIds.size === 0) {
-              if (socket.pendingReconciliations) socket.pendingReconciliations.delete(reqId);
-              pendingReconciliationsByRequestId.delete(reqId);
-            }
+        // Clean up correlation request entry and mark as consumed
+        if (isReconciled && activeCorrelation) {
+          if (!activeCorrelation.consumedJobs) {
+            activeCorrelation.consumedJobs = new Set();
+          }
+          activeCorrelation.consumedJobs.add(jobId);
+          if (activeCorrelation.validatedCompletions) {
+            activeCorrelation.validatedCompletions.delete(jobId);
+          }
+          if (activeCorrelation.jobIds) {
+            activeCorrelation.jobIds.delete(jobId);
+          }
+          const hasRemainingJobIds = activeCorrelation.jobIds && activeCorrelation.jobIds.size > 0;
+          const hasRemainingValidated = activeCorrelation.validatedCompletions && activeCorrelation.validatedCompletions.size > 0;
+          if (!hasRemainingJobIds && !hasRemainingValidated) {
+            const reqId = normalizedReport.requestId;
+            if (socket.pendingReconciliations) socket.pendingReconciliations.delete(reqId);
+            pendingReconciliationsByRequestId.delete(reqId);
           }
         }
 

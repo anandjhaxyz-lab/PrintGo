@@ -402,52 +402,8 @@ const createRefund = async (params) => {
 
         return updatedRefund;
       }
-    } else if (gatewayResult.isUncertainOutcome || gatewayResult.isTimeout) {
-      // Uncertain external outcome: HTTP 5xx, connection reset, read timeout, network disconnect.
-      // UP-03/UP-06 Fail-Closed: Keep refund in PROCESSING, retryEligible = false, retain exact gatewayRefundId.
-      const updatedRefund = await tx.refund.update({
-        where: { id: refund.id },
-        data: {
-          status: 'PROCESSING',
-          retryEligible: false,
-          failureReason: `Uncertain gateway outcome: ${gatewayResult.error || 'Network error/Timeout'}. Retained in PROCESSING without retry release.`,
-          gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
-        }
-      });
-
-      await tx.transaction.create({
-        data: {
-          paymentId: payment.id,
-          action: 'REFUND_UNCERTAIN_OUTCOME',
-          status: 'PENDING',
-          amount: finalRefundAmount,
-          errorMessage: gatewayResult.error || 'Gateway uncertain outcome',
-          gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
-        }
-      });
-
-      if (tx.reconciliationRecord) {
-        await tx.reconciliationRecord.create({
-          data: {
-            paymentId: payment.id,
-            refundId: refund.id,
-            status: 'PENDING_RECONCILIATION',
-            discrepancyType: 'UNCERTAIN_GATEWAY_REFUND_OUTCOME',
-            details: JSON.stringify({
-              gatewayRefundId: refundIdForGateway,
-              statusCode: gatewayResult.statusCode,
-              isTimeout: gatewayResult.isTimeout,
-              isConnectionReset: gatewayResult.isConnectionReset,
-              isServerError: gatewayResult.isServerError,
-              error: gatewayResult.error
-            })
-          }
-        }).catch(() => {});
-      }
-
-      return updatedRefund;
-    } else {
-      // Definitive failure: Provider rejected before execution (e.g. 400 invalid order).
+    } else if (gatewayResult.isDefinitiveFailure && !gatewayResult.isUncertainOutcome && !gatewayResult.isTimeout && !gatewayResult.isRateLimited) {
+      // Definitive failure: Provider explicitly and safely rejected before execution (e.g. 400 invalid order).
       // Only documented & verified definitive provider failures are classified as FAILED.
       const updatedRefund = await tx.refund.update({
         where: { id: refund.id },
@@ -469,6 +425,60 @@ const createRefund = async (params) => {
           gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
         }
       });
+
+      return updatedRefund;
+    } else {
+      // Uncertain external outcome / Rate-limited (HTTP 429) / Timeout (HTTP 408) / Network disconnect / Unclassified:
+      // UP-03/UP-06 Fail-Closed: Keep refund in PROCESSING, retryEligible = false, retain exact gatewayRefundId.
+      // Do NOT create a new gatewayRefundId. Do NOT perform automatic retry that could cause duplicate refund.
+      const isRateLimited = gatewayResult.isRateLimited || gatewayResult.statusCode === 429;
+      const isTimeout = gatewayResult.isTimeout || gatewayResult.statusCode === 408;
+      const failureReasonText = isRateLimited
+        ? `Rate limited by gateway (HTTP 429): ${gatewayResult.error || 'Too Many Requests'}. Retained in PROCESSING for manual/scheduled reconciliation without automatic retry.`
+        : (isTimeout
+          ? `Gateway timeout (HTTP 408/ECONNABORTED): ${gatewayResult.error || 'Request timeout'}. Retained in PROCESSING without retry release.`
+          : `Uncertain gateway outcome (${gatewayResult.statusCode || 'network/unclassified'}): ${gatewayResult.error || 'Network error/Timeout'}. Retained in PROCESSING without retry release.`);
+
+      const updatedRefund = await tx.refund.update({
+        where: { id: refund.id },
+        data: {
+          status: 'PROCESSING',
+          retryEligible: false,
+          failureReason: failureReasonText,
+          gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
+        }
+      });
+
+      await tx.transaction.create({
+        data: {
+          paymentId: payment.id,
+          action: isRateLimited ? 'REFUND_RATE_LIMITED' : 'REFUND_UNCERTAIN_OUTCOME',
+          status: 'PENDING',
+          amount: finalRefundAmount,
+          errorMessage: gatewayResult.error || (isRateLimited ? 'Gateway rate limit' : 'Gateway uncertain outcome'),
+          gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
+        }
+      });
+
+      if (tx.reconciliationRecord) {
+        await tx.reconciliationRecord.create({
+          data: {
+            paymentId: payment.id,
+            refundId: refund.id,
+            status: 'PENDING_RECONCILIATION',
+            discrepancyType: isRateLimited ? 'GATEWAY_RATE_LIMITED' : (isTimeout ? 'GATEWAY_TIMEOUT' : 'UNCERTAIN_GATEWAY_REFUND_OUTCOME'),
+            details: JSON.stringify({
+              gatewayRefundId: refundIdForGateway,
+              statusCode: gatewayResult.statusCode,
+              isRateLimited,
+              isTimeout,
+              isConnectionReset: gatewayResult.isConnectionReset,
+              isServerError: gatewayResult.isServerError,
+              error: gatewayResult.error
+            })
+          }
+        }).catch(() => {});
+      }
 
       return updatedRefund;
     }
