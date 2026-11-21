@@ -87,7 +87,7 @@ INSERT INTO "PrinterQr" ("id", "publicCode", "label", "status", "machineId") VAL
 INSERT INTO "Session" ("id", "code", "status", "machineId", "printerQrId", "paymentMode", "expiresAt") VALUES
   ('session-a', 'SESSIONA12345', 'WAITING_FOR_MOBILE', 'machine-a', 'qr-a', 'CASH_AT_COUNTER', CURRENT_TIMESTAMP + INTERVAL '1 hour'),
   ('session-b', 'SESSIONB12345', 'WAITING_FOR_MOBILE', 'machine-b', NULL, 'CASHFREE_ONLINE', CURRENT_TIMESTAMP + INTERVAL '1 hour'),
-  ('session-inconsistent', 'SESSIONBAD1', 'WAITING_FOR_MOBILE', 'machine-a', 'qr-b', 'CASH_AT_COUNTER', CURRENT_TIMESTAMP + INTERVAL '1 hour');
+  ('session-inconsistent', 'SESSIONINC123', 'WAITING_FOR_MOBILE', 'machine-a', 'qr-b', 'CASH_AT_COUNTER', CURRENT_TIMESTAMP + INTERVAL '1 hour');
 
 INSERT INTO "PrintJob" ("id", "shortId", "status", "cost", "machineId", "paymentMode") VALUES
   ('job-a', 'JOBA1234', 'COMPLETED', 12.50, 'machine-a', 'CASH_AT_COUNTER'),
@@ -115,6 +115,10 @@ BEGIN
     RAISE EXCEPTION 'Expected 2 legacy primary PrinterDevice rows; got %', device_count;
   END IF;
 
+  SELECT "id" INTO legacy_device_id
+  FROM "PrinterDevice"
+  WHERE "machineId" = 'machine-a' AND "isDefault" = TRUE;
+
   IF EXISTS (
     SELECT 1 FROM "PrinterDevice"
     WHERE "status" <> 'DISCOVERY_REQUIRED'
@@ -140,7 +144,36 @@ BEGIN
   FROM "Session"
   WHERE "printerDeviceId" IS NOT NULL;
   IF mapped_session_count <> 3 THEN
-    RAISE EXCEPTION 'Expected QR-linked and Machine-fallback sessions mapped; got %', mapped_session_count;
+    RAISE EXCEPTION 'Expected QR-linked, Machine-fallback, and inconsistent sessions mapped; got %', mapped_session_count;
+  END IF;
+
+  -- Assert Session-PrinterDevice Machine Isolation
+  IF (SELECT "printerDeviceId" FROM "Session" WHERE "id" = 'session-inconsistent') =
+     (SELECT "printerDeviceId" FROM "PrinterQr" WHERE "id" = 'qr-b') THEN
+    RAISE EXCEPTION 'Inconsistent Session inherited PrinterDevice from a foreign Machine QR';
+  END IF;
+
+  IF (SELECT "printerDeviceId" FROM "Session" WHERE "id" = 'session-inconsistent') IS DISTINCT FROM legacy_device_id THEN
+    RAISE EXCEPTION 'Inconsistent Session was not assigned to own Machine default legacy PrinterDevice via fallback';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM "Session" s
+    JOIN "PrinterDevice" pd ON s."printerDeviceId" = pd."id"
+    WHERE s."machineId" IS DISTINCT FROM pd."machineId"
+  ) THEN
+    RAISE EXCEPTION 'Detected Session assigned to PrinterDevice belonging to a different Machine';
+  END IF;
+
+  IF (SELECT "printerDeviceId" FROM "Session" WHERE "id" = 'session-a') IS DISTINCT FROM
+     (SELECT "printerDeviceId" FROM "PrinterQr" WHERE "id" = 'qr-a') THEN
+    RAISE EXCEPTION 'Valid QR-linked Session was not correctly mapped to its PrinterDevice';
+  END IF;
+
+  IF (SELECT "printerDeviceId" FROM "Session" WHERE "id" = 'session-b') IS DISTINCT FROM
+     (SELECT "id" FROM "PrinterDevice" WHERE "machineId" = 'machine-b' AND "isDefault" = TRUE) THEN
+    RAISE EXCEPTION 'Valid Machine-fallback Session was not correctly mapped to its default PrinterDevice';
   END IF;
 
   IF (SELECT "printerDeviceId" FROM "Session" WHERE "id" = 'session-inconsistent') = (SELECT "printerDeviceId" FROM "PrinterQr" WHERE "id" = 'qr-b') THEN
@@ -172,10 +205,6 @@ BEGIN
     RAISE EXCEPTION 'Expected Machine-level telemetry rows attributed to legacy primary devices; got %', mapped_status_count;
   END IF;
 
-  SELECT "id" INTO legacy_device_id
-  FROM "PrinterDevice"
-  WHERE "machineId" = 'machine-a' AND "isDefault" = TRUE;
-
   -- Phase 1 must retain the old active-per-Machine QR invariant. A second
   -- active QR for a different child device is still blocked until Phase 3.
   INSERT INTO "PrinterDevice" (
@@ -202,7 +231,7 @@ BEGIN
     RAISE EXCEPTION 'Legacy active-per-Machine QR constraint was not retained in Phase 1';
   END IF;
 
-  RAISE NOTICE 'PASS: Phase 1 legacy backfill preserved QR tokens, sessions, jobs, payment snapshots and status rows; no Windows queue names were guessed.';
+  RAISE NOTICE 'PASS: Phase 1 legacy backfill enforced Session machine isolation, preserved QR tokens, sessions, jobs, payment snapshots and status rows; no Windows queue names were guessed.';
 END
 $assert$;
 
