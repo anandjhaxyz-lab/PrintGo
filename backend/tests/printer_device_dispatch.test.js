@@ -95,9 +95,14 @@ describe('Backend device-bound PrintJob dispatch gate', () => {
       where: {
         shortId: job.shortId,
         status: 'WAITING',
-        printerDeviceId: 'device-epson'
+        printerDeviceId: 'device-epson',
+        printAttempts: { lt: 3 },
+        legacyAttemptsUnknown: false
       },
-      data: { status: 'PRINTING' }
+      data: {
+        status: 'PRINTING',
+        printAttempts: { increment: 1 }
+      }
     });
     expect(io.to).toHaveBeenCalledWith('machine_machine-a');
     expect(room.emit).toHaveBeenCalledWith('physical_print_job', expect.objectContaining({
@@ -268,9 +273,14 @@ describe('Backend device-bound PrintJob dispatch gate', () => {
       where: {
         shortId: legacy.shortId,
         status: 'WAITING',
-        printerDeviceId: null
+        printerDeviceId: null,
+        printAttempts: { lt: 3 },
+        legacyAttemptsUnknown: false
       },
-      data: { status: 'PRINTING' }
+      data: {
+        status: 'PRINTING',
+        printAttempts: { increment: 1 }
+      }
     });
     const emitted = room.emit.mock.calls.find(([event]) => event === 'physical_print_job');
     expect(emitted).toBeDefined();
