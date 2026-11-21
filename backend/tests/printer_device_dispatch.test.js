@@ -101,7 +101,8 @@ describe('Backend device-bound PrintJob dispatch gate', () => {
       },
       data: {
         status: 'PRINTING',
-        printAttempts: { increment: 1 }
+        printAttempts: { increment: 1 },
+        reservedForRetry: false
       }
     });
     expect(io.to).toHaveBeenCalledWith('machine_machine-a');
@@ -279,7 +280,8 @@ describe('Backend device-bound PrintJob dispatch gate', () => {
       },
       data: {
         status: 'PRINTING',
-        printAttempts: { increment: 1 }
+        printAttempts: { increment: 1 },
+        reservedForRetry: false
       }
     });
     const emitted = room.emit.mock.calls.find(([event]) => event === 'physical_print_job');
