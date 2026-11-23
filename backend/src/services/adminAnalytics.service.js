@@ -715,6 +715,7 @@ const getOperators = async (user) => {
       email: true,
       name: true,
       role: true,
+      isActive: true,
       companyId: true,
       company: { select: { id: true, name: true } },
       createdAt: true

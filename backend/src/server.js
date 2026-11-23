@@ -319,9 +319,11 @@ const companiesRoutes = require('./modules/companies/companies.routes');
 const paymentsRoutes = require('./modules/payments/payments.routes');
 const subscriptionsRoutes = require('./modules/subscriptions/subscriptions.routes');
 const advertisementsRoutes = require('./modules/advertisements/advertisements.routes');
+const usersRoutes = require('./modules/users/users.routes');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/users', usersRoutes);
 app.use('/api/jobs', jobsRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/machines', machinesRoutes);

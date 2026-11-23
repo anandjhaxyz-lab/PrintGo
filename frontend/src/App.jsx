@@ -5,6 +5,7 @@ import { Printer, Loader } from 'lucide-react';
 const KioskView = React.lazy(() => import('./pages/KioskView'));
 const MobileView = React.lazy(() => import('./pages/MobileView'));
 const AdminDashboard = React.lazy(() => import('./pages/AdminDashboard'));
+const ActivateAccount = React.lazy(() => import('./pages/ActivateAccount'));
 const ContactUs = React.lazy(() => import('./pages/ContactUs'));
 const Terms = React.lazy(() => import('./pages/Terms'));
 const Refunds = React.lazy(() => import('./pages/Refunds'));
@@ -50,7 +51,7 @@ const isAdminOnlyMode = import.meta.env.VITE_APP_MODE === 'admin';
 
 const AppLayout = ({ children }) => {
   const location = useLocation();
-  const isAdmin = isAdminOnlyMode || location.pathname.startsWith('/admin') || location.pathname.startsWith('/login');
+  const isAdmin = isAdminOnlyMode || location.pathname.startsWith('/admin') || location.pathname.startsWith('/login') || location.pathname.startsWith('/activate');
   const isMobile = location.pathname.startsWith('/m/') || location.pathname.startsWith('/p/');
 
   // In Admin Mode or for Admin Workspace, give dedicated full-screen layout without Kiosk header/footer
@@ -152,6 +153,7 @@ const App = () => {
                 <Route path="/" element={<AdminDashboard />} />
                 <Route path="/admin" element={<AdminDashboard />} />
                 <Route path="/login" element={<AdminDashboard />} />
+                <Route path="/activate" element={<ActivateAccount />} />
                 <Route path="*" element={<AdminDashboard />} />
               </Routes>
             ) : (
@@ -163,6 +165,7 @@ const App = () => {
                 <Route path="/p/:publicCode" element={<MobileView />} />
                 <Route path="/admin" element={<AdminDashboard />} />
                 <Route path="/login" element={<AdminDashboard />} />
+                <Route path="/activate" element={<ActivateAccount />} />
                 <Route path="/contact" element={<ContactUs />} />
                 <Route path="/terms" element={<Terms />} />
                 <Route path="/refunds" element={<Refunds />} />

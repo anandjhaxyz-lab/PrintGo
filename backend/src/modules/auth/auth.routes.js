@@ -3,9 +3,10 @@ const router = express.Router();
 const authController = require('./auth.controller');
 const { protect } = require('../../middlewares/auth');
 const { validate } = require('../../middlewares/validate');
-const { loginSchema, sessionSchema } = require('../../utils/schemas');
+const { loginSchema, activateSchema, sessionSchema } = require('../../utils/schemas');
 
 router.post('/login', validate(loginSchema), authController.login);
+router.post('/activate', validate(activateSchema), authController.activateAccount);
 router.post('/logout', authController.logout);
 router.get('/me', protect, authController.getMe);
 

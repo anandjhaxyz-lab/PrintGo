@@ -426,7 +426,7 @@ const AdminDashboard = () => {
           )}
 
           {currentTab === 'shop' && (
-            <ShopOperatorsView companies={companies} machines={machines} operators={operators} isSuperadmin={isSuperadmin} />
+            <ShopOperatorsView companies={companies} machines={machines} operators={operators} isSuperadmin={isSuperadmin} onRefresh={loadDashboardData} />
           )}
 
           {currentTab === 'reports' && (

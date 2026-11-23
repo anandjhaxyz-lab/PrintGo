@@ -10,6 +10,15 @@ const loginSchema = z.object({
   params: z.any(),
 });
 
+const activateSchema = z.object({
+  body: z.object({
+    token: z.string().min(1, 'Token is required'),
+    password: z.string().min(6, 'Password must be at least 6 characters'),
+  }).strict(),
+  query: z.any(),
+  params: z.any(),
+});
+
 const sessionSchema = z.object({
   body: z.object({
     sessionCode: z.string().min(1).optional(),
@@ -118,9 +127,9 @@ const updateMachineSchema = z.object({
 const createCompanySchema = z.object({
   body: z.object({
     name: z.string().min(1),
-    contactPerson: z.string().min(1),
+    contactPerson: z.string().min(1).optional(),
     email: z.string().email(),
-    phone: z.string().min(1),
+    phone: z.string().min(1).optional(),
   }).strip(),
   query: z.any(),
   params: z.any(),
@@ -145,8 +154,41 @@ const cancelSubscriptionSchema = z.object({
   }).strip(),
 });
 
+// Users Schemas
+const updateUserSchema = z.object({
+  body: z.object({
+    name: z.string().min(1).optional(),
+    role: z.enum(['SUPERADMIN', 'FRANCHISEE', 'STAFF']).optional(),
+    isActive: z.boolean().optional(),
+    companyId: z.string().uuid().nullable().optional(),
+  }).strict(),
+  query: z.any(),
+  params: z.object({
+    id: z.string().uuid(),
+  }).strip(),
+});
+
+const toggleUserActiveSchema = z.object({
+  body: z.object({
+    isActive: z.boolean(),
+  }).strict(),
+  query: z.any(),
+  params: z.object({
+    id: z.string().uuid(),
+  }).strip(),
+});
+
+const deleteUserSchema = z.object({
+  body: z.any(),
+  query: z.any(),
+  params: z.object({
+    id: z.string().uuid(),
+  }).strip(),
+});
+
 module.exports = {
   loginSchema,
+  activateSchema,
   sessionSchema,
   createJobSchema,
   updateJobStatusSchema,
@@ -156,4 +198,7 @@ module.exports = {
   createCompanySchema,
   createSubscriptionSchema,
   cancelSubscriptionSchema,
+  updateUserSchema,
+  toggleUserActiveSchema,
+  deleteUserSchema,
 };

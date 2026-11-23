@@ -33,6 +33,34 @@ const login = async (req, res, next) => {
   }
 };
 
+const activateAccount = async (req, res, next) => {
+  try {
+    const { token, password } = req.body;
+    const { user, token: authToken } = await authService.activateAccount(token, password);
+
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+
+    res.cookie('jwt', authToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 90 * 24 * 60 * 60 * 1000 // 90 days
+    });
+
+    user.password = undefined;
+
+    res.status(200).json({
+      success: true,
+      message: 'Account successfully activated',
+      token: authToken,
+      user
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 const logout = (req, res) => {
   res.cookie('jwt', 'loggedout', {
     expires: new Date(Date.now() + 10 * 1000),
@@ -286,6 +314,7 @@ const getPublicPricing = async (req, res, next) => {
 
 module.exports = {
   login,
+  activateAccount,
   logout,
   getMe,
   createSession,

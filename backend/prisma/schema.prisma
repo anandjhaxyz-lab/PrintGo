@@ -20,6 +20,12 @@ model User {
   companyId String?
   company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
   
+  isActive            Boolean   @default(true)
+  tokenVersion        Int       @default(0)
+  passwordChangedAt   DateTime?
+  activationTokenHash String?
+  activationExpiresAt DateTime?
+
   notifications  Notification[]
   supportTickets SupportTicket[]
   activityLogs   ActivityLog[]
@@ -28,6 +34,8 @@ model User {
   updatedAt DateTime @updatedAt
 
   @@index([email])
+  @@index([companyId, role])
+  @@index([activationTokenHash])
 }
 
 
