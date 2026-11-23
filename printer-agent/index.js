@@ -27,6 +27,7 @@ const {
   buildAgentHello,
   validatePrinterDeviceRegistry
 } = require('./src/agentProtocol');
+const { acquireAgentMutex, MUTEX_NAME } = require('./src/windowsNamedMutex');
 const journal = new JobJournal();
 const agentPackage = require('./package.json');
 
@@ -73,25 +74,59 @@ async function validatePrinter() {
     }
 }
 
-if (PRINTER_NAME) {
-    validatePrinter();
-} else {
-  console.warn('⚠️  WARNING: PRINTER_NAME is not set. Running in simulation mode (no physical printing).');
+let agentMutexLock = null;
+let isShuttingDown = false;
+let isAcceptingJobs = true;
+
+async function bootstrap() {
+  try {
+    console.log(`🔒 [UP-05] Requesting Windows Named Mutex: ${MUTEX_NAME}...`);
+    agentMutexLock = await acquireAgentMutex({
+      onShutdown: shutdownAgent,
+      isOperational: () => {
+        const activeLanes = printerDeviceQueue ? printerDeviceQueue.getActiveLaneCount() : 0;
+        const activeMonitors = spoolerMonitor ? spoolerMonitor.getActiveMonitorCount() : 0;
+        return (isAcceptingJobs && !isShuttingDown) || activeLanes > 0 || activeMonitors > 0;
+      }
+    });
+    if (agentMutexLock && typeof agentMutexLock.registerShutdown === 'function') {
+      agentMutexLock.registerShutdown(shutdownAgent);
+    }
+    console.log(`✅ [UP-05] Windows Named Mutex acquired and locked for process lifetime: ${MUTEX_NAME}`);
+  } catch (err) {
+    if (err.code === 'MUTEX_ALREADY_HELD') {
+      console.error(`\n❌ [UP-05 REJECTION] Another PrintGo/NEOX Agent process is already running on this machine.`);
+      console.error(`   The Windows Named Mutex '${MUTEX_NAME}' is currently locked.`);
+      console.error(`   To prevent duplicate physical prints, secondary instances fail closed and terminate immediately.\n`);
+      process.exit(1);
+    }
+    console.error(`\n❌ [UP-05 FATAL] Failed to acquire Windows Named Mutex '${MUTEX_NAME}': ${err.message}\n`);
+    process.exit(1);
+  }
+
+  if (PRINTER_NAME) {
+    await validatePrinter();
+  } else {
+    console.warn('⚠️  WARNING: PRINTER_NAME is not set. Running in simulation mode (no physical printing).');
+  }
+
+  startAgent();
 }
 
-console.log(`🖨️  PrintGo Enterprise Printer Agent Starting...`);
-console.log(`🔗 Connecting to cloud backend: ${BACKEND_URL}`);
+function startAgent() {
+  console.log(`🖨️  PrintGo Enterprise Printer Agent Starting...`);
+  console.log(`🔗 Connecting to cloud backend: ${BACKEND_URL}`);
 
-const tempDir = path.join(__dirname, 'temp');
-if (!fs.existsSync(tempDir)) {
-  fs.mkdirSync(tempDir);
-}
+  const tempDir = path.join(__dirname, 'temp');
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir);
+  }
 
-const socket = io(BACKEND_URL, { 
-  transports: ['websocket'],
-  auth: { machineKey: MACHINE_KEY }
-});
-const dispatchAuthorizer = new PrinterDispatchAuthorizer(socket);
+  const socket = io(BACKEND_URL, { 
+    transports: ['websocket'],
+    auth: { machineKey: MACHINE_KEY }
+  });
+  const dispatchAuthorizer = new PrinterDispatchAuthorizer(socket);
 
 // Persistent RSA Keypair for E2EE across restarts
 const keysDir = path.join(__dirname, 'keys');
@@ -123,11 +158,61 @@ const printerDeviceQueue = new PrinterDeviceQueue();
 const activePrintJobIds = new Set();
 
 let statusInterval = null;
+let heartbeatInterval = null;
+let keepAliveInterval = null;
 let registeredMachineId = null;
 let fleetProtocolAccepted = false;
 let fleetManager = null;
 let latestRegistryIssuedAt = 0;
 let pendingRegistryRefresh = null;
+
+async function shutdownAgent(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  isAcceptingJobs = false;
+  console.log(`🛑 [Agent Shutdown] Received ${signal || 'shutdown signal'}. Executing graceful teardown...`);
+
+  // 1. Stop heartbeat and keep-alive timers immediately
+  if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
+  if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+  if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
+
+  // 2. Deterministic queue drain (bounded timeout: 10s)
+  const laneCount = printerDeviceQueue ? printerDeviceQueue.getActiveLaneCount() : 0;
+  if (laneCount > 0) {
+    console.log(`⏳ [Agent Shutdown] Draining printer device queues (${laneCount} active lanes)...`);
+    await printerDeviceQueue.drain({ timeoutMs: 10000 });
+    console.log(`✅ [Agent Shutdown] Printer device queues drained successfully.`);
+  }
+
+  // 3. Safely settle active spooler monitors (bounded timeout)
+  if (spoolerMonitor && typeof spoolerMonitor.settleActiveMonitors === 'function') {
+    await spoolerMonitor.settleActiveMonitors({
+      socket,
+      reason: `AGENT_SHUTDOWN_${signal || 'SIGINT'}`
+    });
+  }
+
+  // 4. Settle pending registry refresh
+  if (pendingRegistryRefresh) {
+    settleRegistryRefresh(pendingRegistryRefresh.requestId, false, { code: 'AGENT_SHUTDOWN', message: 'Agent shutting down' });
+  }
+
+  // 5. Disconnect socket cleanly
+  if (socket) {
+    try {
+      if (socket.connected) {
+        socket.emit('agent_disconnecting', { machineKey: MACHINE_KEY, reason: signal || 'SHUTDOWN' });
+        socket.disconnect();
+      }
+    } catch (_) {}
+  }
+  console.log(`✅ [Agent Shutdown] Teardown complete.`);
+}
+
+if (agentMutexLock && typeof agentMutexLock.registerShutdown === 'function') {
+  agentMutexLock.registerShutdown(shutdownAgent);
+}
 
 const settleRegistryRefresh = (requestId, accepted, details = {}) => {
   const pending = pendingRegistryRefresh;
@@ -454,10 +539,20 @@ socket.on('reconcile_active_jobs', ({ requestId, jobIds = [], jobBindings = {} }
       });
     } else if (['COMPLETED_LOCALLY', 'ACKNOWLEDGED'].includes(entry.state)) {
       console.log(`📡 Reporting existing completion evidence for Job ${jobId} (state: ${entry.state})`);
+      socket.emit('print_spooler_cleared', {
+        jobId,
+        requestId,
+        reconciled: true,
+        wasSeenInQueue: true,
+        dispatchedAt: entry.dispatchedAt || entry.dispatchIntentAt,
+        completedAt: entry.completedAt,
+        ...binding
+      });
       socket.emit('print_physical_success', {
         jobId,
         requestId,
         reconciled: true,
+        wasSeenInQueue: true,
         dispatchedAt: entry.dispatchedAt || entry.dispatchIntentAt,
         completedAt: entry.completedAt,
         ...binding
@@ -485,6 +580,10 @@ socket.on('reconcile_active_jobs', ({ requestId, jobIds = [], jobBindings = {} }
 // checkPrinterStatus logic has been moved to src/spooler.js
 
 socket.on('physical_print_job', (jobData) => {
+  if (isShuttingDown || !isAcceptingJobs) {
+    console.warn(`⚠️ [Agent Shutdown] Refusing new print work for Job ${jobData?.jobId}: Agent is shutting down.`);
+    return;
+  }
   const jobId = jobData?.jobId;
   if (!jobId || typeof jobId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
     console.error(`❌ REJECTED Job: Invalid jobId format (potential injection): ${jobId}`);
@@ -561,7 +660,8 @@ const processPhysicalPrintJob = async (jobData) => {
   const replayDisposition = journal.getReplayDisposition(jobData.jobId);
   if (replayDisposition === 'COMPLETED') {
     console.warn(`⚠️ IDEMPOTENCY GUARD: Job ${jobData.jobId} has durable local completion evidence. Refusing duplicate physical print.`);
-    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true, ...deviceBinding });
+    socket.emit('print_spooler_cleared', { jobId: jobData.jobId, alreadyDispatched: true, wasSeenInQueue: true, ...deviceBinding });
+    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true, wasSeenInQueue: true, ...deviceBinding });
     return;
   }
 
@@ -870,18 +970,30 @@ const processPhysicalPrintJob = async (jobData) => {
 };
 
 // Send heartbeat every 30 seconds to keep machine online status active
-setInterval(() => {
+heartbeatInterval = setInterval(() => {
   socket.emit('heartbeat');
 }, 30000);
 
 // P4-001: Render Free Tier Keep-Alive
 // Render spins down free instances after 15 mins of inactivity. 
 // A raw HTTP GET request every 10 minutes ensures the server stays awake while the kiosk is online.
-setInterval(async () => {
-  try {
-    await axios.get(`${BACKEND_URL}/api/health`);
-    console.log(`📡 Keep-Alive ping sent to ${BACKEND_URL}/api/health`);
-  } catch (error) {
-    console.error(`⚠️  Keep-Alive ping failed: ${error.message}`);
-  }
-}, 10 * 60 * 1000); // 10 minutes
+  keepAliveInterval = setInterval(async () => {
+    try {
+      await axios.get(`${BACKEND_URL}/api/health`);
+      console.log(`📡 Keep-Alive ping sent to ${BACKEND_URL}/api/health`);
+    } catch (error) {
+      console.error(`⚠️  Keep-Alive ping failed: ${error.message}`);
+    }
+  }, 10 * 60 * 1000); // 10 minutes
+}
+
+if (require.main === module) {
+  bootstrap();
+}
+
+module.exports = {
+  bootstrap,
+  startAgent,
+  shutdownAgent,
+  MUTEX_NAME
+};

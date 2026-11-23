@@ -29,6 +29,7 @@ backups/**
 *.dump
 *.sql
 !backend/prisma/migrations/**/*.sql
+!backend/tests/sql/**/*.sql
 *_manifest.json
 
 # Local backup copies

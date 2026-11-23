@@ -70,6 +70,61 @@ class SpoolerMonitor {
     this.isCheckingStatus = false;
     this.portName = 'Unknown';
     this.connectionType = 'Unknown';
+    this.activeMonitors = new Map();
+  }
+
+  hasActiveMonitors() {
+    return this.activeMonitors.size > 0;
+  }
+
+  getActiveMonitorCount() {
+    return this.activeMonitors.size;
+  }
+
+  async settleActiveMonitors(options = {}) {
+    const { socket, reason = 'AGENT_SHUTTING_DOWN' } = options;
+    if (this.activeMonitors.size === 0) return { settled: 0 };
+
+    const settledCount = this.activeMonitors.size;
+    console.log(`🛑 [SpoolerMonitor] Settling ${settledCount} active spooler monitor(s) due to ${reason}...`);
+
+    for (const [jobId, monitor] of this.activeMonitors.entries()) {
+      try {
+        if (monitor.pollSpooler) clearInterval(monitor.pollSpooler);
+        if (monitor.simTimer) clearTimeout(monitor.simTimer);
+
+        const wasSeenInQueue = monitor.getWasSeenInQueue ? monitor.getWasSeenInQueue() : false;
+        const targetSocket = socket || monitor.socket;
+
+        if (this.journal) {
+          this.journal.recordAmbiguous(jobId, {
+            reason: `Agent shutdown interrupted spooler monitoring. Partial physical output may have occurred.`,
+            wasSeenInQueue,
+            interruptedAt: new Date().toISOString(),
+            ...monitor.eventBinding
+          });
+        }
+
+        if (targetSocket && targetSocket.connected) {
+          targetSocket.emit('print_physical_ambiguous', {
+            jobId,
+            reason: `Agent shutdown interrupted spooler monitoring. Partial physical output may have occurred.`,
+            wasSeenInQueue,
+            interruptedAt: new Date().toISOString(),
+            ...monitor.eventBinding
+          });
+        }
+
+        if (monitor.localFilePath && fs.existsSync(monitor.localFilePath)) {
+          try { fs.unlinkSync(monitor.localFilePath); } catch (_) {}
+        }
+      } catch (err) {
+        console.error(`Error settling monitor for job ${jobId}:`, err);
+      }
+    }
+
+    this.activeMonitors.clear();
+    return { settled: settledCount };
   }
 
   checkPrinterStatus(socket) {
@@ -215,11 +270,14 @@ class SpoolerMonitor {
     if (!this.printerName || this.printerName === 'SimulationMode') {
       console.log(`⚠️  SIMULATION MODE: Bypassing physical print for job ${jobId}`);
       socket.emit('print_spooler_success', { jobId, ...eventBinding });
-      setTimeout(() => {
+      const simTimer = setTimeout(() => {
+        this.activeMonitors.delete(jobId);
         if (this.journal) this.journal.recordCompleted(jobId, { mode: 'simulation', ...eventBinding });
-        socket.emit('print_physical_success', { jobId, mode: 'simulation', ...eventBinding });
+        socket.emit('print_spooler_cleared', { jobId, mode: 'simulation', wasSeenInQueue: true, ...eventBinding });
+        socket.emit('print_physical_success', { jobId, mode: 'simulation', wasSeenInQueue: true, ...eventBinding });
         if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
       }, 3000);
+      this.activeMonitors.set(jobId, { simTimer, socket, localFilePath, jobId, eventBinding, getWasSeenInQueue: () => true });
       return null;
     }
 
@@ -228,6 +286,16 @@ class SpoolerMonitor {
     let wasSeenInQueue = false; 
     let isPollingExecution = false;
     const maxAttempts = 60; // 60 iterations (with 2s delay = ~2 minutes)
+
+    const monitorEntry = {
+      pollSpooler: null,
+      socket,
+      localFilePath,
+      jobId,
+      eventBinding,
+      getWasSeenInQueue: () => wasSeenInQueue
+    };
+    this.activeMonitors.set(jobId, monitorEntry);
     
     const pollSpooler = setInterval(() => {
       // Guard against overlapping PowerShell processes
@@ -236,6 +304,7 @@ class SpoolerMonitor {
       checkAttempts++;
       if (checkAttempts > maxAttempts) {
         clearInterval(pollSpooler);
+        this.activeMonitors.delete(jobId);
         console.error(`⚠️ Spooler monitoring timed out for Job ${jobId}.`);
         if (wasSeenInQueue) {
           // It was seen in queue and never reported error, but didn't clear within 2m
@@ -278,8 +347,10 @@ class SpoolerMonitor {
             if (wasSeenInQueue) {
               // Verified transition: It was in queue, and now is safely cleared
               clearInterval(pollSpooler);
+              this.activeMonitors.delete(jobId);
               console.log(`✅ Job ${jobId} physically completed (verified in spooler and cleared)!`);
               if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+              socket.emit('print_spooler_cleared', { jobId, wasSeenInQueue: true, ...eventBinding });
               socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             }
@@ -299,8 +370,17 @@ class SpoolerMonitor {
               const status = ourJob.JobStatus || '';
               if (status.includes('Error') || status.includes('PaperOut') || status.includes('PaperJam') || status.includes('Blocked')) {
                 clearInterval(pollSpooler);
-                console.error(`❌ Physical Print Error for Job ${jobId}: ${status}`);
-                socket.emit('print_physical_error', { jobId, error: status, ...eventBinding });
+                this.activeMonitors.delete(jobId);
+                console.error(`⚠️ Spooler error reported for Job ${jobId} while in queue: ${status}. Outcome is ambiguous; partial printing may have occurred.`);
+                // Post-dispatch in-queue errors are ambiguous: partial pages may have printed.
+                // Never emit print_physical_error (which would trigger automatic failure and refund).
+                socket.emit('print_physical_ambiguous', {
+                  jobId,
+                  reason: `Spooler reported ${status} while job was in queue. Partial printing may have occurred.`,
+                  wasSeenInQueue: true,
+                  error: status,
+                  ...eventBinding
+                });
                 this.execFile('powershell.exe', [
                   '-NoProfile',
                   '-NonInteractive',
@@ -312,8 +392,10 @@ class SpoolerMonitor {
             } else if (wasSeenInQueue) {
               // Was seen in queue on previous check, now gone -> completed!
               clearInterval(pollSpooler);
+              this.activeMonitors.delete(jobId);
               console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
               if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+              socket.emit('print_spooler_cleared', { jobId, wasSeenInQueue: true, ...eventBinding });
               socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
               if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
             }
@@ -333,8 +415,10 @@ class SpoolerMonitor {
             wasSeenInQueue = true;
           } else if (wasSeenInQueue) {
              clearInterval(pollSpooler);
+             this.activeMonitors.delete(jobId);
              console.log(`✅ Job ${jobId} physically completed (cleared from spooler)!`);
              if (this.journal) this.journal.recordCompleted(jobId, { wasSeenInQueue: true, ...eventBinding });
+             socket.emit('print_spooler_cleared', { jobId, wasSeenInQueue: true, ...eventBinding });
              socket.emit('print_physical_success', { jobId, wasSeenInQueue: true, ...eventBinding });
              if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
           }
@@ -344,6 +428,7 @@ class SpoolerMonitor {
       }
     }, 2000); // 2 second interval avoids CPU/process starvation
 
+    monitorEntry.pollSpooler = pollSpooler;
     return pollSpooler;
   }
 }

@@ -177,6 +177,31 @@ const runReconciliation = async (options = {}) => {
                 amount: refund.amount
               }
             });
+
+            // Recalculate payment status based on live successful refunds
+            const allSuccessfulRefunds = await tx.refund.findMany({
+              where: { paymentId: refund.paymentId, status: 'SUCCESS' }
+            });
+            const totalSuccessfulCents = allSuccessfulRefunds.reduce((sum, r) => sum + Math.round(Number(r.amount) * 100), 0) + Math.round(Number(refund.amount) * 100);
+            const paymentCents = Math.round(Number(refund.payment.amount) * 100);
+            const isFullyRefunded = totalSuccessfulCents >= paymentCents;
+
+            await tx.payment.update({
+              where: { id: refund.paymentId },
+              data: { status: isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED' }
+            });
+
+            if (tx.reconciliationRecord) {
+              await tx.reconciliationRecord.updateMany({
+                where: { refundId: refund.id, resolved: false },
+                data: {
+                  resolved: true,
+                  resolvedAt: new Date(),
+                  resolvedBy: 'RECONCILIATION_ENGINE',
+                  resolutionNotes: 'Resolved automatically via gateway refund verification'
+                }
+              }).catch(() => {});
+            }
           });
 
           // Issue Credit Note if invoice exists

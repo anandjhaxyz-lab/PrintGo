@@ -47,6 +47,7 @@ jobs:
           POSTGRES_DB: printgo_disposable_target
         ports:
           - 5432:5432
+          - 5433:5432
         options: >-
           --health-cmd pg_isready
           --health-interval 5s
@@ -86,6 +87,11 @@ jobs:
 
       - name: Verify Full Multi-Printer Migration Chain (00012-00016)
         run: psql "$MIGRATION_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/multi_printer_full_migration_chain.test.sql
+        env:
+          MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target
+
+      - name: Verify UP-02 Migration 00017 Attempt Cap & Fail-Closed Backfill
+        run: psql "$MIGRATION_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f tests/sql/up02_migration_00017_backfill.test.sql
         env:
           MIGRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target
 
@@ -161,6 +167,20 @@ jobs:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+
+      - name: Run PR #20 Cashfree Gateway & Reconciliation Safety Suites
+        run: npx jest tests/cashfree_adapter_error_classification.test.js tests/reconciliation_completion_correlation.test.js tests/pr19_cashfree_uncertain_outcome.test.js tests/pr19_safety_followup_ambiguous_printing.test.js tests/pr19_timer_reconciliation_correlation.test.js tests/pr19_up02_max_attempts.test.js --runInBand --forceExit
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/printgo_disposable_target?schema=public
+
+      - name: Run UP-02 PostgreSQL Transaction-Wide Concurrency Integration Tests (Port 5433 Guarded)
+        run: npx jest tests/pr19_up02_postgresql_concurrency.test.js --runInBand --forceExit
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_2026
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5433/printgo_disposable_target?schema=public
 
       - name: Run Phase 3T Supervised Demo Payment Access Lock Suite (12 Tests)
         run: node tests/phase3t_demo_access_lock.test.js

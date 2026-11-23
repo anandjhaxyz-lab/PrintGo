@@ -369,4 +369,305 @@ describe('Phase 4A Refund Idempotency Retry & Concurrency Safety', () => {
     expect(txMock.payment.update).not.toHaveBeenCalled();
     expect(cashfreeGateway.createRefund).not.toHaveBeenCalled();
   });
+
+  // =========================================================================
+  // Finding 3 — Cashfree Refund Error Classification & Safe Processing Gate
+  // =========================================================================
+  describe('Finding 3: Cashfree Error Classification and State Transitions', () => {
+    const helperSetupNewRefund = () => {
+      prisma.refund.findUnique.mockResolvedValueOnce(null);
+      prisma.payment.findUnique.mockResolvedValueOnce(basePayment);
+
+      const createdRecord = {
+        id: 'ref-f3-001',
+        idempotencyKey: 'idemp-f3-001',
+        paymentId,
+        amount: 100.0,
+        status: 'PROCESSING',
+        retryEligible: false,
+        gatewayRefundId: 'ref_order_001_f3'
+      };
+
+      const txMock = {
+        $executeRawUnsafe: jest.fn().mockResolvedValue(),
+        refund: {
+          findUnique: jest.fn().mockResolvedValue(null),
+          findMany: jest.fn().mockResolvedValue([]),
+          create: jest.fn().mockResolvedValue(createdRecord),
+          update: jest.fn().mockImplementation(async ({ data }) => ({
+            ...createdRecord,
+            ...data
+          }))
+        },
+        transaction: {
+          create: jest.fn().mockResolvedValue({ id: 'tx-f3-1' })
+        },
+        reconciliationRecord: {
+          create: jest.fn().mockResolvedValue({ id: 'rec-f3-1' })
+        }
+      };
+
+      prisma.$transaction.mockImplementation(async (callback) => callback(txMock));
+      return { txMock, createdRecord };
+    };
+
+    test('HTTP 400 documented definitive rejection transitions to FAILED with retryEligible=false', async () => {
+      const { txMock } = helperSetupNewRefund();
+
+      cashfreeGateway.createRefund.mockResolvedValueOnce({
+        success: false,
+        isDefinitiveFailure: true,
+        isUncertainOutcome: false,
+        isTimeout: false,
+        isRateLimited: false,
+        statusCode: 400,
+        error: 'Invalid order state or amount exceeds available balance',
+        rawResponse: { message: 'Invalid order state' }
+      });
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-f3-400'
+      });
+
+      expect(result.status).toBe('FAILED');
+      expect(result.retryEligible).toBe(false);
+      expect(txMock.refund.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'FAILED',
+          retryEligible: false,
+          failureReason: expect.stringContaining('Invalid order state')
+        })
+      }));
+      expect(txMock.transaction.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'REFUND_FAILED',
+          status: 'FAILED'
+        })
+      }));
+    });
+
+    test('HTTP 408 timeout keeps refund in PROCESSING with retryEligible=false and logs GATEWAY_TIMEOUT', async () => {
+      const { txMock } = helperSetupNewRefund();
+
+      cashfreeGateway.createRefund.mockResolvedValueOnce({
+        success: false,
+        isDefinitiveFailure: false,
+        isUncertainOutcome: true,
+        isTimeout: true,
+        isRateLimited: false,
+        statusCode: 408,
+        error: 'Cashfree request timed out (HTTP 408)',
+        rawResponse: { message: 'Request Timeout' }
+      });
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-f3-408'
+      });
+
+      expect(result.status).toBe('PROCESSING');
+      expect(result.retryEligible).toBe(false);
+      expect(txMock.refund.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PROCESSING',
+          retryEligible: false,
+          failureReason: expect.stringContaining('HTTP 408')
+        })
+      }));
+      expect(txMock.reconciliationRecord.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PENDING_RECONCILIATION',
+          discrepancyType: 'GATEWAY_TIMEOUT'
+        })
+      }));
+    });
+
+    test('HTTP 429 rate limit keeps refund in PROCESSING with retryEligible=false, logs REFUND_RATE_LIMITED', async () => {
+      const { txMock } = helperSetupNewRefund();
+
+      cashfreeGateway.createRefund.mockResolvedValueOnce({
+        success: false,
+        isDefinitiveFailure: false,
+        isUncertainOutcome: true,
+        isTimeout: false,
+        isRateLimited: true,
+        statusCode: 429,
+        error: 'Too Many Requests',
+        rawResponse: { message: 'Rate limit exceeded' }
+      });
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-f3-429'
+      });
+
+      expect(result.status).toBe('PROCESSING');
+      expect(result.retryEligible).toBe(false);
+      expect(txMock.refund.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PROCESSING',
+          retryEligible: false,
+          failureReason: expect.stringContaining('HTTP 429')
+        })
+      }));
+      expect(txMock.transaction.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'REFUND_RATE_LIMITED',
+          status: 'PENDING'
+        })
+      }));
+      expect(txMock.reconciliationRecord.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PENDING_RECONCILIATION',
+          discrepancyType: 'GATEWAY_RATE_LIMITED'
+        })
+      }));
+    });
+
+    test('HTTP 5xx server error keeps refund in PROCESSING with retryEligible=false', async () => {
+      const { txMock } = helperSetupNewRefund();
+
+      cashfreeGateway.createRefund.mockResolvedValueOnce({
+        success: false,
+        isDefinitiveFailure: false,
+        isUncertainOutcome: true,
+        isServerError: true,
+        statusCode: 502,
+        error: 'Bad Gateway',
+        rawResponse: { message: 'Bad Gateway' }
+      });
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-f3-502'
+      });
+
+      expect(result.status).toBe('PROCESSING');
+      expect(result.retryEligible).toBe(false);
+      expect(txMock.refund.update).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PROCESSING',
+          retryEligible: false
+        })
+      }));
+      expect(txMock.reconciliationRecord.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PENDING_RECONCILIATION',
+          discrepancyType: 'UNCERTAIN_GATEWAY_REFUND_OUTCOME'
+        })
+      }));
+    });
+
+    test('ECONNRESET connection reset keeps refund in PROCESSING with retryEligible=false', async () => {
+      const { txMock } = helperSetupNewRefund();
+
+      cashfreeGateway.createRefund.mockResolvedValueOnce({
+        success: false,
+        isDefinitiveFailure: false,
+        isUncertainOutcome: true,
+        isConnectionReset: true,
+        error: 'read ECONNRESET',
+        rawResponse: { code: 'ECONNRESET' }
+      });
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-f3-connreset'
+      });
+
+      expect(result.status).toBe('PROCESSING');
+      expect(result.retryEligible).toBe(false);
+      expect(txMock.reconciliationRecord.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PENDING_RECONCILIATION',
+          discrepancyType: 'UNCERTAIN_GATEWAY_REFUND_OUTCOME'
+        })
+      }));
+    });
+
+    test('ECONNABORTED client-side timeout keeps refund in PROCESSING with retryEligible=false and logs GATEWAY_TIMEOUT', async () => {
+      const { txMock } = helperSetupNewRefund();
+
+      cashfreeGateway.createRefund.mockResolvedValueOnce({
+        success: false,
+        isDefinitiveFailure: false,
+        isUncertainOutcome: true,
+        isTimeout: true,
+        error: 'timeout of 10000ms exceeded',
+        rawResponse: { code: 'ECONNABORTED' }
+      });
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-f3-econnaborted'
+      });
+
+      expect(result.status).toBe('PROCESSING');
+      expect(result.retryEligible).toBe(false);
+      expect(txMock.reconciliationRecord.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PENDING_RECONCILIATION',
+          discrepancyType: 'GATEWAY_TIMEOUT'
+        })
+      }));
+    });
+
+    test('Unknown/unclassified error keeps refund in PROCESSING with retryEligible=false', async () => {
+      const { txMock } = helperSetupNewRefund();
+
+      cashfreeGateway.createRefund.mockResolvedValueOnce({
+        success: false,
+        isDefinitiveFailure: false,
+        isUncertainOutcome: true,
+        error: 'Unexpected runtime socket anomaly',
+        rawResponse: { error: 'Unknown' }
+      });
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-f3-unknown'
+      });
+
+      expect(result.status).toBe('PROCESSING');
+      expect(result.retryEligible).toBe(false);
+      expect(txMock.reconciliationRecord.create).toHaveBeenCalledWith(expect.objectContaining({
+        data: expect.objectContaining({
+          status: 'PENDING_RECONCILIATION',
+          discrepancyType: 'UNCERTAIN_GATEWAY_REFUND_OUTCOME'
+        })
+      }));
+    });
+
+    test('Concurrent same-idempotency-key retry returns existing PROCESSING record without calling gateway', async () => {
+      const inFlightRefund = {
+        id: 'ref-f3-inflight',
+        idempotencyKey: 'idemp-concurrent-01',
+        paymentId,
+        amount: 100.0,
+        status: 'PROCESSING',
+        retryEligible: false,
+        gatewayRefundId: 'ref_order_001_concurrent'
+      };
+
+      prisma.refund.findUnique.mockResolvedValueOnce(inFlightRefund);
+
+      const result = await refundService.createRefund({
+        paymentId,
+        amount: 100.0,
+        idempotencyKey: 'idemp-concurrent-01'
+      });
+
+      expect(result).toBe(inFlightRefund);
+      expect(cashfreeGateway.createRefund).not.toHaveBeenCalled();
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+  });
 });
