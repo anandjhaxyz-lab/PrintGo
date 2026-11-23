@@ -63,7 +63,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
     try {
       const response = await axios.post(
         `${API_URL}/api/admin/printer-discoveries/${discovery.id}/approve`,
-        { displayName: displayName.trim() }
+        { displayName: displayName.trim(), isDefault: false }
       );
       const registeredName = response.data?.data?.device?.displayName || displayName.trim();
       setSuccess(`${registeredName} approved and registered. You can now create its permanent customer QR.`);
