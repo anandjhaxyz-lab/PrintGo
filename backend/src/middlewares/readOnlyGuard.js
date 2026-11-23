@@ -1,3 +1,4 @@
+const logger = require('../utils/logger');
 const {
   STAGING_SERVICE_ID,
   STAGING_SERVICE_NAME,
@@ -18,6 +19,8 @@ const ALLOWED_CASH_MUTATION_PATTERNS = [
   { method: 'PUT', regex: /^\/api\/machines\/[^/]+\/payment-mode$/ },
   { method: 'POST', regex: /^\/api\/admin\/jobs\/[^/]+\/confirm-cash$/ }
 ];
+
+const STAGING_PRINTER_APPROVAL_PATTERN = /^\/api\/admin\/printer-discoveries\/[a-zA-Z0-9_-]+\/approve$/;
 
 const getCleanPath = (req) => {
   let target = '';
@@ -131,6 +134,64 @@ const isAllowedStagingPaymentModeConfig = (req) => {
   return true;
 };
 
+/**
+ * Dedicated, narrowly scoped, fail-closed Staging-only permission for printer discovery approval.
+ * Permits ONLY POST /api/admin/printer-discoveries/:id/approve with body containing { isDefault: false }
+ * on the exact authorized Staging Render service instance.
+ *
+ * Fails closed unless ALL conditions are strictly satisfied:
+ * 1. APP_ENV is exactly 'staging'
+ * 2. RENDER is exactly 'true'
+ * 3. RENDER_SERVICE_ID matches 'srv-dbqpapon74is73csbc80'
+ * 4. RENDER_SERVICE_NAME matches 'printgo-backend-staging'
+ * 5. RENDER_GIT_BRANCH matches 'feature/printgo-production-readiness'
+ * 6. STAGING_PRINTER_APPROVALS_ENABLED === 'true' (or ALLOW_STAGING_PRINTER_APPROVALS === 'true')
+ * 7. HTTP method is strictly POST
+ * 8. Normalized API path exactly matches /api/admin/printer-discoveries/{id}/approve
+ * 9. req.body is an object and req.body.isDefault is strictly boolean false (=== false)
+ *
+ * @param {Object} req - Express request object
+ * @returns {boolean}
+ */
+const isAllowedStagingPrinterApproval = (req) => {
+  // 1. APP_ENV is exactly staging
+  if (process.env.APP_ENV !== 'staging') return false;
+
+  // 2. RENDER is exactly true
+  if (process.env.RENDER !== 'true') return false;
+
+  // 3. RENDER_SERVICE_ID matches srv-dbqpapon74is73csbc80
+  if (process.env.RENDER_SERVICE_ID !== STAGING_SERVICE_ID) return false;
+
+  // 4. RENDER_SERVICE_NAME matches printgo-backend-staging
+  if (process.env.RENDER_SERVICE_NAME !== STAGING_SERVICE_NAME) return false;
+
+  // 5. RENDER_GIT_BRANCH matches feature/printgo-production-readiness
+  if (process.env.RENDER_GIT_BRANCH !== STAGING_GIT_BRANCH) return false;
+
+  // 6. Dedicated staging flag enabled (STAGING_PRINTER_APPROVALS_ENABLED or ALLOW_STAGING_PRINTER_APPROVALS)
+  const isEnabled = process.env.STAGING_PRINTER_APPROVALS_ENABLED === 'true' ||
+                    process.env.ALLOW_STAGING_PRINTER_APPROVALS === 'true';
+  if (!isEnabled) return false;
+
+  // 7. HTTP method is strictly POST
+  const method = (req.method || '').toUpperCase();
+  if (method !== 'POST') return false;
+
+  // 8. Normalized API path matches /api/admin/printer-discoveries/:id/approve
+  const cleanPath = getCleanPath(req);
+  if (!STAGING_PRINTER_APPROVAL_PATTERN.test(cleanPath)) return false;
+
+  // 9. req.body must explicitly specify isDefault: false (strictly boolean false)
+  if (!req.body || typeof req.body !== 'object' || req.body.isDefault !== false) {
+    logger?.warn?.(`[READ_ONLY_GUARD] Rejected staging printer approval for ${cleanPath}: isDefault must be strictly false`);
+    return false;
+  }
+
+  logger?.info?.(`[READ_ONLY_GUARD] Authorized staging printer discovery approval exemption for ${cleanPath}`);
+  return true;
+};
+
 const readOnlyGuard = (req, res, next) => {
   if (process.env.ADMIN_READ_ONLY === 'true') {
     const mutationMethods = ['POST', 'PUT', 'DELETE', 'PATCH'];
@@ -147,6 +208,13 @@ const readOnlyGuard = (req, res, next) => {
         return next();
       }
 
+      if (isAllowedStagingPrinterApproval(req)) {
+        return next();
+      }
+
+      const cleanPath = getCleanPath(req);
+      logger?.warn?.(`[READ_ONLY_GUARD] Blocked mutation: ${req.method} ${cleanPath} (ADMIN_READ_ONLY=true)`);
+
       return res.status(403).json({
         success: false,
         error: 'Forbidden: Cloud Admin Dashboard is operating in Read-Only Monitoring Mode. Remote mutations are disabled.'
@@ -161,7 +229,9 @@ module.exports = {
   isAllowedAdMutation,
   isAllowedCashMutation,
   isAllowedStagingPaymentModeConfig,
+  isAllowedStagingPrinterApproval,
   getCleanPath,
   ALLOWED_AD_MUTATION_PATTERNS,
-  ALLOWED_CASH_MUTATION_PATTERNS
+  ALLOWED_CASH_MUTATION_PATTERNS,
+  STAGING_PRINTER_APPROVAL_PATTERN
 };

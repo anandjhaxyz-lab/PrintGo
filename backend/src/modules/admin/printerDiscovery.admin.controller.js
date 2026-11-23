@@ -36,6 +36,15 @@ const listApprovedPrinterDevices = async (req, res, next) => {
 
 const approvePrinterDiscovery = async (req, res, next) => {
   try {
+    const isStagingApprovalsEnabled = process.env.STAGING_PRINTER_APPROVALS_ENABLED === 'true' ||
+                                     process.env.ALLOW_STAGING_PRINTER_APPROVALS === 'true';
+    if (isStagingApprovalsEnabled && req.body?.isDefault !== false) {
+      return res.status(400).json({
+        success: false,
+        error: 'Approval request must explicitly contain isDefault: false.'
+      });
+    }
+
     const result = await printerDiscoveryService.approvePrinterDiscovery(
       req.params.id, req.body || {}, req.user, prisma
     );
