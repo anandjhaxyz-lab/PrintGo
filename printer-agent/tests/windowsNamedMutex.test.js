@@ -1,6 +1,7 @@
 const fs = require('fs');
 const { spawn } = require('child_process');
 const path = require('path');
+const os = require('os');
 const {
   MUTEX_NAME,
   SHUTDOWN_STATE,
@@ -27,6 +28,48 @@ describe('UP-05: Windows Named Mutex (Global\\NEOX_UniversalPrintAgent_Running)'
     expect(script).toContain('[System.Threading.Mutex]::new($true, $mutexName, [ref]$createdNew)');
     expect(script).toContain('MUTEX_ALREADY_HELD');
     expect(script).toContain('MUTEX_ACQUIRED');
+
+    const apostropheScript = buildPowerShellScript(
+      "Global\\O'Brien_Mutex",
+      "C:\\Temp\\O'Brien\\status.json",
+      "C:\\Temp\\O'Brien\\attempt.json",
+      "C:\\Temp\\O'Brien\\release.signal",
+      1234,
+      "token_O'Brien"
+    );
+    expect(apostropheScript).toContain("$mutexName = 'Global\\O''Brien_Mutex'");
+    expect(apostropheScript).toContain("$statusFile = 'C:\\Temp\\O''Brien\\status.json'");
+    expect(apostropheScript).toContain("$attemptFile = 'C:\\Temp\\O''Brien\\attempt.json'");
+    expect(apostropheScript).toContain("$releaseFile = 'C:\\Temp\\O''Brien\\release.signal'");
+    expect(apostropheScript).toContain("$acquisitionToken = 'token_O''Brien'");
+  });
+
+  (isWindows ? test : test.skip)('2b. Helper launches successfully when the Windows temp path contains an apostrophe', async () => {
+    const apostropheTemp = path.join(os.tmpdir(), `PrintGo O'Brien ${Date.now()}`);
+    fs.mkdirSync(apostropheTemp, { recursive: true });
+    const envKeys = ['TEMP', 'TMP', 'TMPDIR'];
+    const previousEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+    const uniqueMutex = `${testMutexPrefix}ApostropheTemp_${Date.now()}`;
+    let handle;
+
+    try {
+      for (const key of envKeys) process.env[key] = apostropheTemp;
+      handle = await acquireAgentMutex({ mutexName: uniqueMutex, force: true, exitOnShutdown: false });
+      expect(handle.acquired).toBe(true);
+      handle.release();
+      handle.detachSignalHandlers();
+      handle = null;
+    } finally {
+      if (handle) {
+        try { handle.release(); } catch (_) {}
+        try { handle.detachSignalHandlers(); } catch (_) {}
+      }
+      for (const key of envKeys) {
+        if (previousEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = previousEnv[key];
+      }
+      try { fs.rmSync(apostropheTemp, { recursive: true, force: true }); } catch (_) {}
+    }
   });
 
   (isWindows ? test : test.skip)('3. First instance successfully acquires mutex on Windows', async () => {

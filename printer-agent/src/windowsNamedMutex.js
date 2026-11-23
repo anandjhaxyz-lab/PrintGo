@@ -49,14 +49,19 @@ function getMutexDir(mutexName) {
   return dir;
 }
 
+// PowerShell single-quoted strings escape an embedded apostrophe by doubling it.
+function toPowerShellSingleQuoted(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
 function buildPowerShellScript(mutexName, statusFile = '', attemptFile = '', releaseFile = '', parentPid = process.pid, acquisitionToken = '') {
   return `
-$mutexName = '${mutexName}'
-$statusFile = '${statusFile.replace(/\\/g, '\\\\')}'
-$attemptFile = '${attemptFile.replace(/\\/g, '\\\\')}'
-$releaseFile = '${releaseFile.replace(/\\/g, '\\\\')}'
+$mutexName = ${toPowerShellSingleQuoted(mutexName)}
+$statusFile = ${toPowerShellSingleQuoted(statusFile)}
+$attemptFile = ${toPowerShellSingleQuoted(attemptFile)}
+$releaseFile = ${toPowerShellSingleQuoted(releaseFile)}
 $parentPid = ${parentPid || $PID}
-$acquisitionToken = '${acquisitionToken}'
+$acquisitionToken = ${toPowerShellSingleQuoted(acquisitionToken)}
 
 try {
     $createdNew = $false
@@ -325,8 +330,10 @@ function acquireAgentMutex(options = {}) {
     const script = options.script || buildPowerShellScript(mutexName, statusFile, attemptFile, releaseFile, parentPid, acquisitionToken);
     fs.writeFileSync(scriptFile, script, 'utf8');
 
-    // Launch independent detached process holding the kernel mutex
-    const launchCmd = `powershell.exe -NoProfile -Command "Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '${scriptFile.replace(/\\/g, '\\\\')}' -WindowStyle Hidden"`;
+    // Start the mutex holder through Start-Process so it remains independent
+    // of the Agent process. Escape apostrophes in the PowerShell single-quoted path.
+    const escapedScriptFile = String(scriptFile).replace(/'/g, "''");
+    const launchCmd = `powershell.exe -NoProfile -Command "Start-Process powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '${escapedScriptFile}' -WindowStyle Hidden"`;
     try {
       execSync(launchCmd);
     } catch (launchErr) {
