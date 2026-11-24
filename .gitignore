@@ -5,27 +5,77 @@ frontend/node_modules/
 superadmin/node_modules/
 printer-agent/node_modules/
 
-# Environment files (NEVER commit secrets)
+# Environment and Credential files (NEVER commit secrets)
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 backend/.env
+backend/.env.*
+!backend/.env.example
 frontend/.env
+frontend/.env.*
+!frontend/.env.example
 printer-agent/.env
+printer-agent/.env.*
+!printer-agent/.env.example
 superadmin/.env
+superadmin/.env.*
+!superadmin/.env.example
+.pg_credentials.local
 
-# Uploaded files
+# Database backups, dumps and manifests
+backups/
+backups/**
+*.dump
+*.sql
+!backend/prisma/migrations/**/*.sql
+*_manifest.json
+
+# Local backup copies
+*.bak
+*.bak_*
+
+# Customer uploaded files, temp spools and generated invoices
 backend/uploads/
+backend/uploads/**
 printer-agent/temp/
+printer-agent/temp/**
 
-# Database files
+# Customer documents and test print PDFs
+*.pdf
+!backend/test.pdf
+
+# Printer Agent local keys, journal & machine state
+printer-agent/keys/
+printer-agent/keys/**
+printer-agent/data/
+printer-agent/data/**
+
+# SQLite and local DB files
 *.db
 *.db-journal
 
-# OS files
-.DS_Store
-Thumbs.db
+# Logs
+*.log
+backend/logs/
 
-# Build output
+# Build outputs
 dist/
 build/
+coverage/
+.vitest/
+
+# Temporary test outputs, headless browser profiles and scratch renders
+DEMO_QR_*.html
+temp_chrome*/
+screenshot_*.png
+current_mobile_actual_*.png
+test_sample_*
+test_harness.html
+phase4_1_test_qr*.png
+phase4_1_test_qr*.html
+PHASE4_1_SYNTHETIC_TEST_DOCUMENT.pdf
+
+# OS metadata
+.DS_Store
+Thumbs.db

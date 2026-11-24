@@ -11,20 +11,37 @@ const { getStorage } = require('../../utils/storage');
 
 const upload = multer({
   storage: getStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB limit (was 1000MB — P1-003)
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB limit
   fileFilter: (req, file, cb) => {
     const allowedTypes = [
       'application/pdf',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/x-pdf',
+      'application/acrobat',
+      'applications/vnd.pdf',
+      'text/pdf',
       'image/jpeg',
+      'image/jpg',
       'image/png',
-      'application/octet-stream' // Allow E2E encrypted blobs
+      'image/webp',
     ];
-    if (allowedTypes.includes(file.mimetype)) {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const allowedExts = ['.pdf', '.jpg', '.jpeg', '.png', '.webp'];
+
+    // Encrypted uploads use application/octet-stream — require a permitted underlying document/image extension
+    if (file.mimetype === 'application/octet-stream') {
+      if (allowedExts.includes(ext)) {
+        return cb(null, true);
+      }
+      return cb(new AppError('Invalid encrypted file type. Allowed: PDF and Images (PNG, JPG, JPEG, WEBP)', 400), false);
+    }
+
+    const mimeAllowed = allowedTypes.includes(file.mimetype);
+    const extAllowed = !ext || allowedExts.includes(ext);
+
+    if (mimeAllowed && extAllowed) {
       cb(null, true);
     } else {
-      cb(new AppError('Invalid file type.', 400), false);
+      cb(new AppError('Invalid file type. Only PDF and Images (PNG, JPG, JPEG, WEBP) are supported in this pilot.', 400), false);
     }
   }
 });
@@ -32,5 +49,6 @@ const upload = multer({
 const { requireSessionOrUser } = require('../../middlewares/session');
 
 router.post('/', requireSessionOrUser, upload.single('file'), uploadController.handleUpload);
+router.get('/preview/:filename', requireSessionOrUser, uploadController.handlePreview);
 
 module.exports = router;

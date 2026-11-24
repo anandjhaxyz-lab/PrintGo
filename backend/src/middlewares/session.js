@@ -37,10 +37,41 @@ const requireSessionOrUser = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
     if (decoded.type === 'session') {
-      // Session token — attach session info to request
+      if (!decoded.sessionId || typeof decoded.sessionId !== 'string' || !decoded.sessionId.trim()) {
+        return next(new AppError('Invalid session token payload.', 401));
+      }
+
+      // Authoritatively look up the session in the database
+      const prisma = require('../utils/prisma');
+      const session = await prisma.session.findUnique({
+        where: { code: decoded.sessionId.trim() }
+      });
+
+      if (!session) {
+        return next(new AppError('Session not found or has expired', 401));
+      }
+
+      if (session.status === 'EXPIRED' || session.status === 'COMPLETED') {
+        return next(new AppError('This session has expired. Please scan a new QR code.', 410));
+      }
+
+      if (new Date() > session.expiresAt) {
+        // Mark as expired in DB
+        await prisma.session.update({
+          where: { id: session.id },
+          data: { status: 'EXPIRED' }
+        }).catch(() => {});
+        return next(new AppError('This session has expired. Please scan a new QR code.', 410));
+      }
+
+      // Attach authoritative server-verified session info (including DB UUID primary key)
       req.session = {
-        sessionId: decoded.sessionId,
-        machineId: decoded.machineId,
+        id: session.id,          // Internal DB primary key UUID
+        code: session.code,      // Unique 12-char session code
+        sessionId: session.code, // Backwards-compatible identifier
+        machineId: session.machineId || decoded.machineId,
+        status: session.status,
+        expiresAt: session.expiresAt
       };
       return next();
     }

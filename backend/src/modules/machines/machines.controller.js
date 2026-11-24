@@ -1,4 +1,6 @@
 const machinesService = require('./machines.service');
+const prisma = require('../../utils/prisma');
+const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
 
 const getMachines = async (req, res, next) => {
   try {
@@ -55,8 +57,6 @@ const getAgentVersion = async (req, res, next) => {
 
 const getPublicKey = async (req, res, next) => {
   try {
-    const { PrismaClient } = require('@prisma/client');
-    const prisma = new PrismaClient();
     const machine = await prisma.machine.findUnique({
       where: { id: req.params.id },
       select: { publicKey: true }
@@ -70,11 +70,88 @@ const getPublicKey = async (req, res, next) => {
   }
 };
 
+const setAdSuppression = async (req, res, next) => {
+  try {
+    const adSuppressionService = require('../../services/adSuppression.service');
+    const result = await adSuppressionService.setAdSuppression(
+      req.params.id,
+      req.body,
+      req.user,
+      req.ip
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const cancelAdSuppression = async (req, res, next) => {
+  try {
+    const adSuppressionService = require('../../services/adSuppression.service');
+    const result = await adSuppressionService.cancelAdSuppression(
+      req.params.id,
+      req.user,
+      req.ip
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getAdSuppressionStatus = async (req, res, next) => {
+  try {
+    const adSuppressionService = require('../../services/adSuppression.service');
+    const result = await adSuppressionService.getAdSuppressionStatus(
+      req.params.id,
+      req.user
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const updatePaymentMode = async (req, res, next) => {
+  try {
+    const { paymentMode } = req.body;
+    const machine = await machinesService.updateMachinePaymentMode(
+      req.params.id,
+      paymentMode,
+      req.user,
+      req.app.get('io')
+    );
+    res.json({ success: true, machine, paymentMode: machine.paymentMode });
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getPaymentMode = async (req, res, next) => {
+  try {
+    const machine = await machinesService.getMachineById(req.params.id, req.user);
+    const capabilities = machinesService.getPaymentModeCapabilities();
+    res.json({
+      success: true,
+      machineId: machine.id,
+      paymentMode: machine.paymentMode || DEFAULT_PAYMENT_MODE,
+      capabilities
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getMachines,
   createMachine,
   updateMachine,
   getMyMachines,
   getAgentVersion,
-  getPublicKey
+  getPublicKey,
+  setAdSuppression,
+  cancelAdSuppression,
+  getAdSuppressionStatus,
+  updatePaymentMode,
+  getPaymentMode
 };

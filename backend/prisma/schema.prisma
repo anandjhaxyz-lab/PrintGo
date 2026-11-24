@@ -20,6 +20,12 @@ model User {
   companyId String?
   company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
   
+  isActive            Boolean   @default(true)
+  tokenVersion        Int       @default(0)
+  passwordChangedAt   DateTime?
+  activationTokenHash String?
+  activationExpiresAt DateTime?
+
   notifications  Notification[]
   supportTickets SupportTicket[]
   activityLogs   ActivityLog[]
@@ -28,6 +34,8 @@ model User {
   updatedAt DateTime @updatedAt
 
   @@index([email])
+  @@index([companyId, role])
+  @@index([activationTokenHash])
 }
 
 
@@ -40,6 +48,8 @@ model Company {
   
   users    User[]
   machines Machine[]
+  businessProfile BusinessProfile?
+  printPricingProfiles PrintPricingProfile[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -71,6 +81,8 @@ model Machine {
   status String @default("INACTIVE")
   healthStatus    String         @default("UNKNOWN") // ONLINE, OFFLINE, PAPER_OUT, ERROR
   printerModel    String?
+  connectionType  String?
+  paymentMode     String?        // CASH_AT_COUNTER, DEMO_SIMULATION, CASHFREE_ONLINE (null indicates legacy/unconfigured)
   softwareVersion String?
   publicKey       String?        @db.Text
   lastOnline      DateTime?
@@ -85,30 +97,164 @@ model Machine {
   supportTickets  SupportTicket[]
   activityLogs    ActivityLog[]
   sessions        Session[]
+  printerQrs      PrinterQr[]
+  printerDevices  PrinterDevice[]
+  printerDiscoveries PrinterDiscovery[]
+  printPricingProfile PrintPricingProfile?
+  advertisements  Advertisement[]
+
+  // Advertisement Suppression Control
+  adSuppressionMode   AdSuppressionMode @default(ENABLED)
+  adSuppressionUntil  DateTime?
+  adSuppressionReason String?
+  adSuppressedBy      String?
+  adSuppressedAt      DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([companyId])
   @@index([status])
+  @@index([adSuppressionMode, adSuppressionUntil])
+}
+
+model PrinterDevice {
+  id                 String   @id @default(uuid())
+  machineId          String
+  machine            Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  // Stable cloud identity is independent of the Windows queue display name.
+  displayName        String
+  windowsPrinterName String?
+  printerModel       String?
+  driverName         String?
+  portName           String?
+  connectionType     String?
+
+  // DISCOVERY_REQUIRED, PENDING_APPROVAL, ACTIVE, DISABLED, MAINTENANCE
+  status             String   @default("DISCOVERY_REQUIRED")
+  // UNKNOWN, ONLINE, OFFLINE, PAPER_OUT, JAMMED, ERROR
+  healthStatus       String   @default("UNKNOWN")
+  isDefault          Boolean  @default(false)
+  sortOrder          Int      @default(0)
+
+  approvedAt         DateTime?
+  approvedBy         String?
+  lastDiscoveredAt   DateTime?
+  lastTelemetryAt    DateTime?
+
+  printerQrs         PrinterQr[]
+  sessions           Session[]
+  printJobs          PrintJob[]
+  printerStatuses    PrinterStatus[]
+  dispatchLease      PrinterDeviceDispatchLease?
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([machineId, status])
+  @@index([machineId, healthStatus])
+  @@unique([machineId, windowsPrinterName])
+}
+
+// One active dispatch lease per physical printer. The device row is locked
+// during lease acquisition and Admin disable/remap mutations to serialize them.
+model PrinterDeviceDispatchLease {
+  printerDeviceId String        @id
+  printerDevice   PrinterDevice @relation(fields: [printerDeviceId], references: [id], onDelete: Cascade)
+  requestId       String        @unique
+  jobShortId      String
+  expiresAt       DateTime
+  releasedAt      DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([releasedAt, expiresAt])
+  @@index([jobShortId])
+}
+
+model PrinterDiscovery {
+  id                       String   @id @default(uuid())
+  machineId                String
+  machine                  Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  windowsPrinterName       String
+  queueNameKey             String
+  driverName               String?
+  portName                 String?
+  connectionType           String   @default("Unknown")
+  printerStatus            String?
+  detectedErrorState       String?
+  workOffline              Boolean?
+  shared                   Boolean?
+  network                  Boolean?
+  isDefault                Boolean  @default(false)
+  reviewStatus             String   @default("DISCOVERED")
+  approvedPrinterDeviceId  String?
+  lastSeenAt               DateTime @default(now())
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@unique([machineId, queueNameKey])
+  @@index([machineId, reviewStatus, lastSeenAt])
+}
+
+model PrinterQr {
+  id            String    @id @default(uuid())
+  publicCode    String    @unique // High-entropy, cryptographically secure random token (URL-safe)
+  label         String?   @default("Front Desk Counter") // Friendly placement label
+  status        String    @default("ACTIVE") // ACTIVE, REVOKED, REPLACED
+
+  machineId       String?
+  machine         Machine?       @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
+
+  // Metadata & Audit Trail
+  generatedBy   String?   // Admin User ID or "SYSTEM"
+  revokedAt     DateTime?
+  revokedBy     String?   // Admin User ID
+  revokedReason String?   // Mandatory operator reason (minimum 10 chars)
+
+  // Customer sessions generated by scanning this physical QR
+  sessions      Session[]
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([publicCode])
+  @@index([machineId])
+  @@index([printerDeviceId])
+  @@index([status])
+  // PostgreSQL partial unique indexes enforce one ACTIVE legacy QR per Machine
+  // (printerDeviceId NULL) and one ACTIVE QR per PrinterDevice. Multiple devices
+  // under the same Machine can each have their own permanent customer QR.
 }
 
 model Session {
-  id        String   @id @default(uuid())
-  code      String   @unique // Short code displayed in QR (server-generated, 12 chars)
-  status    String   @default("WAITING_FOR_MOBILE") // WAITING_FOR_MOBILE, CONNECTED, COMPLETED, EXPIRED
+  id          String     @id @default(uuid())
+  code        String     @unique // Short code displayed in QR (server-generated, 12 chars)
+  status      String     @default("WAITING_FOR_MOBILE") // WAITING_FOR_MOBILE, CONNECTED, COMPLETED, EXPIRED
   
-  machineId String?
-  machine   Machine? @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  machineId   String?
+  machine     Machine?   @relation(fields: [machineId], references: [id], onDelete: SetNull)
   
-  expiresAt DateTime // Session expiration time
+  // Optional link to the permanent physical QR that spawned this session
+  printerQrId     String?
+  printerQr       PrinterQr?     @relation(fields: [printerQrId], references: [id], onDelete: SetNull)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
+  paymentMode String?    // CASH_AT_COUNTER, DEMO_SIMULATION, CASHFREE_ONLINE (null indicates legacy session)
   
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  expiresAt   DateTime   // Session expiration time (60 mins TTL)
+  
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
 
   @@index([code])
   @@index([status])
   @@index([expiresAt])
+  @@index([printerQrId])
+  @@index([printerDeviceId, status])
 }
 
 
@@ -159,32 +305,98 @@ model Payment {
   id               String        @id @default(uuid())
   amount           Float
   currency         String        @default("INR")
-  status String @default("PENDING")
+  status           String        @default("PENDING")
   gatewaySessionId String?       @unique // e.g. Cashfree session id
   gatewayOrderId   String?       @unique // e.g. Cashfree order id
-  type String
+  gatewayPaymentId String?       // e.g. Cashfree cf_payment_id
+  paymentMethod    String?       // upi, card, netbanking, demo
+  paymentGroup     String?       // upi, credit_card, etc.
+  paidAt           DateTime?
+  type             String
+  confirmedBy      String?       // Admin / Operator user ID or email for cash confirmation
+  confirmedAt      DateTime?     // Cash confirmation timestamp
 
-  transactions Transaction[]
-  printJobs    PrintJob[]
+  transactions     Transaction[]
+  refunds          Refund[]
+  invoices         Invoice[]
+  printJobs        PrintJob[]
+  reconciliationRecords ReconciliationRecord[]
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
 
   @@index([gatewayOrderId])
+  @@index([gatewayPaymentId])
 }
 
-
-
-
-
 model Transaction {
+  id               String   @id @default(uuid())
+  paymentId        String
+  payment          Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  action           String   @default("PAYMENT_ATTEMPT") // ORDER_CREATED, PAYMENT_SUCCESS, PAYMENT_FAILED, VERIFY_POLL, WEBHOOK, REFUND
+  status           String   @default("PENDING") // PENDING, SUCCESS, FAILED
+  amount           Float?
+  gatewayPaymentId String?
+  gatewayResponse  String?  // Raw response from gateway (redacted of secrets)
+  errorCode        String?
+  errorMessage     String?
+  ipAddress        String?
+  
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([paymentId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model PaymentEvent {
+  id             String    @id @default(uuid())
+  eventId        String    @unique // Unique event ID or hash of webhook timestamp + orderId + eventType
+  eventType      String    // e.g. PAYMENT_SUCCESS_WEBHOOK, PAYMENT_FAILED_WEBHOOK, REFUND_STATUS_WEBHOOK
+  gatewayOrderId String
+  paymentId      String?
+  signature      String?
+  payload        String    // Raw event payload (redacted)
+  processed      Boolean   @default(false)
+  processedAt    DateTime?
+  error          String?
+  
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([gatewayOrderId])
+  @@index([eventId])
+  @@index([processed])
+}
+
+model Refund {
   id              String   @id @default(uuid())
+  idempotencyKey  String?  @unique
   paymentId       String
   payment         Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
-  gatewayResponse String?    // Raw response from gateway for auditing
+  printJobId      String?
+  gatewayRefundId String?  @unique // Client reference e.g. ref_<shortId>_<timestamp>
+  cfRefundId      String?  // Cashfree internal cf_refund_id
+  amount          Float
+  currency        String   @default("INR")
+  reason          String?
+  status          String   @default("PENDING") // PENDING, PROCESSING, SUCCESS, FAILED, CANCELLED
+  failureReason   String?
+  retryEligible   Boolean  @default(false)
+  gatewayResponse String?  // Gateway response JSON
+  initiatedBy     String?  // Admin User ID or 'SYSTEM'
+  processedAt     DateTime?
   
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  creditNotes     CreditNote[]
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([paymentId])
+  @@index([gatewayRefundId])
+  @@index([status])
+  @@index([idempotencyKey])
 }
 
 // ==============================================
@@ -211,14 +423,20 @@ model PrintJob {
   status String @default("PENDING_PAYMENT")
   cost          Float
   
-  machineId     String?
-  machine       Machine?      @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  machineId       String?
+  machine         Machine?       @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
+  // Immutable physical Windows queue selected for this job at creation time.
+  // This must not be read from the mutable PrinterDevice row for Agent reports.
+  printerWindowsQueueName String?
   customerId    String?
   customer      Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
   documentId    String
   document      Document      @relation(fields: [documentId], references: [id], onDelete: Restrict)
   paymentId     String?
   payment       Payment?      @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  paymentMode   String?       // CASH_AT_COUNTER, DEMO_SIMULATION, CASHFREE_ONLINE (captured from session; null for legacy)
   
   // Settings
   color         String        @default("bw") // bw, color
@@ -227,11 +445,17 @@ model PrintJob {
   pagesToPrint  Int           @default(1)
   pageRangeType String        @default("all") // all, custom
   customRange   String?
+  paperSize     String        @default("A4")
+  paperType     String        @default("plain")
+  pricingSnapshot String?     @db.Text
   
   // E2E Encryption
   encryptedKey  String?       @db.Text
   iv            String?
   
+  isTest        Boolean       @default(false)
+  
+  invoice       Invoice?
   printHistory  PrintHistory[]
 
   createdAt DateTime @default(now())
@@ -239,6 +463,8 @@ model PrintJob {
 
   @@index([shortId])
   @@index([machineId])
+  @@index([printerDeviceId, status, createdAt])
+  @@index([isTest])
 }
 
 
@@ -261,18 +487,22 @@ model PrintHistory {
 
 model PrinterStatus {
   id           String   @id @default(uuid())
-  machineId    String
-  machine      Machine  @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  machineId       String
+  machine         Machine        @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  printerDeviceId String?
+  printerDevice   PrinterDevice? @relation(fields: [printerDeviceId], references: [id], onDelete: SetNull)
   isOnline     Boolean  @default(true)
   paperStatus  String   @default("OK") // OK, LOW, OUT
   tonerStatus  String   @default("OK") // OK, LOW, EMPTY
   jamStatus    Boolean  @default(false)
+  connectionType String?
   timestamp    DateTime @default(now())
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([machineId])
+  @@index([printerDeviceId, timestamp])
 }
 
 model Notification {
@@ -333,3 +563,240 @@ model AuditLog {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+// ==============================================
+// 7. DYNAMIC PRICING, TAXES & INVOICING
+// ==============================================
+
+model PrintPricingProfile {
+  id              String   @id @default(uuid())
+  name            String   @default("Standard Kiosk Pricing")
+  isDefault       Boolean  @default(false)
+  
+  machineId       String?  @unique
+  machine         Machine? @relation(fields: [machineId], references: [id], onDelete: SetNull)
+  companyId       String?
+  company         Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  // Per page/sheet rates in INR
+  bwSingleRate    Float    @default(2.0)
+  bwDuplexRate    Float    @default(3.0)
+  colorSingleRate Float    @default(10.0)
+  colorDuplexRate Float    @default(18.0)
+  
+  // Paper Size multipliers
+  a4Multiplier    Float    @default(1.0)
+  a3Multiplier    Float    @default(2.0)
+  legalMultiplier Float    @default(1.2)
+  
+  // Paper Type surcharges (flat INR added per side)
+  glossySurcharge Float    @default(0.0)
+  
+  // Minimum order charge
+  minOrderAmount  Float    @default(1.0)
+  
+  // Optional convenience fee
+  convenienceFee  Float    @default(0.0)
+  
+  // Taxes / GST configuration
+  gstEnabled      Boolean  @default(false)
+  gstRatePercent  Float    @default(18.0) // 18% standard GST for printing services (SAC 9989)
+  isTaxInclusive  Boolean  @default(true)  // Whether displayed customer price includes GST
+  
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([companyId])
+  @@index([isDefault])
+  @@index([isActive])
+}
+
+model BusinessProfile {
+  id                 String   @id @default(uuid())
+  companyId          String?  @unique
+  company            Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  
+  legalName          String   @default("PrintGo Self-Service Kiosks")
+  tradeName          String?  @default("PrintGo")
+  gstin              String?  // Validated GST Identification Number
+  panNumber          String?
+  sacCode            String   @default("9989") // SAC 9989: Photographic & Printing Services
+  supportEmail       String?  @default("support@printgo.local")
+  supportPhone       String?  @default("+91 9999999999")
+  addressLine1       String?
+  addressLine2       String?
+  city               String?  @default("Hyderabad")
+  state              String?  @default("Telangana")
+  stateCode          String?  @default("36") // GST State Code for Telangana
+  pincode            String?
+  
+  invoicePrefix      String   @default("INV-PG-")
+  nextInvoiceNumber  Int      @default(1001)
+  termsAndConditions String?
+  
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model Invoice {
+  id                 String    @id @default(uuid())
+  invoiceNumber      String    @unique
+  printJobId         String    @unique
+  printJob           PrintJob  @relation(fields: [printJobId], references: [id], onDelete: Restrict)
+  paymentId          String?
+  payment            Payment?  @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  
+  // Financial breakdown
+  subtotal           Float     // Base cost before taxes
+  discountAmount     Float     @default(0.0)
+  taxableAmount      Float     // Amount on which tax is calculated
+  cgstRate           Float     @default(0.0)
+  cgstAmount         Float     @default(0.0)
+  sgstRate           Float     @default(0.0)
+  sgstAmount         Float     @default(0.0)
+  igstRate           Float     @default(0.0)
+  igstAmount         Float     @default(0.0)
+  totalTax           Float     @default(0.0)
+  convenienceFee     Float     @default(0.0)
+  totalAmount        Float     // Final billed amount matching job.cost
+  currency           String    @default("INR")
+  status             String    @default("ISSUED") // ISSUED, CANCELLED
+  isDemo             Boolean   @default(false)
+  creditNotes        CreditNote[]
+  
+  // Business Snapshot
+  sellerName         String
+  sellerGstin        String?
+  sellerState        String?
+  buyerName          String?
+  buyerPhone         String?
+  buyerEmail         String?
+  sacCode            String    @default("9989")
+  
+  // Immutable Audit Snapshot
+  pricingSnapshot    String    @db.Text
+  lineItems          String    @db.Text
+  pdfPath            String?
+  
+  issuedAt           DateTime  @default(now())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([invoiceNumber])
+  @@index([issuedAt])
+}
+
+model CreditNote {
+  id               String    @id @default(uuid())
+  creditNoteNumber String    @unique
+  invoiceId        String
+  invoice          Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  printJobId       String?
+  paymentId        String?
+  refundId         String?
+  refund           Refund?   @relation(fields: [refundId], references: [id], onDelete: SetNull)
+  reason           String
+  subtotal         Float
+  cgstAmount       Float     @default(0.0)
+  sgstAmount       Float     @default(0.0)
+  igstAmount       Float     @default(0.0)
+  totalTax         Float     @default(0.0)
+  totalAmount      Float
+  currency         String    @default("INR")
+  pdfPath          String?
+  issuedBy         String?
+  issuedAt         DateTime  @default(now())
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([invoiceId])
+  @@index([creditNoteNumber])
+  @@index([issuedAt])
+  @@index([refundId])
+}
+
+// ==============================================
+// 9. FINANCIAL RECONCILIATION
+// ==============================================
+
+model ReconciliationRecord {
+  id              String   @id @default(uuid())
+  paymentId       String?
+  payment         Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  refundId        String?
+  printJobId      String?
+  status          String   // MATCHED, PENDING_RECONCILIATION, AMOUNT_MISMATCH, GATEWAY_MISMATCH, DUPLICATE_EVENT, MANUAL_REVIEW_REQUIRED
+  discrepancyType String?  // MISSING_TRANSACTION, AMOUNT_MISMATCH, GATEWAY_PENDING, ORPHAN_REFUND, MISSING_CREDIT_NOTE
+  details         String?  @db.Text
+  resolved        Boolean  @default(false)
+  resolvedAt      DateTime?
+  resolvedBy      String?  // Admin user ID
+  resolutionNotes String?  @db.Text
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([paymentId])
+  @@index([refundId])
+  @@index([status])
+  @@index([resolved])
+}
+
+// ==============================================
+// 10. ADVERTISEMENT DISPLAY & PROMOTIONS
+// ==============================================
+
+enum AdSuppressionMode {
+  ENABLED
+  PERMANENT
+  TEMPORARY
+}
+
+enum AdvertisementScope {
+  GLOBAL
+  MACHINE_SPECIFIC
+}
+
+enum AdvertisementPlacement {
+  ALL
+  KIOSK_ONLY
+  MOBILE_ONLY
+}
+
+model Advertisement {
+  id              String                 @id @default(uuid())
+  title           String
+  type            String                 // 'IMAGE' or 'VIDEO'
+  mediaUrl        String
+  thumbnailUrl    String?
+  displayDuration Int                    @default(5) // in seconds for slideshow
+  displayOrder    Int                    @default(0)
+  isActive        Boolean                @default(true)
+
+  // Scope & Machine Binding
+  scope           AdvertisementScope     @default(GLOBAL)
+  machineId       String?
+  machine         Machine?               @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  // Placement Targeting
+  placement       AdvertisementPlacement @default(ALL)
+
+  startDate       DateTime?
+  endDate         DateTime?
+  fileSize        Int?
+  mimeType        String?
+  createdBy       String?
+  companyId       String?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  @@index([isActive])
+  @@index([displayOrder])
+  @@index([scope, machineId])
+  @@index([placement])
+  @@index([startDate, endDate])
+}
+
+

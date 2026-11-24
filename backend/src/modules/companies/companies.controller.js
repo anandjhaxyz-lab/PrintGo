@@ -12,7 +12,10 @@ const getCompanies = async (req, res, next) => {
 const createCompany = async (req, res, next) => {
   try {
     const result = await companiesService.createCompany(req.body);
-    res.json({ success: true, ...result });
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.status(201).json({ success: true, ...result });
   } catch (error) {
     next(error);
   }

@@ -41,13 +41,14 @@ describe('Jobs Endpoints', () => {
       ]);
 
       const res = await request(app).get('/api/jobs');
-      
+
       expect(res.statusCode).toEqual(200);
       expect(res.body.success).toBe(true);
       expect(res.body.jobs.length).toBe(1);
-      // Ensure the service was called with the user object (for tenant isolation)
+      // Ensure the service was called with the user object and query params (for tenant isolation + pagination)
       expect(jobsService.getAllJobs).toHaveBeenCalledWith(
-        expect.objectContaining({ id: '1', companyId: 'comp-1' })
+        expect.objectContaining({ id: '1', companyId: 'comp-1' }),
+        expect.any(Object)
       );
     });
   });
@@ -56,9 +57,62 @@ describe('Jobs Endpoints', () => {
     it('should validate zod schema for create job', async () => {
       // Missing file and settings
       const res = await request(app).post('/api/jobs').send({});
-      
+
       expect(res.statusCode).toEqual(400);
       expect(res.body.error).toBeDefined();
+    });
+  });
+
+  describe('PUT /api/jobs/:id/status', () => {
+    it('should delegate to jobsService.updateJobStatus with options', async () => {
+      jobsService.updateJobStatus.mockResolvedValue({ id: 'job-1', shortId: 'job123', status: 'WAITING' });
+
+      const res = await request(app)
+        .put('/api/jobs/job123/status')
+        .send({ status: 'WAITING' });
+
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.success).toBe(true);
+      expect(jobsService.updateJobStatus).toHaveBeenCalledWith(
+        'job123',
+        'WAITING',
+        expect.objectContaining({ id: '1', role: 'FRANCHISEE' }),
+        expect.objectContaining({ reason: undefined })
+      );
+    });
+
+    it('should reject invalid status with 400', async () => {
+      const res = await request(app)
+        .put('/api/jobs/job123/status')
+        .send({ status: 'INVALID_STATUS' });
+
+      expect(res.statusCode).toEqual(400);
+    });
+  });
+
+  describe('POST /api/jobs/:id/resolve-ambiguity', () => {
+    it('should delegate to jobsService.resolveAmbiguousJob', async () => {
+      jobsService.resolveAmbiguousJob.mockResolvedValue({ id: 'job-1', shortId: 'job123', status: 'COMPLETED' });
+
+      const res = await request(app)
+        .post('/api/jobs/job123/resolve-ambiguity')
+        .send({
+          outcome: 'COMPLETED',
+          physicalConfirmation: true,
+          reason: 'Physical verification confirmed by operator'
+        });
+
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.success).toBe(true);
+      expect(jobsService.resolveAmbiguousJob).toHaveBeenCalledWith(
+        'job123',
+        expect.objectContaining({
+          outcome: 'COMPLETED',
+          physicalConfirmation: true,
+          reason: 'Physical verification confirmed by operator'
+        }),
+        expect.objectContaining({ id: '1', role: 'FRANCHISEE' })
+      );
     });
   });
 });

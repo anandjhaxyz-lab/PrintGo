@@ -7,8 +7,10 @@ import { Step2Connected } from '../components/kiosk/Step2Connected';
 import { Step3Settings } from '../components/kiosk/Step3Settings';
 import { Step4Payment } from '../components/kiosk/Step4Payment';
 import { Step5Status } from '../components/kiosk/Step5Status';
+import { AdvertisementDisplay } from '../components/AdvertisementDisplay';
+import { getApiUrl } from '../utils/apiConfig';
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://printgo-ssoi.onrender.com';
+const API_URL = getApiUrl();
 
 const KioskView = () => {
   const [sessionId, setSessionId] = useState('');
@@ -128,7 +130,12 @@ const KioskView = () => {
     }
   }, [step, jobId]);
 
-  const mobileUrl = `${window.location.protocol}//${window.location.host}/m/${sessionId}`;
+  // Public mobile URL configuration for remote cellular (4G/5G) / external Wi-Fi customer access
+  const configuredMobileUrl = import.meta.env.VITE_MOBILE_URL || import.meta.env.VITE_FRONTEND_URL;
+  const qrBase = configuredMobileUrl 
+    ? configuredMobileUrl.replace(/\/+$/, '') 
+    : `${window.location.protocol}//${window.location.host}`;
+  const mobileUrl = `${qrBase}/m/${sessionId}`;
 
   const formatEta = (seconds) => {
     if (!seconds) return 'calculating...';
@@ -201,6 +208,14 @@ const KioskView = () => {
       </div>
       
       {renderContent()}
+
+      {/* Kiosk Advertisement Display */}
+      <div style={{ width: '100%', maxWidth: 520, margin: '1.5rem auto 0 auto', padding: '0 1rem' }}>
+        <AdvertisementDisplay
+          sessionToken={sessionToken}
+          placement="KIOSK_ONLY"
+        />
+      </div>
 
       {/* Manual Start Over Button */}
       {step > 1 && (

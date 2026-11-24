@@ -1,5 +1,6 @@
 const prisma = require('../../utils/prisma');
 const AppError = require('../../utils/AppError');
+const { computePrinterAvailability } = require('../../services/printerAvailability.service');
 
 // @desc    Get global stats
 // @route   GET /api/admin/stats
@@ -64,16 +65,590 @@ exports.getAllMachines = async (req, res, next) => {
       include: {
         company: {
           select: { name: true }
+        },
+        printerStatuses: {
+          take: 1,
+          orderBy: { timestamp: 'desc' }
         }
       },
       orderBy: { createdAt: 'desc' }
     });
 
+    const machinesWithAvailability = machines.map(m => {
+      const latestStatus = m.printerStatuses?.[0] || null;
+      const availability = computePrinterAvailability(m, latestStatus);
+      return {
+        ...m,
+        isOnline: availability.isReady,
+        agentOnline: availability.agentOnline,
+        hardwareStatus: availability.status,
+        statusMessage: availability.statusMessage,
+      };
+    });
+
     res.status(200).json({
       status: 'success',
-      data: { machines }
+      data: { machines: machinesWithAvailability }
     });
   } catch (error) {
     next(new AppError('Failed to fetch machines', 500));
+  }
+};
+
+// ==============================================
+// PRICING & BILLING MANAGEMENT
+// ==============================================
+
+exports.getPricingProfiles = async (req, res, next) => {
+  try {
+    const profiles = await prisma.printPricingProfile.findMany({
+      include: { machine: { select: { id: true, name: true, location: true } } },
+      orderBy: { createdAt: 'desc' }
+    });
+    res.status(200).json({ status: 'success', data: { profiles } });
+  } catch (error) {
+    next(new AppError('Failed to fetch pricing profiles', 500));
+  }
+};
+
+exports.savePricingProfile = async (req, res, next) => {
+  try {
+    const { id, name, isDefault, machineId, companyId, bwSingleRate, bwDuplexRate, colorSingleRate, colorDuplexRate, a4Multiplier, a3Multiplier, legalMultiplier, glossySurcharge, minOrderAmount, convenienceFee, gstEnabled, gstRatePercent, isTaxInclusive, isActive } = req.body;
+    const data = {
+      name: name || 'Standard Kiosk Pricing',
+      isDefault: Boolean(isDefault),
+      machineId: machineId || null,
+      companyId: companyId || null,
+      bwSingleRate: bwSingleRate !== undefined ? Number(bwSingleRate) : 2.0,
+      bwDuplexRate: bwDuplexRate !== undefined ? Number(bwDuplexRate) : 3.0,
+      colorSingleRate: colorSingleRate !== undefined ? Number(colorSingleRate) : 10.0,
+      colorDuplexRate: colorDuplexRate !== undefined ? Number(colorDuplexRate) : 18.0,
+      a4Multiplier: a4Multiplier !== undefined ? Number(a4Multiplier) : 1.0,
+      a3Multiplier: a3Multiplier !== undefined ? Number(a3Multiplier) : 2.0,
+      legalMultiplier: legalMultiplier !== undefined ? Number(legalMultiplier) : 1.2,
+      glossySurcharge: glossySurcharge !== undefined ? Number(glossySurcharge) : 0.0,
+      minOrderAmount: minOrderAmount !== undefined ? Number(minOrderAmount) : 1.0,
+      convenienceFee: convenienceFee !== undefined ? Number(convenienceFee) : 0.0,
+      gstEnabled: Boolean(gstEnabled),
+      gstRatePercent: gstRatePercent !== undefined ? Number(gstRatePercent) : 18.0,
+      isTaxInclusive: isTaxInclusive !== undefined ? Boolean(isTaxInclusive) : true,
+      isActive: isActive !== undefined ? Boolean(isActive) : true
+    };
+
+    let profile;
+    if (id) {
+      profile = await prisma.printPricingProfile.update({ where: { id }, data });
+    } else {
+      profile = await prisma.printPricingProfile.create({ data });
+    }
+
+    res.status(200).json({ status: 'success', data: { profile } });
+  } catch (error) {
+    next(new AppError('Failed to save pricing profile: ' + error.message, 400));
+  }
+};
+
+exports.getBusinessProfile = async (req, res, next) => {
+  try {
+    const { getBusinessProfile } = require('../../services/invoice.service');
+    const profile = await getBusinessProfile(req.user?.companyId);
+    res.status(200).json({ status: 'success', data: { profile } });
+  } catch (error) {
+    next(new AppError('Failed to fetch business profile', 500));
+  }
+};
+
+exports.saveBusinessProfile = async (req, res, next) => {
+  try {
+    const { legalName, tradeName, gstin, panNumber, sacCode, supportEmail, supportPhone, addressLine1, addressLine2, city, state, stateCode, pincode, invoicePrefix, termsAndConditions } = req.body;
+
+    const data = {
+      legalName: legalName || 'PrintGo Self-Service Kiosks',
+      tradeName: tradeName || 'PrintGo',
+      gstin: gstin ? gstin.trim().toUpperCase() : null,
+      panNumber: panNumber ? panNumber.trim().toUpperCase() : null,
+      sacCode: sacCode || '9989',
+      supportEmail: supportEmail || null,
+      supportPhone: supportPhone || null,
+      addressLine1: addressLine1 || null,
+      addressLine2: addressLine2 || null,
+      city: city || 'Hyderabad',
+      state: state || 'Telangana',
+      stateCode: stateCode || '36',
+      pincode: pincode || null,
+      invoicePrefix: invoicePrefix || 'INV-PG-',
+      termsAndConditions: termsAndConditions || null
+    };
+
+    const existing = await prisma.businessProfile.findFirst();
+    let profile;
+    if (existing) {
+      profile = await prisma.businessProfile.update({ where: { id: existing.id }, data });
+    } else {
+      profile = await prisma.businessProfile.create({ data });
+    }
+
+    res.status(200).json({ status: 'success', data: { profile } });
+  } catch (error) {
+    next(new AppError('Failed to save business profile: ' + error.message, 400));
+  }
+};
+
+// ==============================================
+// REFUNDS MANAGEMENT (Phase 4A & 4E)
+// ==============================================
+
+exports.getRefunds = async (req, res, next) => {
+  try {
+    const refundService = require('../../services/refund.service');
+    const result = await refundService.getRefunds({
+      page: req.query.page,
+      limit: req.query.limit,
+      status: req.query.status,
+      paymentId: req.query.paymentId,
+      user: req.user
+    });
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getRefundById = async (req, res, next) => {
+  try {
+    const refundService = require('../../services/refund.service');
+    const refund = await refundService.getRefundById(req.params.id, req.user);
+    res.status(200).json({ success: true, refund });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.createRefund = async (req, res, next) => {
+  try {
+    const refundService = require('../../services/refund.service');
+    const { paymentId, amount, reason, idempotencyKey } = req.body;
+
+    if (!paymentId) {
+      return res.status(400).json({ success: false, error: 'paymentId is required' });
+    }
+
+    const refund = await refundService.createRefund({
+      paymentId,
+      amount,
+      reason,
+      idempotencyKey,
+      user: req.user,
+      initiatedBy: req.user?.id || 'ADMIN'
+    });
+
+    res.status(201).json({ success: true, refund });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ==============================================
+// RECONCILIATION ENGINE (Phase 4D & 4E)
+// ==============================================
+
+exports.getReconciliationRecords = async (req, res, next) => {
+  try {
+    const reconciliationService = require('../../services/reconciliation.service');
+    const result = await reconciliationService.getReconciliationRecords({
+      page: req.query.page,
+      limit: req.query.limit,
+      status: req.query.status,
+      resolved: req.query.resolved
+    });
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getReconciliationById = async (req, res, next) => {
+  try {
+    const prisma = require('../../utils/prisma');
+    const record = await prisma.reconciliationRecord.findUnique({
+      where: { id: req.params.id },
+      include: { payment: true }
+    });
+    if (!record) return res.status(404).json({ success: false, error: 'Reconciliation record not found' });
+    res.status(200).json({ success: true, record });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.runReconciliation = async (req, res, next) => {
+  try {
+    const reconciliationService = require('../../services/reconciliation.service');
+    const dryRun = req.body.dryRun === true;
+    const limit = req.body.limit ? Number(req.body.limit) : 50;
+
+    const result = await reconciliationService.runReconciliation({ limit, dryRun });
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.resolveReconciliation = async (req, res, next) => {
+  try {
+    const reconciliationService = require('../../services/reconciliation.service');
+    const { resolutionNotes } = req.body;
+
+    const updated = await reconciliationService.resolveDiscrepancy(req.params.id, {
+      resolutionNotes,
+      user: req.user
+    });
+
+    res.status(200).json({ success: true, record: updated });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ==============================================
+// PHASE 5: ENTERPRISE ANALYTICS & DASHBOARD APIS
+// ==============================================
+
+exports.getOverviewStats = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getOverviewStats(req.user, req.query);
+    res.status(200).json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getSalesCharts = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getSalesChartsData(req.user, req.query);
+    res.status(200).json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getPayments = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getPayments(req.user, req.query);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getInvoices = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getInvoices(req.user, req.query);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getCreditNotes = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getCreditNotes(req.user, req.query);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getCustomers = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getCustomers(req.user, req.query);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getOperators = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getOperators(req.user);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getAuditLogs = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const result = await adminAnalytics.getAuditLogs(req.user, req.query);
+    res.status(200).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.exportReportCsv = async (req, res, next) => {
+  try {
+    const adminAnalytics = require('../../services/adminAnalytics.service');
+    const reportType = req.params.type || 'sales';
+    const csvData = await adminAnalytics.exportReportCsv(req.user, reportType, req.query);
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="printgo_${reportType}_report_${Date.now()}.csv"`);
+    res.status(200).send(csvData);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Confirm Cash Received Action
+ * Authorized staff (SUPERADMIN, FRANCHISEE, STAFF) records physical cash collection,
+ * locks and verifies exact server-authoritative amount, records audit logs,
+ * updates payment/printjob state atomically, and dispatches print job.
+ */
+exports.confirmCashPayment = async (req, res, next) => {
+  try {
+    const { shortId } = req.params;
+    const { amount: passedAmount } = req.body || {};
+    const user = req.user;
+    const io = req.app.get('io');
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required to confirm cash payment'
+      });
+    }
+
+    if (!['SUPERADMIN', 'FRANCHISEE', 'STAFF'].includes(user.role)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden: Insufficient privileges to confirm cash payment'
+      });
+    }
+
+    if (!shortId) {
+      return res.status(400).json({ success: false, error: 'Job shortId is required' });
+    }
+
+    // Historical guard: job ab36197e is permanently protected
+    if (shortId === 'ab36197e') {
+      return res.status(400).json({
+        success: false,
+        error: 'Historical baseline job ab36197e is protected and cannot be altered or confirmed'
+      });
+    }
+
+    const job = await prisma.printJob.findUnique({
+      where: { shortId },
+      include: { machine: true, payment: true, document: true }
+    });
+
+    if (!job) {
+      return res.status(404).json({ success: false, error: 'Print job not found' });
+    }
+
+    // Multi-tenant check: Franchisee/staff can only confirm jobs for their own company
+    if (user.role !== 'SUPERADMIN') {
+      if (!job.machine || job.machine.companyId !== user.companyId) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied: Cannot confirm payment for job belonging to another shop'
+        });
+      }
+    }
+
+    // Cash-at-Counter payment mode enforcement
+    if (job.paymentMode !== 'CASH_AT_COUNTER') {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot confirm cash payment: Job payment mode is '${job.paymentMode || 'UNSPECIFIED'}'. Cash confirmation is permitted only for CASH_AT_COUNTER jobs.`
+      });
+    }
+
+    // Mandatory Correction 2: Server-authoritative cash amount
+    // Never trust a customer or frontend-supplied amount for payment confirmation
+    const authoritativeAmount = Number(job.cost);
+    if (passedAmount !== undefined && passedAmount !== null && passedAmount !== '') {
+      const parsedPassed = Number(passedAmount);
+      if (isNaN(parsedPassed) || Math.abs(parsedPassed - authoritativeAmount) > 0.01) {
+        return res.status(400).json({
+          success: false,
+          error: `Received cash amount (₹${passedAmount}) does not match exact payable amount (₹${authoritativeAmount})`
+        });
+      }
+    }
+
+    // Mandatory Correction 3: Reliable, idempotent print dispatch with transaction & advisory lock
+    const lockKey = `printjob_confirm_cash_${job.id}`;
+    const cashOrderId = `cash_order_${job.shortId}_${Date.now()}`;
+
+    const { payment, updatedJob, wasAlreadyProcessed } = await prisma.$transaction(async (tx) => {
+      // Advisory transaction lock prevents concurrent double confirmation
+      if (typeof tx.$executeRawUnsafe === 'function') {
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, lockKey);
+      }
+
+      const freshJob = await tx.printJob.findUnique({
+        where: { id: job.id },
+        include: { payment: true, document: true, machine: true }
+      });
+
+      if (!freshJob) {
+        throw new AppError('Print job not found during confirmation', 404);
+      }
+
+      // Revalidate payment mode inside transaction before any state mutation
+      if (freshJob.paymentMode !== 'CASH_AT_COUNTER') {
+        throw new AppError(
+          `Cannot confirm cash payment: Job payment mode is '${freshJob.paymentMode || 'UNSPECIFIED'}'. Cash confirmation is permitted only for CASH_AT_COUNTER jobs.`,
+          400
+        );
+      }
+
+      // If already paid or moved past PENDING_PAYMENT:
+      if (freshJob.status !== 'PENDING_PAYMENT') {
+        return {
+          payment: freshJob.payment,
+          updatedJob: freshJob,
+          wasAlreadyProcessed: true
+        };
+      }
+
+      // Create Payment record
+      const newPayment = await tx.payment.create({
+        data: {
+          amount: authoritativeAmount,
+          currency: 'INR',
+          type: 'PRINT_JOB',
+          status: 'SUCCESS',
+          paymentMethod: 'cash',
+          paymentGroup: 'cash',
+          gatewayOrderId: cashOrderId,
+          paidAt: new Date(),
+          confirmedBy: user.email || user.id,
+          confirmedAt: new Date()
+        }
+      });
+
+      // Update PrintJob to WAITING
+      const updated = await tx.printJob.update({
+        where: { id: freshJob.id },
+        data: {
+          status: 'WAITING',
+          paymentId: newPayment.id
+        },
+        include: { document: true, machine: true, payment: true }
+      });
+
+      // Transaction audit log
+      if (tx.transaction && typeof tx.transaction.create === 'function') {
+        await tx.transaction.create({
+          data: {
+            paymentId: newPayment.id,
+            action: 'CASH_PAYMENT_CONFIRMATION',
+            status: 'SUCCESS',
+            amount: authoritativeAmount,
+            gatewayPaymentId: cashOrderId,
+            gatewayResponse: JSON.stringify({
+              confirmedBy: user.email || user.id,
+              confirmedById: user.id,
+              confirmedAt: new Date().toISOString(),
+              jobShortId: freshJob.shortId,
+              amount: authoritativeAmount
+            })
+          }
+        });
+      }
+
+      // System AuditLog
+      if (tx.auditLog && typeof tx.auditLog.create === 'function') {
+        await tx.auditLog.create({
+          data: {
+            entity: 'PrintJob',
+            entityId: freshJob.id,
+            action: 'CONFIRM_CASH_PAYMENT',
+            performedBy: user.email || user.id,
+            changes: JSON.stringify({
+              shortId: freshJob.shortId,
+              cost: authoritativeAmount,
+              paymentId: newPayment.id,
+              confirmedBy: user.email || user.id
+            })
+          }
+        });
+      }
+
+      return { payment: newPayment, updatedJob: updated, wasAlreadyProcessed: false };
+    });
+
+    if (wasAlreadyProcessed) {
+      return res.status(200).json({
+        success: true,
+        alreadyConfirmed: true,
+        message: `Job ${job.shortId} has already been confirmed/paid`,
+        job: updatedJob,
+        payment
+      });
+    }
+
+    // Broadcast real-time updates to customer and admin
+    if (io) {
+      let customerSessionId = null;
+      try {
+        const snap = typeof updatedJob.pricingSnapshot === 'string'
+          ? JSON.parse(updatedJob.pricingSnapshot)
+          : updatedJob.pricingSnapshot;
+        customerSessionId = snap?.sessionId || null;
+      } catch {}
+
+      if (customerSessionId) {
+        io.to(customerSessionId).emit('kiosk_payment_success', { jobId: updatedJob.shortId });
+      }
+      io.to(`job_${updatedJob.shortId}`).emit('kiosk_payment_success', { jobId: updatedJob.shortId });
+      io.to(`job_${updatedJob.shortId}`).emit('job_status_changed', updatedJob);
+      if (updatedJob.machine?.companyId) {
+        io.to(`company_${updatedJob.machine.companyId}`).emit('job_status_changed', updatedJob);
+      }
+      io.to('superadmins').emit('job_status_changed', updatedJob);
+      io.to('admins').emit('job_status_changed', updatedJob);
+    }
+
+    // Dispatch print job through existing print queue exactly once
+    const queueService = require('../../services/queueService');
+    let dispatched = false;
+    let dispatchError = null;
+
+    if (typeof queueService?.startPrintingProcess === 'function') {
+      try {
+        await queueService.startPrintingProcess(updatedJob.shortId, io);
+        dispatched = true;
+      } catch (dispatchErr) {
+        dispatched = false;
+        dispatchError = dispatchErr?.message || 'Print queue dispatch failed';
+        console.error(`Failed to dispatch cash print job ${updatedJob.shortId}:`, dispatchErr);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: dispatched
+        ? 'Cash payment confirmed and print job dispatched'
+        : 'Cash payment confirmed. Note: Print queue dispatch encountered an issue; operator can release from Admin dashboard.',
+      dispatched,
+      dispatchError,
+      job: updatedJob,
+      payment
+    });
+  } catch (error) {
+    next(error);
   }
 };
