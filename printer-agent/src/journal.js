@@ -4,6 +4,20 @@ const crypto = require('crypto');
 
 const CURRENT_JOURNAL_VERSION = 2;
 
+class JournalCorruptionError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'JournalCorruptionError';
+  }
+}
+
+class JournalPersistenceError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'JournalPersistenceError';
+  }
+}
+
 function atomicRenameWithRetry(srcPath, destPath, maxRetries = 5, initialDelayMs = 25) {
   let lastError = null;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -62,6 +76,40 @@ class JobJournal {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+  }
+
+  get jobs() {
+    return this.data;
+  }
+
+  set jobs(val) {
+    this.data = val || {};
+  }
+
+  static computeChecksum(jobs) {
+    if (!jobs || typeof jobs !== 'object') return '';
+    const sortedKeys = Object.keys(jobs).sort();
+    const canonical = {};
+    for (const k of sortedKeys) {
+      canonical[k] = jobs[k];
+    }
+    return crypto.createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+  }
+
+  recoverOnStartup() {
+    if (!this.data || typeof this.data !== 'object') return;
+    for (const [id, entry] of Object.entries(this.data)) {
+      if (entry && ['DISPATCH_INTENT', 'DISPATCHED_TO_SPOOLER', 'SPOOLING'].includes(entry.state)) {
+        entry.state = 'AMBIGUOUS_REQUIRES_OPERATOR_REVIEW';
+        entry.history = entry.history || [];
+        entry.history.push({
+          state: 'AMBIGUOUS_REQUIRES_OPERATOR_REVIEW',
+          timestamp: new Date().toISOString(),
+          reason: 'Startup crash recovery'
+        });
+      }
+    }
+    this.save();
   }
 
   cleanupTempFiles() {
@@ -248,7 +296,7 @@ class JobJournal {
         try { fs.unlinkSync(tempPath); } catch {}
       }
       console.error('🔥 Failed to persist job journal atomically:', err.message);
-      throw new Error(`Durable journal write failed: ${err.message}`);
+      throw new JournalPersistenceError(`Durable journal write failed: ${err.message}`);
     }
   }
 
@@ -440,3 +488,6 @@ class JobJournal {
 }
 
 module.exports = JobJournal;
+module.exports.JobJournal = JobJournal;
+module.exports.JournalCorruptionError = JournalCorruptionError;
+module.exports.JournalPersistenceError = JournalPersistenceError;
