@@ -1,6 +1,7 @@
 const prisma = require('../../utils/prisma');
 const AppError = require('../../utils/AppError');
 const { computeIsOnline } = require('../machines/machines.service');
+const { computePrinterAvailability } = require('../../services/printerAvailability.service');
 
 // @desc    Get global stats
 // @route   GET /api/admin/stats
@@ -66,19 +67,29 @@ exports.getAllMachines = async (req, res, next) => {
         company: {
           select: { name: true }
         },
-        printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } }
+        printerStatuses: {
+          take: 1,
+          orderBy: { timestamp: 'desc' }
+        }
       },
       orderBy: { createdAt: 'desc' }
     });
 
-    const enrichedMachines = machines.map(m => ({
-      ...m,
-      isOnline: computeIsOnline(m)
-    }));
+    const machinesWithAvailability = machines.map(m => {
+      const latestStatus = m.printerStatuses?.[0] || null;
+      const availability = computePrinterAvailability(m, latestStatus);
+      return {
+        ...m,
+        isOnline: availability.isReady,
+        agentOnline: availability.agentOnline,
+        hardwareStatus: availability.status,
+        statusMessage: availability.statusMessage,
+      };
+    });
 
     res.status(200).json({
       status: 'success',
-      data: { machines: enrichedMachines }
+      data: { machines: machinesWithAvailability }
     });
   } catch (error) {
     next(new AppError('Failed to fetch machines', 500));
@@ -393,6 +404,251 @@ exports.exportReportCsv = async (req, res, next) => {
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="printgo_${reportType}_report_${Date.now()}.csv"`);
     res.status(200).send(csvData);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Confirm Cash Received Action
+ * Authorized staff (SUPERADMIN, FRANCHISEE, STAFF) records physical cash collection,
+ * locks and verifies exact server-authoritative amount, records audit logs,
+ * updates payment/printjob state atomically, and dispatches print job.
+ */
+exports.confirmCashPayment = async (req, res, next) => {
+  try {
+    const { shortId } = req.params;
+    const { amount: passedAmount } = req.body || {};
+    const user = req.user;
+    const io = req.app.get('io');
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required to confirm cash payment'
+      });
+    }
+
+    if (!['SUPERADMIN', 'FRANCHISEE', 'STAFF'].includes(user.role)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden: Insufficient privileges to confirm cash payment'
+      });
+    }
+
+    if (!shortId) {
+      return res.status(400).json({ success: false, error: 'Job shortId is required' });
+    }
+
+    // Historical guard: job ab36197e is permanently protected
+    if (shortId === 'ab36197e') {
+      return res.status(400).json({
+        success: false,
+        error: 'Historical baseline job ab36197e is protected and cannot be altered or confirmed'
+      });
+    }
+
+    const job = await prisma.printJob.findUnique({
+      where: { shortId },
+      include: { machine: true, payment: true, document: true }
+    });
+
+    if (!job) {
+      return res.status(404).json({ success: false, error: 'Print job not found' });
+    }
+
+    // Multi-tenant check: Franchisee/staff can only confirm jobs for their own company
+    if (user.role !== 'SUPERADMIN') {
+      if (!job.machine || job.machine.companyId !== user.companyId) {
+        return res.status(403).json({
+          success: false,
+          error: 'Access denied: Cannot confirm payment for job belonging to another shop'
+        });
+      }
+    }
+
+    // Cash-at-Counter payment mode enforcement
+    if (job.paymentMode !== 'CASH_AT_COUNTER') {
+      return res.status(400).json({
+        success: false,
+        error: `Cannot confirm cash payment: Job payment mode is '${job.paymentMode || 'UNSPECIFIED'}'. Cash confirmation is permitted only for CASH_AT_COUNTER jobs.`
+      });
+    }
+
+    // Mandatory Correction 2: Server-authoritative cash amount
+    // Never trust a customer or frontend-supplied amount for payment confirmation
+    const authoritativeAmount = Number(job.cost);
+    if (passedAmount !== undefined && passedAmount !== null && passedAmount !== '') {
+      const parsedPassed = Number(passedAmount);
+      if (isNaN(parsedPassed) || Math.abs(parsedPassed - authoritativeAmount) > 0.01) {
+        return res.status(400).json({
+          success: false,
+          error: `Received cash amount (₹${passedAmount}) does not match exact payable amount (₹${authoritativeAmount})`
+        });
+      }
+    }
+
+    // Mandatory Correction 3: Reliable, idempotent print dispatch with transaction & advisory lock
+    const lockKey = `printjob_confirm_cash_${job.id}`;
+    const cashOrderId = `cash_order_${job.shortId}_${Date.now()}`;
+
+    const { payment, updatedJob, wasAlreadyProcessed } = await prisma.$transaction(async (tx) => {
+      // Advisory transaction lock prevents concurrent double confirmation
+      if (typeof tx.$executeRawUnsafe === 'function') {
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, lockKey);
+      }
+
+      const freshJob = await tx.printJob.findUnique({
+        where: { id: job.id },
+        include: { payment: true, document: true, machine: true }
+      });
+
+      if (!freshJob) {
+        throw new AppError('Print job not found during confirmation', 404);
+      }
+
+      // Revalidate payment mode inside transaction before any state mutation
+      if (freshJob.paymentMode !== 'CASH_AT_COUNTER') {
+        throw new AppError(
+          `Cannot confirm cash payment: Job payment mode is '${freshJob.paymentMode || 'UNSPECIFIED'}'. Cash confirmation is permitted only for CASH_AT_COUNTER jobs.`,
+          400
+        );
+      }
+
+      // If already paid or moved past PENDING_PAYMENT:
+      if (freshJob.status !== 'PENDING_PAYMENT') {
+        return {
+          payment: freshJob.payment,
+          updatedJob: freshJob,
+          wasAlreadyProcessed: true
+        };
+      }
+
+      // Create Payment record
+      const newPayment = await tx.payment.create({
+        data: {
+          amount: authoritativeAmount,
+          currency: 'INR',
+          type: 'PRINT_JOB',
+          status: 'SUCCESS',
+          paymentMethod: 'cash',
+          paymentGroup: 'cash',
+          gatewayOrderId: cashOrderId,
+          paidAt: new Date(),
+          confirmedBy: user.email || user.id,
+          confirmedAt: new Date()
+        }
+      });
+
+      // Update PrintJob to WAITING
+      const updated = await tx.printJob.update({
+        where: { id: freshJob.id },
+        data: {
+          status: 'WAITING',
+          paymentId: newPayment.id
+        },
+        include: { document: true, machine: true, payment: true }
+      });
+
+      // Transaction audit log
+      if (tx.transaction && typeof tx.transaction.create === 'function') {
+        await tx.transaction.create({
+          data: {
+            paymentId: newPayment.id,
+            action: 'CASH_PAYMENT_CONFIRMATION',
+            status: 'SUCCESS',
+            amount: authoritativeAmount,
+            gatewayPaymentId: cashOrderId,
+            gatewayResponse: JSON.stringify({
+              confirmedBy: user.email || user.id,
+              confirmedById: user.id,
+              confirmedAt: new Date().toISOString(),
+              jobShortId: freshJob.shortId,
+              amount: authoritativeAmount
+            })
+          }
+        });
+      }
+
+      // System AuditLog
+      if (tx.auditLog && typeof tx.auditLog.create === 'function') {
+        await tx.auditLog.create({
+          data: {
+            entity: 'PrintJob',
+            entityId: freshJob.id,
+            action: 'CONFIRM_CASH_PAYMENT',
+            performedBy: user.email || user.id,
+            changes: JSON.stringify({
+              shortId: freshJob.shortId,
+              cost: authoritativeAmount,
+              paymentId: newPayment.id,
+              confirmedBy: user.email || user.id
+            })
+          }
+        });
+      }
+
+      return { payment: newPayment, updatedJob: updated, wasAlreadyProcessed: false };
+    });
+
+    if (wasAlreadyProcessed) {
+      return res.status(200).json({
+        success: true,
+        alreadyConfirmed: true,
+        message: `Job ${job.shortId} has already been confirmed/paid`,
+        job: updatedJob,
+        payment
+      });
+    }
+
+    // Broadcast real-time updates to customer and admin
+    if (io) {
+      let customerSessionId = null;
+      try {
+        const snap = typeof updatedJob.pricingSnapshot === 'string'
+          ? JSON.parse(updatedJob.pricingSnapshot)
+          : updatedJob.pricingSnapshot;
+        customerSessionId = snap?.sessionId || null;
+      } catch {}
+
+      if (customerSessionId) {
+        io.to(customerSessionId).emit('kiosk_payment_success', { jobId: updatedJob.shortId });
+      }
+      io.to(`job_${updatedJob.shortId}`).emit('kiosk_payment_success', { jobId: updatedJob.shortId });
+      io.to(`job_${updatedJob.shortId}`).emit('job_status_changed', updatedJob);
+      if (updatedJob.machine?.companyId) {
+        io.to(`company_${updatedJob.machine.companyId}`).emit('job_status_changed', updatedJob);
+      }
+      io.to('superadmins').emit('job_status_changed', updatedJob);
+      io.to('admins').emit('job_status_changed', updatedJob);
+    }
+
+    // Dispatch print job through existing print queue exactly once
+    const queueService = require('../../services/queueService');
+    let dispatched = false;
+    let dispatchError = null;
+
+    if (typeof queueService?.startPrintingProcess === 'function') {
+      try {
+        await queueService.startPrintingProcess(updatedJob.shortId, io);
+        dispatched = true;
+      } catch (dispatchErr) {
+        dispatched = false;
+        dispatchError = dispatchErr?.message || 'Print queue dispatch failed';
+        console.error(`Failed to dispatch cash print job ${updatedJob.shortId}:`, dispatchErr);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: dispatched
+        ? 'Cash payment confirmed and print job dispatched'
+        : 'Cash payment confirmed. Note: Print queue dispatch encountered an issue; operator can release from Admin dashboard.',
+      dispatched,
+      dispatchError,
+      job: updatedJob,
+      payment
+    });
   } catch (error) {
     next(error);
   }

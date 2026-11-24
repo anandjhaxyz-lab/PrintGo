@@ -6,6 +6,9 @@ const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('../../services/pricing.service');
 const { resolveCashfreeEnv } = require('../../config/cashfree.config');
+const { isDemoPaymentPermitted, isDemoAccessCodeRequired } = require('../../utils/demoPaymentGuard');
+const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
+const { getMachineAvailability } = require('../../services/printerAvailability.service');
 
 const login = async (req, res, next) => {
   try {
@@ -166,7 +169,26 @@ const joinSession = async (req, res, next) => {
     const pricingProfile = serializePublicPricingProfile(rawProfile);
     const { env: cashfreeEnv } = resolveCashfreeEnv();
 
-    logger.info(`Mobile joined session: ${session.code}`);
+    let printer = null;
+    if (session.machineId) {
+      const availability = await getMachineAvailability(session.machineId, prisma);
+      if (availability) {
+        printer = {
+          name: availability.name,
+          model: availability.printerModel || 'EPSON L6460 Series',
+          location: availability.location || 'Front Desk',
+          isOnline: availability.isReady,
+          hardwareStatus: availability.status,
+          statusMessage: availability.statusMessage,
+          agentOnline: availability.agentOnline,
+          paperStatus: availability.paperStatus,
+          tonerStatus: availability.tonerStatus,
+          jamStatus: availability.jamStatus,
+        };
+      }
+    }
+
+    logger.info(`Mobile joined session: ${session.code} (printer: ${printer ? printer.hardwareStatus : 'none'})`);
 
     res.status(200).json({
       success: true,
@@ -175,6 +197,9 @@ const joinSession = async (req, res, next) => {
       expiresAt: session.expiresAt,
       cashfreeEnv: cashfreeEnv || 'sandbox',
       pricingProfile,
+      enableDemoPayment: isDemoPaymentPermitted(),
+      demoAccessCodeRequired: isDemoPaymentPermitted() && isDemoAccessCodeRequired(),
+      printer,
     });
   } catch (error) {
     next(error);
@@ -231,14 +256,28 @@ const getPublicPricing = async (req, res, next) => {
       }
     }
 
+    let resolvedPaymentMode = DEFAULT_PAYMENT_MODE;
+    if (resolvedMachineId) {
+      const machine = await prisma.machine.findUnique({
+        where: { id: resolvedMachineId },
+        select: { paymentMode: true }
+      });
+      if (machine?.paymentMode) {
+        resolvedPaymentMode = machine.paymentMode;
+      }
+    }
+
     const rawProfile = await getPricingProfile(resolvedMachineId);
     const pricingProfile = serializePublicPricingProfile(rawProfile);
     const { env: cashfreeEnv } = resolveCashfreeEnv();
 
     res.status(200).json({
       success: true,
+      paymentMode: resolvedPaymentMode,
       cashfreeEnv: cashfreeEnv || 'sandbox',
-      pricingProfile
+      pricingProfile,
+      enableDemoPayment: resolvedPaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted(),
+      demoAccessCodeRequired: resolvedPaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted() && isDemoAccessCodeRequired()
     });
   } catch (error) {
     next(error);

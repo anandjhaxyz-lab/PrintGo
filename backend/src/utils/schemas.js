@@ -57,6 +57,26 @@ const createJobSchema = z.object({
 const updateJobStatusSchema = z.object({
   body: z.object({
     status: z.enum(['PENDING_PAYMENT', 'WAITING', 'PRINTING', 'COMPLETED', 'FAILED', 'CANCELLED']),
+    reason: z.string().optional(),
+    evidence: z.string().optional(),
+    physicalConfirmation: z.boolean().optional(),
+    physicalVerificationConfirmed: z.boolean().optional(),
+    spoolerEmptyOnly: z.boolean().optional(),
+  }).strip(),
+  query: z.any(),
+  params: z.object({
+    id: z.string(),
+  }).strip(),
+});
+
+const resolveAmbiguitySchema = z.object({
+  body: z.object({
+    outcome: z.enum(['COMPLETED', 'FAILED']),
+    reason: z.string().optional(),
+    evidence: z.string().optional(),
+    physicalConfirmation: z.boolean().optional(),
+    physicalVerificationConfirmed: z.boolean().optional(),
+    spoolerEmptyOnly: z.boolean().optional(),
   }).strip(),
   query: z.any(),
   params: z.object({
@@ -71,6 +91,9 @@ const createMachineSchema = z.object({
     location: z.string().min(1),
     type: z.enum(['KIOSK', 'COUNTER']).default('KIOSK'),
     companyId: z.string().uuid().optional(),
+    printerModel: z.string().optional(),
+    connectionType: z.string().optional(),
+    paymentMode: z.enum(['CASH_AT_COUNTER', 'DEMO_SIMULATION', 'CASHFREE_ONLINE']).optional(),
   }).strip(),
   query: z.any(),
   params: z.any(),
@@ -81,6 +104,9 @@ const updateMachineSchema = z.object({
     name: z.string().optional(),
     location: z.string().optional(),
     status: z.enum(['ACTIVE', 'INACTIVE', 'SUSPENDED']).optional(),
+    printerModel: z.string().optional(),
+    connectionType: z.string().optional(),
+    paymentMode: z.enum(['CASH_AT_COUNTER', 'DEMO_SIMULATION', 'CASHFREE_ONLINE']).optional(),
   }).strip(),
   query: z.any(),
   params: z.object({
@@ -124,6 +150,7 @@ module.exports = {
   sessionSchema,
   createJobSchema,
   updateJobStatusSchema,
+  resolveAmbiguitySchema,
   createMachineSchema,
   updateMachineSchema,
   createCompanySchema,

@@ -23,7 +23,8 @@ import {
   Monitor,
   Smartphone,
   Layers,
-  MapPin
+  MapPin,
+  Link
 } from 'lucide-react';
 import { getApiUrl } from '../../../utils/apiConfig';
 
@@ -50,6 +51,8 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
     isActive: true,
     startDate: '',
     endDate: '',
+    mediaInputMode: 'UPLOAD', // 'UPLOAD' | 'URL'
+    mediaUrl: '',
     mediaFile: null,
     mediaPreviewUrl: '',
     mediaType: 'IMAGE',
@@ -117,6 +120,7 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
 
   // Helper to open edit modal
   const handleOpenEdit = (ad) => {
+    const isExternal = Boolean(ad.mediaUrl && ad.mediaUrl.startsWith('http'));
     setEditingAdId(ad.id);
     setFormData({
       title: ad.title || '',
@@ -125,8 +129,10 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
       isActive: Boolean(ad.isActive),
       startDate: ad.startDate ? ad.startDate.slice(0, 10) : '',
       endDate: ad.endDate ? ad.endDate.slice(0, 10) : '',
+      mediaInputMode: isExternal ? 'URL' : 'UPLOAD',
+      mediaUrl: isExternal ? ad.mediaUrl : '',
       mediaFile: null,
-      mediaPreviewUrl: ad.mediaUrl ? (ad.mediaUrl.startsWith('http') ? ad.mediaUrl : `${API_URL}${ad.mediaUrl}`) : '',
+      mediaPreviewUrl: ad.mediaUrl ? (isExternal ? ad.mediaUrl : `${API_URL}${ad.mediaUrl}`) : '',
       mediaType: ad.type || 'IMAGE',
       scope: ad.scope || (isSuperadmin ? 'GLOBAL' : 'MACHINE_SPECIFIC'),
       placement: ad.placement || 'ALL',
@@ -143,9 +149,20 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
       return;
     }
 
-    if (!editingAdId && !formData.mediaFile) {
-      showMessage('Please select an image or video file', 'error');
-      return;
+    if (formData.mediaInputMode === 'URL') {
+      if (!formData.mediaUrl.trim()) {
+        showMessage('Please enter an external HTTPS media URL', 'error');
+        return;
+      }
+      if (!formData.mediaUrl.trim().startsWith('https://')) {
+        showMessage('External media URL must use https:// protocol', 'error');
+        return;
+      }
+    } else {
+      if (!editingAdId && !formData.mediaFile) {
+        showMessage('Please select an image or video file', 'error');
+        return;
+      }
     }
 
     if (formData.scope === 'MACHINE_SPECIFIC' && !formData.machineId) {
@@ -167,7 +184,10 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
       if (formData.scope === 'MACHINE_SPECIFIC') {
         data.append('machineId', formData.machineId);
       }
-      if (formData.mediaFile) {
+      if (formData.mediaInputMode === 'URL') {
+        data.append('mediaUrl', formData.mediaUrl.trim());
+        data.append('type', formData.mediaType);
+      } else if (formData.mediaFile) {
         data.append('media', formData.mediaFile);
       }
 
@@ -209,6 +229,8 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
       isActive: true,
       startDate: '',
       endDate: '',
+      mediaInputMode: 'UPLOAD',
+      mediaUrl: '',
       mediaFile: null,
       mediaPreviewUrl: '',
       mediaType: 'IMAGE',
@@ -811,11 +833,98 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                 </div>
               </div>
 
-              {/* Media File Picker & Live Preview */}
+              {/* Media Input Mode & Live Preview */}
               <div>
                 <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 700, color: '#CBD5E1', marginBottom: '0.35rem' }}>
                   Advertisement Media (Photo or MP4 Video) {editingAdId ? '(Optional if keeping current media)' : '*'}
                 </label>
+
+                {/* Source Mode Toggle */}
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFormData(p => ({
+                        ...p,
+                        mediaInputMode: 'UPLOAD',
+                        mediaUrl: '',
+                        mediaPreviewUrl: p.mediaFile ? URL.createObjectURL(p.mediaFile) : ''
+                      }));
+                    }}
+                    style={{
+                      padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem', fontWeight: 600,
+                      background: formData.mediaInputMode === 'UPLOAD' ? 'rgba(245, 158, 11, 0.2)' : '#070E1E',
+                      border: `1px solid ${formData.mediaInputMode === 'UPLOAD' ? '#F59E0B' : '#334155'}`,
+                      color: formData.mediaInputMode === 'UPLOAD' ? '#FCD34D' : '#94A3B8',
+                      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                    }}
+                  >
+                    <UploadCloud size={13} /> Upload File
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFormData(p => ({
+                        ...p,
+                        mediaInputMode: 'URL',
+                        mediaFile: null,
+                        mediaPreviewUrl: p.mediaUrl.startsWith('https://') ? p.mediaUrl : ''
+                      }));
+                    }}
+                    style={{
+                      padding: '4px 10px', borderRadius: '6px', fontSize: '0.75rem', fontWeight: 600,
+                      background: formData.mediaInputMode === 'URL' ? 'rgba(245, 158, 11, 0.2)' : '#070E1E',
+                      border: `1px solid ${formData.mediaInputMode === 'URL' ? '#F59E0B' : '#334155'}`,
+                      color: formData.mediaInputMode === 'URL' ? '#FCD34D' : '#94A3B8',
+                      cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                    }}
+                  >
+                    <Link size={13} /> External HTTPS URL
+                  </button>
+                </div>
+
+                {formData.mediaInputMode === 'URL' ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                    <input
+                      type="url"
+                      placeholder="https://example.com/assets/banner.jpg"
+                      value={formData.mediaUrl}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const isVid = /\.(mp4|webm|ogg)$/i.test(val);
+                        setFormData(p => ({
+                          ...p,
+                          mediaUrl: val,
+                          mediaPreviewUrl: val.startsWith('https://') ? val : '',
+                          mediaType: isVid ? 'VIDEO' : p.mediaType
+                        }));
+                      }}
+                      style={{
+                        width: '100%', padding: '0.55rem 0.75rem', borderRadius: '8px',
+                        background: '#070E1E', border: '1px solid #334155', color: '#FFFFFF',
+                        fontSize: '0.8125rem', outline: 'none'
+                      }}
+                    />
+                    <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                      <label style={{ fontSize: '0.72rem', color: '#CBD5E1', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="urlMediaType"
+                          checked={formData.mediaType === 'IMAGE'}
+                          onChange={() => setFormData(p => ({ ...p, mediaType: 'IMAGE' }))}
+                        /> Photo / Banner
+                      </label>
+                      <label style={{ fontSize: '0.72rem', color: '#CBD5E1', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                        <input
+                          type="radio"
+                          name="urlMediaType"
+                          checked={formData.mediaType === 'VIDEO'}
+                          onChange={() => setFormData(p => ({ ...p, mediaType: 'VIDEO' }))}
+                        /> MP4 Video
+                      </label>
+                    </div>
+                  </div>
+                ) : null}
 
                 {formData.mediaPreviewUrl ? (
                   <div style={{
@@ -839,7 +948,7 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                     )}
                     <button
                       type="button"
-                      onClick={() => setFormData(p => ({ ...p, mediaFile: null, mediaPreviewUrl: '' }))}
+                      onClick={() => setFormData(p => ({ ...p, mediaFile: null, mediaUrl: '', mediaPreviewUrl: '' }))}
                       style={{
                         position: 'absolute', top: '8px', right: '8px',
                         background: 'rgba(239, 68, 68, 0.85)', color: '#FFFFFF',
@@ -851,7 +960,7 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                       <X size={14} />
                     </button>
                   </div>
-                ) : (
+                ) : formData.mediaInputMode === 'UPLOAD' ? (
                   <label style={{
                     display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                     border: '2px dashed #334155', borderRadius: '10px', padding: '1.75rem 1rem',
@@ -867,7 +976,7 @@ export const AdvertisementsView = ({ isSuperadmin }) => {
                       style={{ display: 'none' }}
                     />
                   </label>
-                )}
+                ) : null}
               </div>
 
               {/* Title */}

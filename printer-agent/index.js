@@ -19,28 +19,16 @@ try {
 }
 const SpoolerMonitor = require('./src/spooler');
 const JobJournal = require('./src/journal');
-const printMutex = require('./src/printMutex');
-
-let journal;
-try {
-  journal = new JobJournal();
-  journal.recoverOnStartup();
-  console.log(`📖 Job Journal initialized and verified (${Object.keys(journal.jobs).length} tracked jobs).`);
-
-  // P1-01: On restart, if any job is still in an ambiguous or in-flight state
-  // in the journal, permanently lock the mutex to prevent another physical
-  // print until an operator clears the ambiguous state.
-  const inFlightStates = ['DISPATCHED_TO_SPOOLER', 'SPOOLING', 'AMBIGUOUS_REQUIRES_OPERATOR_REVIEW'];
-  const ambiguousJob = Object.values(journal.jobs).find(j => inFlightStates.includes(j.state));
-  if (ambiguousJob) {
-    printMutex.lockForAmbiguous(ambiguousJob.jobId);
-    console.warn(`⚠️ P1-01: Startup mutex locked for ambiguous/in-flight job ${ambiguousJob.jobId} (state: ${ambiguousJob.state}). Physical printing disabled until operator clears this job.`);
-  }
-} catch (err) {
-  console.error(`🔥 FATAL ERROR: Journal integrity check failed: ${err.message}`);
-  console.error(`Agent cannot operate with a corrupt or unreadable journal. Halting startup.`);
-  process.exit(1);
-}
+const { PrinterFleetManager } = require('./src/printerFleetManager');
+const { PrinterDeviceQueue } = require('./src/printerDeviceQueue');
+const { PrinterDispatchAuthorizer } = require('./src/dispatchAuthorization');
+const { discoverWindowsPrinters } = require('./src/windowsPrinterDiscovery');
+const {
+  buildAgentHello,
+  validatePrinterDeviceRegistry
+} = require('./src/agentProtocol');
+const journal = new JobJournal();
+const agentPackage = require('./package.json');
 
 process.on('uncaughtException', (err) => {
   console.error('🔥 CRITICAL ERROR: Uncaught Exception:', err);
@@ -103,6 +91,7 @@ const socket = io(BACKEND_URL, {
   transports: ['websocket'],
   auth: { machineKey: MACHINE_KEY }
 });
+const dispatchAuthorizer = new PrinterDispatchAuthorizer(socket);
 
 // Persistent RSA Keypair for E2EE across restarts
 const keysDir = path.join(__dirname, 'keys');
@@ -130,20 +119,90 @@ if (fs.existsSync(pubKeyPath) && fs.existsSync(privKeyPath)) {
 }
 
 const spoolerMonitor = new SpoolerMonitor({ execFile, printerName: PRINTER_NAME, journal });
+const printerDeviceQueue = new PrinterDeviceQueue();
+const activePrintJobIds = new Set();
 
 let statusInterval = null;
+let registeredMachineId = null;
+let fleetProtocolAccepted = false;
+let fleetManager = null;
+let latestRegistryIssuedAt = 0;
+let pendingRegistryRefresh = null;
+
+const settleRegistryRefresh = (requestId, accepted, details = {}) => {
+  const pending = pendingRegistryRefresh;
+  if (!pending || pending.requestId !== requestId) return false;
+
+  clearTimeout(pending.timeoutId);
+  pendingRegistryRefresh = null;
+  if (accepted) {
+    pending.resolve(details);
+  } else {
+    pending.reject(new Error(details.message || details.code || 'PrinterDevice registry refresh failed.'));
+  }
+  return true;
+};
+
+const requestLatestPrinterRegistry = () => {
+  if (!fleetProtocolAccepted || !registeredMachineId) {
+    return Promise.reject(new Error('Multi-printer Agent protocol is not authenticated.'));
+  }
+  if (pendingRegistryRefresh) return pendingRegistryRefresh.promise;
+
+  const requestId = crypto.randomUUID();
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+
+  const pending = {
+    requestId,
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise,
+    timeoutId: null
+  };
+  pendingRegistryRefresh = pending;
+  pending.timeoutId = setTimeout(() => {
+    settleRegistryRefresh(requestId, false, {
+      code: 'REGISTRY_REFRESH_TIMEOUT',
+      message: 'The backend did not complete a fresh PrinterDevice registry sync within 15 seconds.'
+    });
+  }, 15000);
+
+  socket.emit('printer_device_registry_request', { requestId });
+  return promise;
+};
 socket.on('connect', () => {
   console.log(`✅ Connected to cloud backend! (Socket ID: ${socket.id})`);
+  fleetProtocolAccepted = false;
+  fleetManager = null;
+  latestRegistryIssuedAt = 0;
   
   // Register Public Key with Backend for E2EE
   socket.emit('register_public_key', { publicKey: publicKeyPem });
+
+  // Negotiate the additive fleet protocol. Older backends ignore this event;
+  // the existing single-printer flow remains active in that case.
+  socket.emit('printer_agent_hello', buildAgentHello({
+    agentVersion: agentPackage.version,
+    markerPath: journal.markerPath,
+    journalSchemaVersion: 2
+  }));
   
   // Clear any previous interval to prevent leaks on reconnect
   if (statusInterval) clearInterval(statusInterval);
   
-  // Periodically send printer status
+  // Per-device monitoring is enabled only after a machine-bound registry is
+  // validated. Until then, keep the legacy PRINTER_NAME status path unchanged.
   statusInterval = setInterval(() => {
-    spoolerMonitor.checkPrinterStatus(socket);
+    if (fleetManager && fleetManager.monitors.size > 0) {
+      fleetManager.checkPrinterStatuses(socket);
+    } else {
+      spoolerMonitor.checkPrinterStatus(socket);
+    }
   }, 30000); // every 30s
 });
 
@@ -153,7 +212,123 @@ socket.on('printer_registration_failed', (data) => {
 });
 
 socket.on('printer_registered_success', (data) => {
+  registeredMachineId = typeof data?.machineId === 'string' ? data.machineId : null;
   console.log(`✅ Registration Success. Machine: ${data.name}`);
+});
+
+socket.on('printer_agent_hello_ack', (ack) => {
+  if (ack && typeof ack.machineId === 'string') {
+    registeredMachineId = ack.machineId;
+  }
+  if (!ack || ack.accepted !== true) {
+    fleetProtocolAccepted = false;
+    console.warn(`⚠️ Multi-printer protocol not negotiated: ${ack?.reason || ack?.code || 'backend did not accept hello'}`);
+    return;
+  }
+
+  fleetProtocolAccepted = ack.supportsMultiPrinter === true;
+  if (fleetProtocolAccepted) {
+    console.log(`✅ Multi-printer protocol v${ack.protocolVersion} accepted for Machine ${ack.machineId} (limit: ${ack.maxPrinters})`);
+  } else {
+    console.log('ℹ️ Backend accepted Agent hello; legacy single-printer mode remains active on this platform.');
+  }
+});
+
+socket.on('printer_device_registry', async (payload) => {
+  const requestId = typeof payload?.requestId === 'string' ? payload.requestId : null;
+  if (!fleetProtocolAccepted) {
+    console.warn('⚠️ Ignoring PrinterDevice registry because multi-printer capability was not negotiated.');
+    if (requestId) settleRegistryRefresh(requestId, false, { code: 'AGENT_PROTOCOL_NOT_NEGOTIATED' });
+    return;
+  }
+
+  try {
+    const registryIssuedAt = Date.parse(payload?.issuedAt);
+    if (!Number.isFinite(registryIssuedAt)) {
+      throw new Error('Backend PrinterDevice registry is missing a valid issuedAt timestamp.');
+    }
+    const devices = validatePrinterDeviceRegistry(payload, registeredMachineId);
+    const discoveredPrinters = await discoverWindowsPrinters({ execFile });
+
+    const nextFleetManager = new PrinterFleetManager({
+      maxDevices: 10,
+      journal,
+      discoverPrinters: async () => discoveredPrinters,
+      getDeviceRegistry: async () => devices,
+      monitorFactory: ({ printerDevice, printerName }) => new SpoolerMonitor({
+        execFile,
+        printerName,
+        printerDeviceId: printerDevice.id,
+        journal
+      })
+    });
+
+    const fleet = await nextFleetManager.refresh();
+    // Connect-time and print-time registry responses can overlap. Never let an
+    // older response overwrite a newer approved-device snapshot.
+    if (registryIssuedAt < latestRegistryIssuedAt) {
+      if (requestId) {
+        settleRegistryRefresh(requestId, true, {
+          machineId: registeredMachineId,
+          deviceCount: devices.length,
+          superseded: true
+        });
+      }
+      return;
+    }
+    latestRegistryIssuedAt = registryIssuedAt;
+    fleetManager = nextFleetManager;
+
+    // Initial hello performs a full inventory report. A print-time refresh only
+    // synchronizes the approved registry and must not generate redundant reports.
+    if (!requestId) {
+      socket.emit('printer_inventory_report', {
+        protocolVersion: 1,
+        discoveredPrinters
+      });
+    }
+
+    const approvedCount = fleet.filter((device) => device.canPrint).length;
+    console.log(`🖨️ Printer fleet synchronized: ${discoveredPrinters.length} Windows queue(s) discovered; ${approvedCount} approved device(s) have independent monitors.`);
+
+    if (requestId) {
+      settleRegistryRefresh(requestId, true, {
+        machineId: registeredMachineId,
+        deviceCount: devices.length,
+        approvedCount
+      });
+    }
+  } catch (error) {
+    // Fail closed: a bad registry or Windows inventory cannot enable a printer.
+    if (!Number.isFinite(Date.parse(payload?.issuedAt)) || Date.parse(payload.issuedAt) >= latestRegistryIssuedAt) {
+      fleetManager = null;
+    }
+    console.error(`❌ Multi-printer registry synchronization failed: ${error.message}`);
+    if (requestId) {
+      settleRegistryRefresh(requestId, false, {
+        code: 'REGISTRY_SYNC_FAILED',
+        message: error.message
+      });
+    }
+  }
+});
+
+socket.on('printer_device_registry_error', (payload) => {
+  console.warn(`⚠️ PrinterDevice registry unavailable: ${payload?.message || payload?.code || 'unknown error'}`);
+  if (payload?.requestId) {
+    settleRegistryRefresh(payload.requestId, false, {
+      code: payload.code || 'REGISTRY_UNAVAILABLE',
+      message: payload.message || 'Backend registry refresh failed.'
+    });
+  }
+});
+
+socket.on('printer_inventory_report_ack', (ack) => {
+  if (ack?.accepted) {
+    console.log(`✅ Backend received discovery inventory: ${ack.receivedCount} queue(s).`);
+  } else {
+    console.warn(`⚠️ Backend rejected discovery inventory: ${ack?.message || ack?.code || 'unknown error'}`);
+  }
 });
 
 socket.on('machine_suspended', (data) => {
@@ -163,6 +338,14 @@ socket.on('machine_suspended', (data) => {
 });
 
 socket.on('disconnect', () => {
+  fleetProtocolAccepted = false;
+  fleetManager = null;
+  if (pendingRegistryRefresh) {
+    settleRegistryRefresh(pendingRegistryRefresh.requestId, false, {
+      code: 'AGENT_DISCONNECTED',
+      message: 'Agent disconnected while refreshing the PrinterDevice registry.'
+    });
+  }
   console.log(`❌ Disconnected from backend. Attempting to reconnect...`);
 });
 
@@ -175,171 +358,228 @@ socket.on('ack_job_completed', ({ jobId }) => {
   journal.recordAcknowledged(jobId);
 });
 
-/**
- * P1-02 Reconnect Reconciliation Helper
- *
- * Verifies whether a journal entry contains genuine durable terminal evidence
- * of physical print completion:
- * - Must be COMPLETED_LOCALLY
- * - If simulation mode was recorded, it is genuine simulation completion.
- * - For physical printing: must have details.wasSeenInQueue === true.
- * - Missing or falsy wasSeenInQueue does NOT qualify (rejects fast-clear / unverified paths).
- */
-function hasVerifiedTerminalCompletion(entry) {
-  if (!entry || entry.state !== 'COMPLETED_LOCALLY') {
-    return false;
-  }
+socket.on('reconcile_active_jobs', ({ requestId, jobIds = [], jobBindings = {} } = {}) => {
+  console.log(`🔍 Received reconciliation request [ReqID: ${requestId || 'legacy'}] from backend for jobs:`, jobIds);
 
-  // Check details recorded in the journal entry or entry history
-  const details = entry.details || {};
+  const bindingForJob = (jobId, entry) => {
+    const hasServerBinding = Object.prototype.hasOwnProperty.call(jobBindings || {}, jobId);
+    const serverBinding = hasServerBinding ? (jobBindings[jobId] || {}) : null;
+    const journalBinding = entry && entry.printerDeviceId
+      ? {
+          printerDeviceId: entry.printerDeviceId,
+          windowsPrinterName: entry.windowsPrinterName || null
+        }
+      : {};
 
-  // If simulation mode
-  if (details.mode === 'simulation') {
-    return true;
-  }
-
-  // Must have strict wasSeenInQueue === true
-  if (details.wasSeenInQueue === true) {
-    return true;
-  }
-
-  // Inspect history records for terminal evidence
-  if (Array.isArray(entry.history)) {
-    const completedStep = entry.history.find(h => h.state === 'COMPLETED_LOCALLY');
-    if (completedStep && completedStep.details) {
-      if (completedStep.details.mode === 'simulation') return true;
-      if (completedStep.details.wasSeenInQueue === true) return true;
-    }
-  }
-
-  return false;
-}
-
-socket.on('reconcile_active_jobs', ({ jobIds = [] }) => {
-  console.log(`🔍 Received reconciliation request from backend for jobs:`, jobIds);
-  for (const jobId of jobIds) {
-    const entry = journal.getJob(jobId);
-    if (!entry) {
-      console.warn(`📡 Job ${jobId} not found in agent journal during reconciliation.`);
-      socket.emit('job_reconciliation_report', { jobId, status: 'NOT_DISPATCHED' });
-      continue;
+    if (hasServerBinding) {
+      const serverId = serverBinding.printerDeviceId || null;
+      const serverQueue = serverBinding.windowsPrinterName || null;
+      const localId = journalBinding.printerDeviceId || null;
+      const localQueue = journalBinding.windowsPrinterName || null;
+      return {
+        binding: serverBinding,
+        mismatch: Boolean(entry && (serverId !== localId || serverQueue !== localQueue))
+      };
     }
 
-    if (entry.state === 'ACKNOWLEDGED') {
-      // P1-02: Already acknowledged terminal completion. Emit idempotent terminal success.
-      console.log(`📡 Job ${jobId} already ACKNOWLEDGED in journal. Emitting idempotent success.`);
-      socket.emit('print_physical_success', {
-        jobId,
-        reconciled: true,
-        idempotent: true,
-        wasSeenInQueue: true,
-        dispatchedAt: entry.dispatchedAt,
-        completedAt: entry.completedAt
-      });
-    } else if (entry.state === 'COMPLETED_LOCALLY') {
-      // P1-02: Check for genuine verified durable evidence
-      if (hasVerifiedTerminalCompletion(entry)) {
-        console.log(`📡 Reporting verified terminal physical completion for Job ${jobId}`);
-        socket.emit('print_physical_success', {
-          jobId,
-          reconciled: true,
-          wasSeenInQueue: true,
-          dispatchedAt: entry.dispatchedAt,
-          completedAt: entry.completedAt
-        });
-      } else {
-        // Missing wasSeenInQueue or fastSpoolCleared without queue observation -> report ambiguous!
-        console.warn(`⚠️ Reporting AMBIGUOUS for Job ${jobId}: COMPLETED_LOCALLY lacks reliable wasSeenInQueue evidence.`);
-        socket.emit('print_physical_ambiguous', {
-          jobId,
-          reason: 'Reconciliation: COMPLETED_LOCALLY lacks verified wasSeenInQueue evidence',
-          wasSeenInQueue: false
-        });
-      }
-    } else if (
-      entry.state === 'DISPATCHED_TO_SPOOLER' ||
-      entry.state === 'SPOOLING' ||
-      entry.state === 'AMBIGUOUS_REQUIRES_OPERATOR_REVIEW'
-    ) {
-      // P1-02: Non-terminal in-flight states must NEVER emit print_physical_success
-      console.warn(`⚠️ Reporting AMBIGUOUS for Job ${jobId}: Agent state is ${entry.state}. Physical completion unverified.`);
+    return { binding: journalBinding, mismatch: false };
+  };
+
+  // A corrupted journal is never evidence that a job was not dispatched.
+  if (journal.isCorrupted) {
+    console.error(`🔥 FAIL-CLOSED GUARD: Local journal is corrupted/unreadable (${journal.corruptionReason}). Refusing to report NOT_DISPATCHED!`);
+    for (const jobId of jobIds) {
+      const { binding } = bindingForJob(jobId, null);
       socket.emit('print_physical_ambiguous', {
         jobId,
-        reason: `Reconciliation: Job in unverified state ${entry.state}`,
-        wasSeenInQueue: entry.state === 'SPOOLING'
+        requestId,
+        reason: `Local journal corrupted/unreadable: ${journal.corruptionReason}. Manual verification required.`,
+        wasSeenInQueue: false,
+        ...binding
       });
-      // Also emit job_reconciliation_report for legacy diagnostic logging
-      socket.emit('job_reconciliation_report', { jobId, status: entry.state });
+    }
+    return;
+  }
+
+  for (const jobId of jobIds) {
+    const entry = journal.getJob(jobId);
+    const { binding, mismatch } = bindingForJob(jobId, entry);
+
+    if (mismatch) {
+      console.warn(`⚠️ Journal physical-printer binding differs from the backend job record for ${jobId}. Reporting AMBIGUOUS.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Journal PrinterDevice identity does not match the current database job binding.',
+        wasSeenInQueue: false,
+        ...binding
+      });
+    } else if (!entry) {
+      // Backend-supplied binding lets the Agent prove an unseen device-bound
+      // job was never received without guessing its PrinterDevice identity.
+      console.log(`📡 Job ${jobId} was never recorded in local journal.`);
+      socket.emit('job_reconciliation_report', {
+        requestId,
+        jobId,
+        status: 'NOT_DISPATCHED',
+        ...binding
+      });
+    } else if (journal.isCorruptedEntry(entry)) {
+      console.warn(`⚠️ Incomplete/corrupted journal entry for Job ${jobId}. Reporting AMBIGUOUS.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Incomplete or malformed journal entry (missing required state)',
+        wasSeenInQueue: false,
+        ...binding
+      });
+    } else if (entry.state === 'RECEIVED') {
+      // Proved never dispatched to spooler: safe to request re-dispatch.
+      console.log(`📡 Job ${jobId} was received but never dispatched to spooler locally.`);
+      socket.emit('job_reconciliation_report', {
+        requestId,
+        jobId,
+        status: 'NOT_DISPATCHED',
+        ...binding
+      });
+    } else if (entry.state === 'DISPATCH_INTENT') {
+      // Driver dispatch intent without confirmed spooler handoff is ambiguous.
+      console.warn(`⚠️ AMBIGUOUS DISPATCH: Job ${jobId} crashed during driver dispatch intent.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Agent crashed during driver dispatch intent window (unconfirmed spooler handoff)',
+        wasSeenInQueue: false,
+        ...binding
+      });
+    } else if (['COMPLETED_LOCALLY', 'ACKNOWLEDGED'].includes(entry.state)) {
+      console.log(`📡 Reporting existing completion evidence for Job ${jobId} (state: ${entry.state})`);
+      socket.emit('print_physical_success', {
+        jobId,
+        requestId,
+        reconciled: true,
+        dispatchedAt: entry.dispatchedAt || entry.dispatchIntentAt,
+        completedAt: entry.completedAt,
+        ...binding
+      });
+    } else if (['SPOOLER_ACCEPTED', 'DISPATCHED_TO_SPOOLER', 'SPOOLING'].includes(entry.state)) {
+      console.log(`📡 Job ${jobId} was accepted by spooler prior to Agent restart. Reporting AMBIGUOUS.`);
+      socket.emit('print_physical_ambiguous', {
+        jobId,
+        requestId,
+        reason: 'Spooler accepted job before agent restart; physical clearance unverified',
+        wasSeenInQueue: true,
+        ...binding
+      });
     } else {
-      console.log(`📡 Job ${jobId} in state ${entry.state}; not dispatched or completed.`);
-      socket.emit('job_reconciliation_report', { jobId, status: entry.state });
+      socket.emit('job_reconciliation_report', {
+        requestId,
+        jobId,
+        status: entry.state,
+        ...binding
+      });
     }
   }
 });
 
 // checkPrinterStatus logic has been moved to src/spooler.js
 
-socket.on('physical_print_job', async (jobData) => {
+socket.on('physical_print_job', (jobData) => {
+  const jobId = jobData?.jobId;
+  if (!jobId || typeof jobId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    console.error(`❌ REJECTED Job: Invalid jobId format (potential injection): ${jobId}`);
+    return;
+  }
+
+  const rawPrinterDeviceId = jobData?.printerDeviceId;
+  const hasDeviceId = rawPrinterDeviceId !== undefined && rawPrinterDeviceId !== null;
+  const laneQueueName = hasDeviceId ? jobData?.windowsPrinterName : PRINTER_NAME;
+  const laneKey = typeof laneQueueName === 'string' && laneQueueName.trim()
+    ? `queue:${laneQueueName.trim().toLocaleLowerCase('en-US')}`
+    : (hasDeviceId
+      ? `device:${typeof rawPrinterDeviceId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(rawPrinterDeviceId) ? rawPrinterDeviceId : 'invalid'}`
+      : `legacy:${registeredMachineId || 'unregistered-machine'}`);
+
+  printerDeviceQueue.enqueue(laneKey, async () => {
+    if (activePrintJobIds.has(jobId)) {
+      console.warn(`⚠️ Duplicate job event ${jobId} arrived while an Agent handler is already active.`);
+      return;
+    }
+    activePrintJobIds.add(jobId);
+    try {
+      await processPhysicalPrintJob(jobData);
+    } finally {
+      activePrintJobIds.delete(jobId);
+    }
+  }).catch((error) => {
+    console.error(`❌ Printer lane rejected job ${jobId}:`, error.message);
+    socket.emit('print_spooler_error', {
+      jobId,
+      error: error.message,
+      ...(jobData?.printerDeviceId ? {
+        printerDeviceId: jobData.printerDeviceId,
+        windowsPrinterName: jobData.windowsPrinterName
+      } : {})
+    });
+  });
+});
+
+const processPhysicalPrintJob = async (jobData) => {
   // Command Injection Prevention (P0)
   if (!jobData.jobId || !/^[a-zA-Z0-9_-]+$/.test(jobData.jobId)) {
     console.error(`❌ REJECTED Job: Invalid jobId format (potential injection): ${jobData.jobId}`);
     return;
   }
 
-  // Idempotency Guard (P0) - Never re-print a previously dispatched job!
-  if (journal.isDispatched(jobData.jobId)) {
-    const existing = journal.getJob(jobData.jobId);
-    if (existing && existing.state === 'AMBIGUOUS_REQUIRES_OPERATOR_REVIEW') {
-      console.error(`❌ REFUSING PRINT: Job ${jobData.jobId} is AMBIGUOUS_REQUIRES_OPERATOR_REVIEW. Physical reprinting is blocked.`);
-      socket.emit('print_spooler_error', { jobId: jobData.jobId, error: 'Job is ambiguous across restart; automatic reprint blocked' });
+  const deviceBound = jobData.printerDeviceId !== undefined && jobData.printerDeviceId !== null;
+  const deviceBinding = deviceBound ? {
+    printerDeviceId: jobData.printerDeviceId,
+    windowsPrinterName: jobData.windowsPrinterName
+  } : {};
+  const existingJournalEntry = journal.getJob(jobData.jobId);
+
+  // A completed journal entry can acknowledge a duplicate only when its immutable
+  // physical-printer identity still matches the database-supplied event.
+  if (existingJournalEntry) {
+    const existingDeviceId = existingJournalEntry.printerDeviceId || null;
+    const existingQueueName = existingJournalEntry.windowsPrinterName || null;
+    if (
+      existingDeviceId !== (deviceBound ? jobData.printerDeviceId : null) ||
+      existingQueueName !== (deviceBound ? jobData.windowsPrinterName : null)
+    ) {
+      socket.emit('print_spooler_error', {
+        jobId: jobData.jobId,
+        error: 'Journal PrinterDevice binding mismatch. Physical dispatch refused.',
+        ...deviceBinding
+      });
       return;
     }
-    console.warn(`⚠️ IDEMPOTENCY GUARD: Job ${jobData.jobId} was already dispatched/printed locally. Refusing duplicate physical print!`);
-    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true });
+  }
+
+  // Duplicate delivery must distinguish durable completion from uncertain
+  // driver handoff. A dispatch intent is NOT proof of physical completion.
+  const replayDisposition = journal.getReplayDisposition(jobData.jobId);
+  if (replayDisposition === 'COMPLETED') {
+    console.warn(`⚠️ IDEMPOTENCY GUARD: Job ${jobData.jobId} has durable local completion evidence. Refusing duplicate physical print.`);
+    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true, ...deviceBinding });
     return;
   }
 
-  // P1-01: Serialization Gate — log if the mutex is already held before queueing
-  if (printMutex.isLocked()) {
-    console.warn(`⚠️ P1-01 SERIALIZATION: Job ${jobData.jobId} queued — printer is busy with job ${printMutex.getHeldJobId()}. Waiting for lock...`);
-  }
-
-  // Record receipt before entering queue (safe — not yet physical dispatch)
-  journal.recordReceived(jobData.jobId, { originalName: jobData.originalName });
-
-  // P1-01: Acquire the serialization lock. This call queues behind any
-  // in-progress physical print job and waits until the lock is released.
-  // A second concurrent call will suspend here until job A completes.
-  let lockHandle;
-  try {
-    lockHandle = await printMutex.acquire(jobData.jobId);
-  } catch (lockErr) {
-    console.error(`❌ P1-01: Failed to acquire serialization lock for Job ${jobData.jobId}: ${lockErr.message}`);
-    socket.emit('print_spooler_error', { jobId: jobData.jobId, error: 'Serialization lock acquisition failed' });
+  if (replayDisposition === 'AMBIGUOUS') {
+    const journalState = existingJournalEntry?.state || 'UNKNOWN';
+    const spoolerMayHaveAccepted = ['DISPATCH_INTENT', 'DISPATCHED_TO_SPOOLER', 'SPOOLER_ACCEPTED', 'SPOOLING'].includes(journalState);
+    const reason = journal.isCorrupted
+      ? `Local journal corrupted/unreadable: ${journal.corruptionReason}. Manual verification required.`
+      : `Duplicate job delivery found journal state "${journalState}" without durable physical-completion evidence. Manual verification required; automatic reprint refused.`;
+    console.warn(`⚠️ AMBIGUOUS DUPLICATE: ${jobData.jobId}: ${reason}`);
+    socket.emit('print_physical_ambiguous', {
+      jobId: jobData.jobId,
+      reason,
+      wasSeenInQueue: spoolerMayHaveAccepted,
+      ...deviceBinding
+    });
     return;
   }
-
-  // Re-check idempotency after lock acquisition (another job may have finished and
-  // the same jobId could have been re-submitted as a duplicate during the wait)
-  if (journal.isDispatched(jobData.jobId)) {
-    const existing = journal.getJob(jobData.jobId);
-    if (existing && existing.state === 'AMBIGUOUS_REQUIRES_OPERATOR_REVIEW') {
-      console.error(`❌ REFUSING PRINT (post-lock): Job ${jobData.jobId} is AMBIGUOUS_REQUIRES_OPERATOR_REVIEW.`);
-      socket.emit('print_spooler_error', { jobId: jobData.jobId, error: 'Job is ambiguous; automatic reprint blocked' });
-      lockHandle.release();
-      return;
-    }
-    console.warn(`⚠️ IDEMPOTENCY GUARD (post-lock): Job ${jobData.jobId} was already dispatched. Refusing duplicate.`);
-    socket.emit('print_physical_success', { jobId: jobData.jobId, alreadyDispatched: true });
-    lockHandle.release();
-    return;
-  }
-
-  console.log(`\n======================================================`);
-  console.log(`📥 NEW PRINT JOB RECEIVED! [Job ID: ${jobData.jobId}]`);
-  console.log(`📄 Document: ${jobData.originalName}`);
-  console.log(`🔒 P1-01: Serialization lock acquired for Job ${jobData.jobId}`);
-  console.log(`======================================================`);
 
   let fileUrl = jobData.fileUrl;
   if (fileUrl && fileUrl.startsWith('https://localhost:5000')) {
@@ -347,13 +587,60 @@ socket.on('physical_print_job', async (jobData) => {
   } else if (fileUrl && !fileUrl.startsWith('http')) {
     fileUrl = `${BACKEND_URL}${fileUrl.startsWith('/') ? '' : '/'}${fileUrl}`;
   }
-
+  
   // Extract original extension (default to .pdf if missing)
   const ext = jobData.originalName ? path.extname(jobData.originalName) : '.pdf';
   const localFilePath = path.join(tempDir, `${jobData.jobId}${ext}`);
   let printFilePath = localFilePath;
+  let targetPrinterName = PRINTER_NAME;
+  let targetSpoolerMonitor = spoolerMonitor;
+  let dispatchLeaseAuthorization = null;
+  let stopDispatchLeaseRenewal = null;
 
   try {
+    if (deviceBound) {
+      if (os.platform() !== 'win32') {
+        throw new Error('Device-bound physical printing is supported only on Windows x64 Agent installations.');
+      }
+      // Refresh on every device-bound job so Admin approvals, disables and remaps
+      // are authoritative before this job chooses a physical Windows queue.
+      await requestLatestPrinterRegistry();
+      if (!fleetProtocolAccepted || !fleetManager) {
+        throw new Error('Authenticated multi-printer registry is unavailable. Device-bound dispatch is blocked.');
+      }
+      if (
+        typeof jobData.printerDeviceId !== 'string' ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(jobData.printerDeviceId) ||
+        typeof jobData.windowsPrinterName !== 'string' ||
+        !jobData.windowsPrinterName.trim() ||
+        jobData.windowsPrinterName.length > 256
+      ) {
+        throw new Error('Device-bound job is missing a valid PrinterDevice ID and exact Windows queue name.');
+      }
+
+      const resolvedDevice = fleetManager.resolveForPrint(jobData.printerDeviceId);
+      if (resolvedDevice.windowsPrinterName !== jobData.windowsPrinterName) {
+        throw new Error('Server job queue name does not match the approved local PrinterDevice registry. Dispatch refused.');
+      }
+      targetPrinterName = resolvedDevice.windowsPrinterName;
+      targetSpoolerMonitor = resolvedDevice.monitor;
+    }
+
+    if (deviceBound && (!targetPrinterName || !targetSpoolerMonitor)) {
+      throw new Error('Device-bound job has no approved physical printer monitor. No legacy fallback is allowed.');
+    }
+
+    journal.recordReceived(jobData.jobId, {
+      originalName: jobData.originalName,
+      ...deviceBinding
+    });
+
+    console.log(`\n======================================================`);
+    console.log(`📥 NEW PRINT JOB RECEIVED! [Job ID: ${jobData.jobId}]`);
+    console.log(`📄 Document: ${jobData.originalName}`);
+    if (deviceBound) console.log(`🖨️ Approved PrinterDevice: ${jobData.printerDeviceId} -> ${targetPrinterName}`);
+    console.log(`======================================================`);
+
     console.log(`⬇️  Downloading PDF from cloud...`);
     const response = await axios({
       method: 'GET',
@@ -381,18 +668,18 @@ socket.on('physical_print_job', async (jobData) => {
 
         // 2. Decrypt File Payload using AES-GCM
         const decipher = crypto.createDecipheriv('aes-256-gcm', decryptedKey, Buffer.from(jobData.iv, 'base64'));
-
+        
         // Extract Auth Tag (last 16 bytes)
         const authTag = fileBuffer.slice(-16);
         const encryptedData = fileBuffer.slice(0, -16);
-
+        
         decipher.setAuthTag(authTag);
-
+        
         const decryptedBuffer = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
         fileBuffer = decryptedBuffer;
-
+        
         console.log(`✅ Decryption successful. Validating page count...`);
-
+        
         // 3. Verify Page Count (Fraud Protection) - Only for PDFs
         const isPdf = fileBuffer.length > 5 && fileBuffer.toString('utf8', 0, 5) === '%PDF-';
         const claimedPages = jobData.pagesToPrint || 1;
@@ -400,7 +687,7 @@ socket.on('physical_print_job', async (jobData) => {
         if (isPdf && pdfParse) {
           const pdfData = await pdfParse(fileBuffer);
           const actualPages = pdfData.numpages;
-
+          
           if (actualPages > claimedPages) {
             throw new Error(`Fraud detected! Claimed pages: ${claimedPages}, Actual pages: ${actualPages}`);
           }
@@ -445,11 +732,11 @@ socket.on('physical_print_job', async (jobData) => {
       }
     }
 
-    if (PRINTER_NAME) {
+    if (targetPrinterName) {
       if (isWin) {
         const ptp = require('pdf-to-printer');
-        const printOptions = { printer: PRINTER_NAME };
-
+        const printOptions = { printer: targetPrinterName };
+        
         if (jobData.settings) {
           if (jobData.settings.copies) printOptions.copies = jobData.settings.copies;
           // Set monochrome: true for B&W, false for explicit color flag in SumatraPDF
@@ -464,19 +751,54 @@ socket.on('physical_print_job', async (jobData) => {
             }
           }
         }
-
+        
         console.log(`⚙️  Windows Print options:`, JSON.stringify(printOptions));
-        journal.recordDispatched(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
+        if (deviceBound) {
+          // The initial fleet refresh can become stale while a large document is
+          // downloading/decrypting. Re-authorize the exact DB job/device/queue
+          // immediately before durable dispatch intent and driver submission.
+          const leaseIdentity = {
+            jobId: jobData.jobId,
+            printerDeviceId: jobData.printerDeviceId,
+            windowsPrinterName: targetPrinterName
+          };
+          dispatchLeaseAuthorization = await dispatchAuthorizer.authorize(leaseIdentity);
+          stopDispatchLeaseRenewal = dispatchAuthorizer.startLeaseRenewal(
+            dispatchLeaseAuthorization,
+            leaseIdentity
+          );
+        }
+        journal.recordDispatchIntent(jobData.jobId, {
+          ...deviceBinding,
+          printerName: targetPrinterName,
+          settings: jobData.settings
+        });
         await ptp.print(printFilePath, printOptions);
+        if (stopDispatchLeaseRenewal) {
+          stopDispatchLeaseRenewal();
+          stopDispatchLeaseRenewal = null;
+        }
+        if (dispatchLeaseAuthorization) {
+          dispatchAuthorizer.releaseLease(dispatchLeaseAuthorization, {
+            jobId: jobData.jobId,
+            printerDeviceId: jobData.printerDeviceId,
+            windowsPrinterName: targetPrinterName
+          });
+          dispatchLeaseAuthorization = null;
+        }
+        journal.recordSpoolerAccepted(jobData.jobId, deviceBinding);
       } else {
         // Linux CUPS Support (Raspberry Pi)
-        const args = ['-d', PRINTER_NAME, '-t', jobData.jobId];
-
+        if (deviceBound) {
+          throw new Error('Device-bound printing cannot use the legacy Linux CUPS path.');
+        }
+        const args = ['-d', targetPrinterName, '-t', jobData.jobId];
+        
         if (jobData.settings) {
           if (jobData.settings.copies) args.push('-n', String(jobData.settings.copies));
           if (jobData.settings.duplex === 'double') args.push('-o', 'sides=two-sided-long-edge');
           else args.push('-o', 'sides=one-sided');
-
+          
           if (jobData.settings.pageRangeType === 'custom' && jobData.settings.customRange) {
             if (/^[0-9,-]+$/.test(jobData.settings.customRange)) {
               args.push('-P', String(jobData.settings.customRange));
@@ -486,53 +808,66 @@ socket.on('physical_print_job', async (jobData) => {
           }
         }
         args.push(printFilePath);
-
+        
         console.log(`⚙️  Linux Print command: lp ${args.join(' ')}`);
-        journal.recordDispatched(jobData.jobId, { printerName: PRINTER_NAME, settings: jobData.settings });
+        journal.recordDispatchIntent(jobData.jobId, {
+          printerName: targetPrinterName,
+          settings: jobData.settings
+        });
         await execFileAsync('lp', args);
+        journal.recordSpoolerAccepted(jobData.jobId);
       }
-
+      
       console.log(`🖨️  SUCCESS: Job ${jobData.jobId} sent to Print Spooler!`);
-
+      
       // Notify backend that spooler accepted the job
-      socket.emit('print_spooler_success', { jobId: jobData.jobId });
+      socket.emit('print_spooler_success', { jobId: jobData.jobId, ...deviceBinding });
+
+      // P3-001: True Print Verification via the monitor bound to this exact queue.
+      targetSpoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket, deviceBinding);
+    } else {
+      // Simulation mode bypass (No physical printer)
+      journal.recordDispatchIntent(jobData.jobId, { mode: 'simulation', ...deviceBinding });
+      journal.recordSpoolerAccepted(jobData.jobId, { mode: 'simulation', ...deviceBinding });
+      targetSpoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket, deviceBinding);
     }
 
-    // P3-001 / P1-01: Await terminal outcome from spooler monitor.
-    // Lock release decision is made based on outcome:
-    //   resolved → verified terminal success → release lock for next job
-    //   rejected with isAmbiguous=true → lock printer permanently (operator required)
-    //   rejected with isAmbiguous=false → definite error, safe to release lock
-    try {
-      await spoolerMonitor.startPollingJob(jobData.jobId, printFilePath, socket);
-      console.log(`🔓 P1-01: Releasing serialization lock after verified completion of Job ${jobData.jobId}`);
-      lockHandle.release();
-    } catch (spoolerErr) {
-      if (spoolerErr.isAmbiguous) {
-        console.error(`🔥 P1-01: Ambiguous outcome for Job ${jobData.jobId} — permanently locking printer. Operator review required.`);
-        printMutex.lockForAmbiguous(jobData.jobId);
-        // lockHandle is superseded by lockForAmbiguous; do NOT call lockHandle.release()
-      } else {
-        // Definite error (physical printer error) — release lock so next job can proceed
-        console.warn(`⚠️ P1-01: Definite error for Job ${jobData.jobId} — releasing lock for next job.`);
-        lockHandle.release();
-      }
-    }
+
 
   } catch (error) {
-    // Pre-dispatch error (download, decrypt, file write, lp/ptp.print call failed)
-    // The physical printer was never successfully contacted → safe to release lock
+    if (stopDispatchLeaseRenewal) {
+      // Keep the backend lease until its short expiry if driver handoff failed or
+      // became ambiguous. Do not release a lease on an uncertain print outcome.
+      stopDispatchLeaseRenewal();
+      stopDispatchLeaseRenewal = null;
+    }
     console.error(`❌ ERROR processing Job ${jobData.jobId}:`, error.message);
-    socket.emit('print_spooler_error', { jobId: jobData.jobId, error: error.message });
-    if (fs.existsSync(localFilePath)) {
-      try { fs.unlinkSync(localFilePath); } catch (_) {}
+    const journalEntry = journal.getJob(jobData.jobId);
+    const mayHaveReachedDriver = journalEntry && [
+      'DISPATCH_INTENT',
+      'DISPATCHED_TO_SPOOLER',
+      'SPOOLER_ACCEPTED',
+      'SPOOLING'
+    ].includes(journalEntry.state);
+
+    if (mayHaveReachedDriver) {
+      socket.emit('print_physical_ambiguous', {
+        jobId: jobData.jobId,
+        reason: `Agent error after durable dispatch intent: ${error.message}`,
+        wasSeenInQueue: false,
+        ...deviceBinding
+      });
+    } else {
+      socket.emit('print_spooler_error', {
+        jobId: jobData.jobId,
+        error: error.message,
+        ...deviceBinding
+      });
     }
-    if (printFilePath !== localFilePath && fs.existsSync(printFilePath)) {
-      try { fs.unlinkSync(printFilePath); } catch (_) {}
-    }
-    lockHandle.release();
+    if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
+    if (printFilePath !== localFilePath && fs.existsSync(printFilePath)) fs.unlinkSync(printFilePath);
   }
-});
+};
 
 // Send heartbeat every 30 seconds to keep machine online status active
 setInterval(() => {

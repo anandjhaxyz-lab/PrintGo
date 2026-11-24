@@ -5,6 +5,18 @@ const AppError = require('../utils/AppError');
 const logger = require('../utils/logger');
 const { getPricingProfile, serializePublicPricingProfile } = require('./pricing.service');
 const { resolveCashfreeEnv } = require('../config/cashfree.config');
+const { isDemoPaymentPermitted, isDemoAccessCodeRequired } = require('../utils/demoPaymentGuard');
+const { DEFAULT_PAYMENT_MODE } = require('../constants/paymentModes');
+const { getMachineAvailability } = require('./printerAvailability.service');
+
+const isMultiPrinterDispatchEnabled = () => process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true';
+const isLegacyPlaceholderDevice = (device) => Boolean(
+  device &&
+  device.isDefault === true &&
+  device.status === 'DISCOVERY_REQUIRED' &&
+  !device.approvedAt &&
+  !device.windowsPrinterName
+);
 
 /**
  * Validates that an IP or hostname is not private/loopback in production.
@@ -92,6 +104,95 @@ const verifyMachineAccess = async (machineId, user) => {
 };
 
 /**
+ * Verifies that a PrinterDevice is approved, active, queue-bound, and belongs
+ * to a Machine the current operator is allowed to manage.
+ */
+const verifyPrinterDeviceAccess = async (printerDeviceId, user = null) => {
+  if (!printerDeviceId) throw new AppError('printerDeviceId is required', 400);
+  const device = await prisma.printerDevice.findUnique({
+    where: { id: printerDeviceId },
+    include: {
+      machine: {
+        select: { id: true, name: true, location: true, status: true, printerModel: true, paymentMode: true, companyId: true }
+      }
+    }
+  });
+  if (!device || !device.machine) throw new AppError('Target physical printer was not found', 404);
+  if (user && user.role !== 'SUPERADMIN') {
+    if (!user.companyId || !device.machine?.companyId || device.machine.companyId !== user.companyId) {
+      throw new AppError('Access denied: You do not have permission to manage this physical printer', 403);
+    }
+  }
+  if (device.machine.status !== 'ACTIVE') {
+    throw new AppError('Cannot create a customer QR for a suspended or inactive Machine', 409);
+  }
+  if (device.status !== 'ACTIVE' || !device.approvedAt || !device.windowsPrinterName?.trim()) {
+    throw new AppError('PrinterDevice must be explicitly approved, ACTIVE and bound to an exact Windows queue before QR creation', 409);
+  }
+  return device;
+};
+
+/**
+ * Generates a permanent QR bound to one approved physical PrinterDevice.
+ * Multiple ACTIVE device QRs may coexist on one Machine; only one is allowed per Device.
+ */
+const generatePrinterDeviceQr = async (printerDeviceId, data = {}, user = null) => {
+  if (!isMultiPrinterDispatchEnabled()) {
+    throw new AppError('Device-specific customer QR activation is locked until per-printer Agent dispatch is enabled.', 503);
+  }
+  const device = await verifyPrinterDeviceAccess(printerDeviceId, user);
+  const existingActive = await prisma.printerQr.findFirst({
+    where: { printerDeviceId: device.id, status: 'ACTIVE' }
+  });
+  if (existingActive) {
+    throw new AppError('An active QR already exists for this physical printer. Use replace to rotate it.', 409);
+  }
+
+  const rawLabel = typeof data.label === 'string' ? data.label.trim() : '';
+  const label = rawLabel || device.displayName;
+  if (!label || label.length > 120) {
+    throw new AppError('QR label must be a non-empty value of at most 120 characters.', 400);
+  }
+  const operatorId = user ? (user.id || user.email) : 'SYSTEM';
+  let created = null;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const publicCode = generateSecurePublicCode();
+    try {
+      created = await prisma.printerQr.create({
+        data: {
+          publicCode,
+          label,
+          status: 'ACTIVE',
+          machineId: device.machineId,
+          printerDeviceId: device.id,
+          generatedBy: operatorId
+        },
+        include: {
+          machine: { select: { id: true, name: true, location: true, status: true, printerModel: true } },
+          printerDevice: { select: { id: true, displayName: true, printerModel: true, status: true } }
+        }
+      });
+      break;
+    } catch (error) {
+      if (error.code === 'P2002') {
+        const target = error.meta?.target;
+        const targetText = typeof target === 'string' ? target : JSON.stringify(target || '');
+        if (targetText.includes('printerDeviceId') || targetText.includes('printer_qrs_printer_device_active_unique')) {
+          throw new AppError('An active QR already exists for this physical printer. Use replace to rotate it.', 409);
+        }
+        if (attempt < 2) continue;
+      }
+      throw error;
+    }
+  }
+
+  if (!created) throw new AppError('Failed to generate a unique public QR code after retries', 500);
+  logger.info(`Generated permanent device QR [${created.publicCode}] for device [${device.id}] on Machine [${device.machineId}] by [${operatorId}]`);
+  return { ...created, targetUrl: getPublicQrUrl(created.publicCode) };
+};
+
+/**
  * Generates a new permanent dedicated QR code for a printer.
  * Strict Invariant: A machine may have at most one ACTIVE PrinterQr record.
  * Rejects with HTTP 409 if an ACTIVE QR already exists.
@@ -112,7 +213,11 @@ const generatePrinterQr = async (machineId, data = {}, user = null) => {
   const existingActive = await prisma.printerQr.findFirst({
     where: {
       machineId: machine.id,
-      status: 'ACTIVE'
+      status: 'ACTIVE',
+      OR: [
+        { printerDeviceId: null },
+        { printerDevice: { is: { isDefault: true, status: 'DISCOVERY_REQUIRED', approvedAt: null, windowsPrinterName: null } } }
+      ]
     }
   });
 
@@ -152,7 +257,11 @@ const generatePrinterQr = async (machineId, data = {}, user = null) => {
       if (err.code === 'P2002') {
         const target = err.meta && (err.meta.target || JSON.stringify(err.meta));
         const targetStr = typeof target === 'string' ? target : JSON.stringify(target);
-        if (targetStr.includes('machineId') || targetStr.includes('printer_qrs_machine_id_active_unique')) {
+        if (
+          targetStr.includes('machineId') ||
+          targetStr.includes('printer_qrs_machine_id_active_unique') ||
+          targetStr.includes('printer_qrs_machine_id_legacy_active_unique')
+        ) {
           throw new AppError('An active dedicated QR already exists for this printer. Use replace to rotate.', 409);
         }
         // If publicCode collided (astronomically rare), retry
@@ -187,11 +296,23 @@ const listPrinterQrs = async (user, query = {}) => {
 
   // Role scoping: non-superadmin users only see QRs for their company's machines
   if (user && user.role !== 'SUPERADMIN') {
+    if (!user.companyId) {
+      return { qrs: [], total: 0, page: Math.max(1, Number(page)), totalPages: 0 };
+    }
     where.machine = { companyId: user.companyId };
   }
 
   if (machineId) {
     where.machineId = machineId;
+  }
+  if (query.printerDeviceId) where.printerDeviceId = String(query.printerDeviceId);
+  if (query.legacyOnly === true || query.legacyOnly === 'true') {
+    where.AND = [{
+      OR: [
+        { printerDeviceId: null },
+        { printerDevice: { is: { isDefault: true, status: 'DISCOVERY_REQUIRED', approvedAt: null, windowsPrinterName: null } } }
+      ]
+    }];
   }
 
   if (status) {
@@ -214,6 +335,9 @@ const listPrinterQrs = async (user, query = {}) => {
       include: {
         machine: {
           select: { id: true, name: true, location: true, status: true, printerModel: true, companyId: true }
+        },
+        printerDevice: {
+          select: { id: true, displayName: true, printerModel: true, status: true, windowsPrinterName: true }
         },
         _count: {
           select: { sessions: true }
@@ -250,6 +374,20 @@ const getPrinterQrById = async (id, user = null) => {
     include: {
       machine: {
         select: { id: true, name: true, location: true, status: true, printerModel: true, companyId: true }
+      },
+      printerDevice: {
+        select: {
+          id: true,
+          machineId: true,
+          displayName: true,
+          printerModel: true,
+          windowsPrinterName: true,
+          status: true,
+          approvedAt: true,
+          isDefault: true,
+          healthStatus: true,
+          lastTelemetryAt: true
+        }
       },
       sessions: {
         take: 20,
@@ -295,6 +433,7 @@ const revokePrinterQr = async (id, reason, user) => {
       `SELECT pq.*, m."companyId" as machine_company_id
        FROM "PrinterQr" pq
        LEFT JOIN "Machine" m ON pq."machineId" = m.id
+       LEFT JOIN "PrinterDevice" pd ON pq."printerDeviceId" = pd.id
        WHERE pq.id = $1
        FOR UPDATE OF pq`,
       id
@@ -387,6 +526,20 @@ const replacePrinterQr = async (id, data = {}, user = null) => {
     if (existingQr.status === 'REPLACED') {
       throw new AppError('This QR code has already been replaced', 400);
     }
+    if (existingQr.printerDeviceId) {
+      const device = await tx.printerDevice.findUnique({ where: { id: existingQr.printerDeviceId } });
+      if (!device || device.machineId !== existingQr.machineId) {
+        throw new AppError('This QR code has an invalid physical printer mapping.', 403);
+      }
+      if (!isLegacyPlaceholderDevice(device)) {
+        if (!isMultiPrinterDispatchEnabled()) {
+          throw new AppError('Device-specific QR rotation is locked until per-printer Agent dispatch is enabled.', 503);
+        }
+        if (!device || device.machineId !== existingQr.machineId || device.status !== 'ACTIVE' || !device.approvedAt || !device.windowsPrinterName) {
+          throw new AppError('The mapped physical printer is no longer approved and ACTIVE. QR rotation is blocked.', 409);
+        }
+      }
+    }
 
     const archivedOldQr = await tx.printerQr.update({
       where: { id },
@@ -404,6 +557,7 @@ const replacePrinterQr = async (id, data = {}, user = null) => {
         label,
         status: 'ACTIVE',
         machineId: existingQr.machineId,
+        printerDeviceId: existingQr.printerDeviceId || null,
         generatedBy: operatorId
       },
       include: {
@@ -451,9 +605,19 @@ const resolvePrinterQr = async (publicCode) => {
               m.name as machine_name,
               m."printerModel" as machine_printer_model,
               m.location as machine_location,
-              m.status as machine_status
+              m.status as machine_status,
+              m."paymentMode" as machine_payment_mode,
+              pd.id as printer_device_id,
+              pd."machineId" as printer_device_machine_id,
+              pd."displayName" as printer_device_display_name,
+              pd."printerModel" as printer_device_model,
+              pd."windowsPrinterName" as printer_device_windows_printer_name,
+              pd.status as printer_device_status,
+              pd."approvedAt" as printer_device_approved_at,
+              pd."isDefault" as printer_device_is_default
        FROM "PrinterQr" pq
        LEFT JOIN "Machine" m ON pq."machineId" = m.id
+       LEFT JOIN "PrinterDevice" pd ON pq."printerDeviceId" = pd.id
        WHERE pq."publicCode" = $1
        FOR UPDATE OF pq`,
       cleanCode
@@ -476,6 +640,18 @@ const resolvePrinterQr = async (publicCode) => {
     if (lockedQr.status !== 'ACTIVE') {
       throw new AppError('This printer QR code is currently inactive.', 403);
     }
+    const legacyPlaceholderDevice = lockedQr.printerDeviceId && isLegacyPlaceholderDevice({
+      isDefault: lockedQr.printer_device_is_default,
+      status: lockedQr.printer_device_status,
+      approvedAt: lockedQr.printer_device_approved_at,
+      windowsPrinterName: lockedQr.printer_device_windows_printer_name
+    });
+    if (lockedQr.printerDeviceId && (!lockedQr.printer_device_id || lockedQr.printer_device_machine_id !== lockedQr.machine_id)) {
+      throw new AppError('This QR code has an invalid physical printer mapping.', 403);
+    }
+    if (lockedQr.printerDeviceId && !legacyPlaceholderDevice && !isMultiPrinterDispatchEnabled()) {
+      throw new AppError('This physical printer QR is not active yet. Please contact shop staff.', 503);
+    }
 
     if (!lockedQr.machineId || !lockedQr.machine_id) {
       throw new AppError('This QR code is not bound to a registered printer.', 400);
@@ -484,29 +660,48 @@ const resolvePrinterQr = async (publicCode) => {
     if (lockedQr.machine_status !== 'ACTIVE') {
       throw new AppError('This printer is currently offline or undergoing maintenance. Please contact shop staff.', 403);
     }
+    // Device QR must still point at the same approved active child printer.
+    // Legacy Machine-level QR records (printerDeviceId NULL) retain their behavior.
+    if (lockedQr.printerDeviceId && !legacyPlaceholderDevice) {
+      if (
+        lockedQr.printer_device_id !== lockedQr.printerDeviceId ||
+        lockedQr.printer_device_status !== 'ACTIVE' ||
+        !lockedQr.printer_device_approved_at ||
+        !lockedQr.printer_device_windows_printer_name
+      ) {
+        throw new AppError('This physical printer is no longer approved or active. Please contact shop staff.', 403);
+      }
+    }
 
     // Create a brand new ephemeral customer session inside transaction
     const sessionCode = crypto.randomBytes(6).toString('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 mins
+    const sessionPaymentMode = lockedQr.machine_payment_mode || DEFAULT_PAYMENT_MODE;
 
     const createdSession = await tx.session.create({
       data: {
         code: sessionCode,
         machineId: lockedQr.machine_id,
         printerQrId: lockedQr.id,
+        // Historic Phase 1 placeholder rows preserve Machine-level QR behavior.
+        printerDeviceId: legacyPlaceholderDevice ? null : (lockedQr.printerDeviceId || null),
         status: 'WAITING_FOR_MOBILE',
+        paymentMode: sessionPaymentMode,
         expiresAt
       }
     });
 
     return { qr: lockedQr, session: createdSession };
-  });
+  }, { maxWait: 10000, timeout: 10000 });
+
+  const effectivePaymentMode = session.paymentMode || qr.machine_payment_mode || DEFAULT_PAYMENT_MODE;
 
   // Mint signed JWT session token
   const sessionToken = jwt.sign(
     {
       sessionId: session.code,
       machineId: qr.machine_id,
+      paymentMode: effectivePaymentMode,
       type: 'session',
       role: 'mobile'
     },
@@ -518,20 +713,39 @@ const resolvePrinterQr = async (publicCode) => {
   const pricingProfile = serializePublicPricingProfile(rawProfile);
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
-  logger.info(`Customer scanned QR [${qr.publicCode}]; created fresh session [${session.code}] bound to printer [${qr.machine_id}]`);
+  const availability = await getMachineAvailability(qr.machine_id, prisma);
+  const isReady = availability ? availability.isReady : false;
+  const hardwareStatus = availability ? availability.status : 'UNKNOWN';
+  const statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
+
+  logger.info(`Customer scanned QR [${qr.publicCode}]; created fresh session [${session.code}] bound to printer [${qr.machine_id}] (Status: ${hardwareStatus}, PaymentMode: ${effectivePaymentMode})`);
 
   return {
     success: true,
     sessionCode: session.code,
     sessionToken,
     expiresAt: session.expiresAt,
+    paymentMode: effectivePaymentMode,
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
+    enableDemoPayment: effectivePaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted(),
+    demoAccessCodeRequired: effectivePaymentMode === 'DEMO_SIMULATION' && isDemoPaymentPermitted() && isDemoAccessCodeRequired(),
     printer: {
-      name: qr.machine_name,
-      model: qr.machine_printer_model || 'EPSON L6460 Series',
-      location: qr.machine_location || 'Front Desk',
-      isOnline: qr.machine_status === 'ACTIVE'
+      name: qr.printer_device_display_name && !isLegacyPlaceholderDevice({
+        isDefault: qr.printer_device_is_default,
+        status: qr.printer_device_status,
+        approvedAt: qr.printer_device_approved_at,
+        windowsPrinterName: qr.printer_device_windows_printer_name
+      }) ? qr.printer_device_display_name : (qr.machine_name || availability?.name),
+      model: qr.printer_device_model || qr.machine_printer_model || availability?.printerModel || 'Unknown',
+      location: qr.machine_location || availability?.location || 'Front Desk',
+      isOnline: isReady,
+      hardwareStatus,
+      statusMessage,
+      agentOnline: availability ? availability.agentOnline : false,
+      paperStatus: availability ? availability.paperStatus : 'UNKNOWN',
+      tonerStatus: availability ? availability.tonerStatus : 'UNKNOWN',
+      jamStatus: availability ? availability.jamStatus : false
     }
   };
 };
@@ -550,7 +764,21 @@ const getPublicPrinterQrInfo = async (publicCode) => {
     where: { publicCode: publicCode.trim() },
     include: {
       machine: {
-        select: { id: true, name: true, location: true, status: true, printerModel: true }
+        select: { id: true, name: true, location: true, status: true, printerModel: true, paymentMode: true }
+      },
+      printerDevice: {
+        select: {
+          id: true,
+          machineId: true,
+          displayName: true,
+          printerModel: true,
+          windowsPrinterName: true,
+          status: true,
+          approvedAt: true,
+          isDefault: true,
+          healthStatus: true,
+          lastTelemetryAt: true
+        }
       }
     }
   });
@@ -562,26 +790,120 @@ const getPublicPrinterQrInfo = async (publicCode) => {
   if (qr.status === 'REVOKED' || qr.status === 'REPLACED') {
     throw new AppError(`This printer QR code has been ${qr.status.toLowerCase()}. Please scan the updated QR flyer on the printer counter.`, 410);
   }
-
   if (!qr.machineId || !qr.machine) {
     throw new AppError('This QR code is not bound to a registered printer.', 400);
+  }
+  const legacyPlaceholderDevice = qr.printerDeviceId && isLegacyPlaceholderDevice(qr.printerDevice);
+  if (qr.printerDeviceId && (!qr.printerDevice || qr.printerDevice.machineId !== qr.machineId)) {
+    throw new AppError('This QR code references an invalid physical printer mapping.', 403);
+  }
+  if (qr.printerDeviceId && !legacyPlaceholderDevice && !isMultiPrinterDispatchEnabled()) {
+    throw new AppError('This physical printer QR is not active yet. Please contact shop staff.', 503);
+  }
+  if (qr.printerDeviceId && !legacyPlaceholderDevice) {
+    if (
+      qr.printerDevice.machineId !== qr.machineId ||
+      qr.printerDevice.status !== 'ACTIVE' ||
+      !qr.printerDevice.approvedAt ||
+      !qr.printerDevice.windowsPrinterName
+    ) {
+      throw new AppError('This physical printer is no longer approved or active.', 403);
+    }
   }
 
   const rawProfile = await getPricingProfile(qr.machine.id);
   const pricingProfile = serializePublicPricingProfile(rawProfile);
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
+  const availability = await getMachineAvailability(qr.machine.id, prisma);
+  let isReady = availability ? availability.isReady : false;
+  let hardwareStatus = availability ? availability.status : 'UNKNOWN';
+  let statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
+  let lastTelemetryAt = null;
+  let resolvedDeviceId = qr.printerDevice && !legacyPlaceholderDevice ? qr.printerDevice.id : null;
+  let resolvedDeviceHealth = qr.printerDevice && !legacyPlaceholderDevice ? qr.printerDevice.healthStatus : null;
+  let resolvedPrinterModel = qr.printerDevice?.printerModel || qr.machine.printerModel || 'Unknown';
+
+  if (qr.printerDevice && !legacyPlaceholderDevice) {
+    lastTelemetryAt = qr.printerDevice.lastTelemetryAt ? qr.printerDevice.lastTelemetryAt.toISOString() : null;
+    const devHealth = qr.printerDevice.healthStatus || 'UNKNOWN';
+    if (!availability || !availability.agentOnline) {
+      hardwareStatus = 'AGENT_OFFLINE';
+      isReady = false;
+      statusMessage = 'Printer Agent Offline';
+    } else if (devHealth === 'ONLINE') {
+      hardwareStatus = 'ONLINE';
+      isReady = true;
+      statusMessage = 'Printer Ready';
+    } else if (devHealth === 'PAPER_OUT') {
+      hardwareStatus = 'PAPER_OUT';
+      isReady = false;
+      statusMessage = 'Out of Paper';
+    } else if (devHealth === 'JAMMED') {
+      hardwareStatus = 'JAMMED';
+      isReady = false;
+      statusMessage = 'Paper Jam';
+    } else if (devHealth === 'OFFLINE') {
+      hardwareStatus = 'OFFLINE';
+      isReady = false;
+      statusMessage = 'Physical Printer Offline';
+    } else {
+      hardwareStatus = 'ERROR';
+      isReady = false;
+      statusMessage = 'Printer Error';
+    }
+  } else if (!qr.printerDeviceId && prisma.printerDevice) {
+    // Machine-level QR: resolve the machine's sole eligible active default device
+    const activeDefaults = await prisma.printerDevice.findMany({
+      where: {
+        machineId: qr.machine.id,
+        status: 'ACTIVE',
+        approvedAt: { not: null },
+        isDefault: true
+      },
+      select: {
+        id: true,
+        displayName: true,
+        printerModel: true,
+        healthStatus: true,
+        lastTelemetryAt: true
+      }
+    });
+
+    if (activeDefaults.length === 1) {
+      const defaultDevice = activeDefaults[0];
+      resolvedDeviceId = defaultDevice.id;
+      resolvedDeviceHealth = defaultDevice.healthStatus || null;
+      if (defaultDevice.lastTelemetryAt) {
+        lastTelemetryAt = defaultDevice.lastTelemetryAt.toISOString();
+      }
+      if (defaultDevice.printerModel) {
+        resolvedPrinterModel = defaultDevice.printerModel;
+      }
+    }
+  }
+
   return {
     success: true,
     status: qr.status,
     label: qr.label,
+    paymentMode: qr.machine.paymentMode || DEFAULT_PAYMENT_MODE,
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
     printer: {
-      name: qr.machine.name,
-      model: qr.machine.printerModel || 'EPSON L6460 Series',
+      name: !legacyPlaceholderDevice && qr.printerDevice?.displayName ? qr.printerDevice.displayName : qr.machine.name,
+      model: resolvedPrinterModel,
       location: qr.machine.location,
-      isOnline: qr.machine.status === 'ACTIVE'
+      isOnline: isReady,
+      hardwareStatus,
+      statusMessage,
+      lastTelemetryAt,
+      deviceHealth: resolvedDeviceHealth,
+      printerDeviceId: resolvedDeviceId,
+      agentOnline: availability ? availability.agentOnline : false,
+      paperStatus: availability ? availability.paperStatus : 'UNKNOWN',
+      tonerStatus: availability ? availability.tonerStatus : 'UNKNOWN',
+      jamStatus: availability ? availability.jamStatus : false
     }
   };
 };
@@ -590,11 +912,13 @@ module.exports = {
   getPublicQrUrl,
   generateSecurePublicCode,
   generatePrinterQr,
+  generatePrinterDeviceQr,
   listPrinterQrs,
   getPrinterQrById,
   revokePrinterQr,
   replacePrinterQr,
   resolvePrinterQr,
   getPublicPrinterQrInfo,
-  verifyMachineAccess
+  verifyMachineAccess,
+  verifyPrinterDeviceAccess
 };

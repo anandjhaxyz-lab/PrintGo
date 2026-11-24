@@ -1,175 +1,420 @@
-const { Queue, Worker } = require('bullmq');
+﻿const { Queue, Worker } = require('bullmq');
 const { connection } = require('./redisClient');
 const prisma = require('../utils/prisma');
 const { isValidJobTransition } = require('../utils/stateMachine');
 
-let printQueue = null;
-let useRedis = !!process.env.REDIS_HOST; // Use Redis if configured
+/**
+ * A queue item must never disappear while leaving a paid device-bound job in
+ * WAITING. If authorization fails before Agent dispatch, terminally fail the
+ * job, record the reason, notify watchers, and refund a successful payment.
+ */
+const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
+  if (!job?.shortId || !job?.printerDeviceId || !['WAITING', 'PRINTING'].includes(expectedStatus)) {
+    return false;
+  }
+  // WAITING jobs have not entered the Agent/driver path and may only be
+  // CANCELLED; once claimed as PRINTING, the state machine allows FAILED.
+  const terminalStatus = expectedStatus === 'WAITING' ? 'CANCELLED' : 'FAILED';
+  if (!isValidJobTransition(expectedStatus, terminalStatus)) {
+    console.error(`Job ${job.shortId}: state machine rejected dispatch-block transition from ${expectedStatus} to ${terminalStatus}.`);
+    return false;
+  }
 
-try {
-  if (useRedis) {
+  const updateResult = await prisma.printJob.updateMany({
+    where: {
+      shortId: job.shortId,
+      status: expectedStatus,
+      printerDeviceId: job.printerDeviceId
+    },
+    data: { status: terminalStatus }
+  });
+  if (updateResult.count !== 1) {
+    console.warn(`Job ${job.shortId}: dispatch failure was not applied because its state/binding changed concurrently.`);
+    return false;
+  }
+
+  const errorDetails = `Device dispatch refused [${code}]: ${reason}`;
+  try {
+    await prisma.printHistory.create({
+      data: {
+        printJobId: job.id,
+        success: false,
+        errorDetails,
+        completedAt: new Date()
+      }
+    });
+  } catch (historyError) {
+    console.error(`Job ${job.shortId}: could not write dispatch refusal history:`, historyError.message);
+  }
+
+  const statusEvent = {
+    id: job.id,
+    shortId: job.shortId,
+    status: terminalStatus,
+    error: reason,
+    code
+  };
+  if (globalIo) {
+    if (job.machineId) globalIo.to(`machine_${job.machineId}`).emit('job_status_changed', statusEvent);
+    globalIo.to(`job_${job.shortId}`).emit('job_status_changed', statusEvent);
+    if (job.machine?.companyId) {
+      globalIo.to(`company_${job.machine.companyId}`).emit('job_status_changed', statusEvent);
+    }
+    globalIo.to('superadmins').emit('job_status_changed', statusEvent);
+    globalIo.to('admins').emit('job_status_changed', statusEvent);
+  }
+
+  if (job.paymentId && job.payment?.status === 'SUCCESS') {
+    try {
+      const paymentsService = require('../modules/payments/payments.service');
+      await paymentsService.refundPayment(
+        job.shortId,
+        null,
+        `Automatic refund: physical printer dispatch was blocked (${code}). ${reason}`,
+        {
+          initiatedBy: 'SYSTEM',
+          preserveJobStatus: true,
+          idempotencyKey: `device_dispatch_blocked_${job.id}_${job.paymentId}`
+        }
+      );
+    } catch (refundError) {
+      console.error(`Job ${job.shortId}: automatic refund failed after dispatch refusal:`, refundError.message);
+      try {
+        const idempotencyKey = `device_dispatch_blocked_${job.id}_${job.paymentId}`;
+        const existingFailed = await prisma.refund.findFirst({
+          where: {
+            OR: [
+              { idempotencyKey },
+              { paymentId: job.paymentId, printJobId: job.id }
+            ]
+          }
+        });
+        let failedRefundId = existingFailed?.id;
+        if (!existingFailed) {
+          const refundRecord = await prisma.refund.create({
+            data: {
+              idempotencyKey,
+              paymentId: job.paymentId,
+              printJobId: job.id,
+              gatewayRefundId: `ref_blocked_${job.shortId}_${Date.now()}`,
+              amount: job.payment?.amount || 0,
+              currency: job.payment?.currency || 'INR',
+              reason: `Automatic refund failed after physical printer dispatch blocked (${code}): ${reason}`,
+              status: 'FAILED',
+              failureReason: refundError.message,
+              retryEligible: true,
+              initiatedBy: 'SYSTEM'
+            }
+          });
+          failedRefundId = refundRecord.id;
+        }
+        await prisma.reconciliationRecord.create({
+          data: {
+            paymentId: job.paymentId,
+            refundId: failedRefundId || null,
+            printJobId: job.id,
+            status: 'PENDING_RECONCILIATION',
+            discrepancyType: 'FAILED_AUTOMATIC_REFUND',
+            details: JSON.stringify({
+              code,
+              reason,
+              error: refundError.message,
+              jobShortId: job.shortId
+            })
+          }
+        }).catch(() => {});
+      } catch (recordError) {
+        console.error(`Failed to record persistent refund failure for job ${job.shortId}:`, recordError.message);
+      }
+    }
+  }
+
+  console.warn(`Job ${job.shortId} was marked ${terminalStatus} because device dispatch was refused [${code}].`);
+  return true;
+};
+
+const isProductionRuntime = process.env.NODE_ENV === 'production';
+const isRedisRequired = isProductionRuntime || process.env.QUEUE_REDIS_REQUIRED === 'true';
+
+let printQueue = null;
+let printWorker = null;
+let workerReady = false;
+let useRedis = Boolean(connection);
+
+if (!useRedis) {
+  if (isRedisRequired) {
+    throw new Error('PrintGo production queue requires Redis; refusing to initialize an in-memory print queue.');
+  }
+  console.warn('BullMQ is not configured; using the development/test in-memory fallback.');
+} else {
+  try {
     printQueue = new Queue('printQueue', { connection });
-  } else {
-    throw new Error('REDIS_HOST not configured');
+  } catch (error) {
+    if (isRedisRequired) {
+      throw new Error(`Failed to initialize the durable print queue: ${error.message}`);
+    }
+    console.warn('BullMQ initialization failed, using the development/test in-memory fallback:', error.message);
+    useRedis = false;
   }
-} catch(e) {
-  if (process.env.NODE_ENV === 'production') {
-    console.warn("⚠️ WARNING: BullMQ requires Redis in production for reliable scaling. Falling back to in-memory queue (not recommended for multi-instance deployments).");
-  } else {
-    console.warn("BullMQ initialization failed, using in-memory queue fallback.");
-  }
-  useRedis = false;
 }
 
 let globalIo = null;
 
 const processJob = async (shortId) => {
   try {
-    // 1. Atomic conditional claim: transition strictly from WAITING -> PRINTING
-    const claimResult = await prisma.printJob.updateMany({
+    const dbJob = await prisma.printJob.findUnique({
+      where: { shortId },
+      include: { document: true, printerDevice: true, payment: true }
+    });
+    if (!dbJob) return;
+
+    // Device-bound jobs are dispatched only after the explicit feature gate and
+    // a fresh DB check of Machine ownership, approval evidence and exact queue.
+    // Legacy Machine-QR jobs (printerDeviceId=null) retain the original route.
+    if (dbJob.printerDeviceId) {
+      const device = dbJob.printerDevice;
+      let blockedCode = null;
+      let blockedReason = null;
+      if (process.env.ENABLE_MULTI_PRINTER_DISPATCH !== 'true') {
+        blockedCode = 'DISPATCH_FEATURE_DISABLED';
+        blockedReason = 'Multi-printer dispatch is disabled. Please contact shop staff for assistance.';
+      } else if (
+        !device ||
+        device.id !== dbJob.printerDeviceId ||
+        device.machineId !== dbJob.machineId ||
+        device.status !== 'ACTIVE' ||
+        !device.approvedAt ||
+        typeof device.windowsPrinterName !== 'string' ||
+        !device.windowsPrinterName.trim()
+      ) {
+        blockedCode = 'PRINTER_DEVICE_UNAVAILABLE';
+        blockedReason = 'The selected physical printer is no longer approved, active or correctly mapped. Please contact shop staff.';
+      } else if (
+        typeof dbJob.printerWindowsQueueName !== 'string' ||
+        !dbJob.printerWindowsQueueName.trim() ||
+        dbJob.printerWindowsQueueName !== device.windowsPrinterName
+      ) {
+        blockedCode = 'PRINTER_QUEUE_SNAPSHOT_MISMATCH';
+        blockedReason = 'The printer queue mapping changed after this job was created. This job was not submitted to a different queue; please create a new print job.';
+      }
+
+      if (blockedCode) {
+        await failBlockedDeviceDispatch(dbJob, 'WAITING', blockedCode, blockedReason);
+        return;
+      }
+    }
+
+    // Validate state transition using state machine
+    if (!isValidJobTransition(dbJob.status, 'PRINTING')) {
+      console.warn(`Job ${shortId}: cannot transition from ${dbJob.status} to PRINTING, skipping`);
+      return;
+    }
+
+    // Atomic test-and-set: guarantee exactly-once transition from WAITING to PRINTING
+    // Ensures concurrent dispatches, interruptions, and admin retries cannot duplicate physical prints
+    const updateResult = await prisma.printJob.updateMany({
       where: {
         shortId,
-        status: 'WAITING'
+        status: 'WAITING',
+        printerDeviceId: dbJob.printerDeviceId || null
       },
-      data: {
-        status: 'PRINTING'
-      }
+      data: { status: 'PRINTING' }
     });
 
-    if (claimResult.count === 0) {
-      // Check current job status to provide clear, observable logging
-      const existingJob = await prisma.printJob.findUnique({
-        where: { shortId },
-        select: { id: true, status: true }
-      });
-      if (!existingJob) {
-        console.warn(`Job ${shortId}: not found in database, skipping`);
-      } else {
-        console.warn(`Job ${shortId}: cannot claim for printing (current status: ${existingJob.status}), skipping duplicate/invalid dispatch`);
-      }
-      return null;
+    if (updateResult.count === 0) {
+      console.warn(`Job ${shortId}: cannot claim WAITING lock (job is already printing or processed), skipping physical print dispatch`);
+      return;
     }
 
-    // 2. Job claimed atomically. Fetch document and full details for physical print dispatch.
     const updatedJob = await prisma.printJob.findUnique({
       where: { shortId },
-      include: { document: true }
+      include: { document: true, printerDevice: true, payment: true }
     });
 
-    if (!updatedJob) {
-      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: claimed successfully but record could not be re-fetched from database`);
-      return null;
-    }
-
-    // Check document presence
-    if (!updatedJob.document || !updatedJob.document.filename) {
-      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: missing document or filename. Cannot print. Marking job FAILED.`);
-      await prisma.printJob.update({
-        where: { shortId },
-        data: { status: 'FAILED' }
-      });
-      return null;
-    }
-
-    // Check machine assignment
-    if (!updatedJob.machineId) {
-      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: no machineId assigned. Cannot route to printer. Marking job FAILED.`);
-      await prisma.printJob.update({
-        where: { shortId },
-        data: { status: 'FAILED' }
-      });
-      return null;
+    // Re-check immediately before sending the Agent event. A concurrent Admin
+    // disable/remap after the initial read must fail closed, never fall back.
+    if (updatedJob?.printerDeviceId) {
+      const device = updatedJob.printerDevice;
+      const deviceStillValid = Boolean(
+        process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true' &&
+        device &&
+        device.id === updatedJob.printerDeviceId &&
+        device.machineId === updatedJob.machineId &&
+        device.status === 'ACTIVE' &&
+        device.approvedAt &&
+        typeof device.windowsPrinterName === 'string' &&
+        device.windowsPrinterName.trim() &&
+        typeof updatedJob.printerWindowsQueueName === 'string' &&
+        updatedJob.printerWindowsQueueName.trim() &&
+        updatedJob.printerWindowsQueueName === device.windowsPrinterName
+      );
+      if (!deviceStillValid) {
+        await failBlockedDeviceDispatch(
+          updatedJob,
+          'PRINTING',
+          'PRINTER_DEVICE_CHANGED_BEFORE_DISPATCH',
+          'The selected physical printer changed or became unavailable before Agent dispatch. Please contact shop staff.'
+        );
+        return;
+      }
     }
 
     if (globalIo) {
-      // Emit status change to machine room + admins only
-      // Emit status change is now handled universally by Prisma $extends
-      
-      const printData = {
-        jobId: updatedJob.shortId,
-        fileUrl: updatedJob.document.filename.replace(/^https:\/\/localhost:5000/, 'http://localhost:5000'),
-        originalName: updatedJob.document.originalName || '',
-        pagesToPrint: updatedJob.pagesToPrint,
-        settings: {
-          color: updatedJob.color,
-          duplex: updatedJob.duplex,
-          copies: updatedJob.copies,
-          pageRangeType: updatedJob.pageRangeType,
-          customRange: updatedJob.customRange
-        },
-        price: updatedJob.cost,
-        encryptedKey: updatedJob.encryptedKey,
-        iv: updatedJob.iv
-      };
-      
-      try {
-        globalIo.to(`machine_${updatedJob.machineId}`).emit('physical_print_job', printData);
-      } catch (socketErr) {
-        console.error(`[POST_CLAIM_ERROR] Job ${shortId}: Socket emission to machine_${updatedJob.machineId} failed: ${socketErr.message}`);
-        // Ambiguous-job safety:
-        // Do NOT reset to WAITING because physical print dispatch may already have partially occurred.
-        // Leaving in PRINTING guarantees the 15-minute recovery cleaner safely marks FAILED and refunds if unacknowledged.
-        throw socketErr;
+        // Emit status change to machine room + admins only
+        // Emit status change is now handled universally by Prisma $extends
+        
+        const printData = {
+          jobId: updatedJob.shortId,
+          fileUrl: (updatedJob.document && updatedJob.document.filename) ? updatedJob.document.filename.replace(/^https:\/\/localhost:5000/, 'http://localhost:5000') : '', 
+          originalName: updatedJob.document ? updatedJob.document.originalName : '',
+          pagesToPrint: updatedJob.pagesToPrint,
+          settings: {
+            color: updatedJob.color,
+            duplex: updatedJob.duplex,
+            copies: updatedJob.copies,
+            pageRangeType: updatedJob.pageRangeType,
+            customRange: updatedJob.customRange
+          },
+          price: updatedJob.cost,
+          encryptedKey: updatedJob.encryptedKey,
+          iv: updatedJob.iv,
+          ...(updatedJob.printerDeviceId ? {
+            printerDeviceId: updatedJob.printerDeviceId,
+            windowsPrinterName: updatedJob.printerWindowsQueueName
+          } : {})
+        };
+        
+        if (updatedJob.machineId) {
+          globalIo.to(`machine_${updatedJob.machineId}`).emit('physical_print_job', printData);
+        } else {
+          // No machineId assigned — cannot send to a specific printer
+          // Log a warning instead of broadcasting to ALL sockets
+          console.warn(`Job ${updatedJob.shortId} has no machineId — cannot route to printer agent`);
+        }
       }
-    }
-
-    console.log(`Job ${shortId} is now PRINTING. Waiting for agent feedback...`);
-    // The physical printer agent will now respond with 'print_spooler_success' or 'print_spooler_error'
-    // which will be handled in socket.js to mark the job as COMPLETED or FAILED.
-    return updatedJob;
+      
+      console.log(`Job ${shortId} is now PRINTING. Waiting for agent feedback...`);
+      // The physical printer agent will now respond with 'print_spooler_success' or 'print_spooler_error'
+      // which will be handled in socket.js to mark the job as COMPLETED or FAILED.
   } catch(e) {
     console.error(`Error processing job ${shortId}:`, e);
     throw e;
   }
 };
 
-const initWorker = (io) => {
+const initWorker = async (io) => {
   globalIo = io;
-  if (!useRedis) return null;
-  
+  if (!useRedis || !printQueue) return null;
+  if (printWorker && workerReady) return printWorker;
+
   try {
-    const worker = new Worker('printQueue', async (job) => {
+    // Keep the backend event publisher single-threaded so Agent receipt order is
+    // deterministic. Per-device lanes in the Agent serialize same-printer work
+    // while allowing independent printers to download/submit in parallel.
+    printWorker = new Worker('printQueue', async (job) => {
       const { shortId } = job.data;
       await processJob(shortId);
     }, { connection, concurrency: 1 });
 
-    worker.on('failed', (job, err) => {
+    printWorker.on('failed', (job, err) => {
       console.error(`Physical Print Job ${job.id} failed without automatic retry: ${err.message}`);
     });
-    return worker;
-  } catch(e) {
+
+    await Promise.all([
+      printQueue.waitUntilReady(),
+      printWorker.waitUntilReady()
+    ]);
+    workerReady = true;
+    return printWorker;
+  } catch (error) {
+    workerReady = false;
+    if (printWorker) {
+      await printWorker.close().catch(() => {});
+      printWorker = null;
+    }
+    if (isRedisRequired) {
+      throw new Error(`Durable print worker failed to become ready: ${error.message}`);
+    }
     useRedis = false;
-    console.warn("Failed to start BullMQ worker, falling back to in-memory.");
+    console.warn('BullMQ worker failed to start; using the development/test in-memory fallback:', error.message);
     return null;
   }
 };
 
 const startPrintingProcess = async (shortId, io) => {
   if (io) globalIo = io;
-  
+
   if (useRedis && printQueue) {
+    let timeoutId;
     try {
-      const enqueuedJob = await printQueue.add(
-        'printJob',
-        { shortId },
-        {
-          jobId: `print_${shortId}`, // Deterministic BullMQ job identity
-          attempts: 1, // Single execution guarantee for physical printing (NO AUTOMATIC RETRIES)
-          removeOnComplete: true,
-          removeOnFail: false // Retain failed physical job records for operator inspection
-        }
-      );
-      return enqueuedJob;
-    } catch(e) {
-      // Observable error: BullMQ is the sole dispatch mechanism when Redis is configured.
-      // Under no circumstances do we fall back to direct in-memory processJob() on enqueue failure or timeout.
-      console.error(`Failed to enqueue job ${shortId} to BullMQ: ${e.message}`);
-      throw e;
+      const enqueuePromise = printQueue.add('printJob', { shortId }, {
+        jobId: `print_${shortId}`,
+        attempts: 1, // Preserve the no-automatic-reprint safety policy.
+        removeOnComplete: true,
+        removeOnFail: false
+      });
+
+      await Promise.race([
+        enqueuePromise,
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error('Redis queue operation timed out after 2500ms')),
+            2500
+          );
+        })
+      ]);
+    } catch (error) {
+      if (isRedisRequired) {
+        // Do not dispatch a physical print outside the durable queue in production.
+        throw new Error(`Durable print queue unavailable for job ${shortId}; no in-memory dispatch was attempted: ${error.message}`);
+      }
+      console.warn(`Redis queue unavailable (${error.message}), using the development/test in-memory fallback.`);
+      try {
+        await processJob(shortId);
+      } catch (processingError) {
+        // Preserve the existing non-production fallback contract. BullMQ Worker
+        // executions still receive the rethrow from processJob above.
+        console.error(`Development/test in-memory fallback failed for job ${shortId}:`, processingError);
+      }
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
+  } else if (isRedisRequired) {
+    throw new Error('Durable print queue is not ready; refusing an in-memory physical print dispatch.');
   } else {
-    // In-memory fallback: strictly for local development/testing where Redis is not configured
-    return await processJob(shortId);
+    try {
+      await processJob(shortId);
+    } catch (processingError) {
+      // Keep development/test callers non-throwing on local direct dispatch.
+      // The durable BullMQ Worker path still records thrown processor errors.
+      console.error(`Development/test in-memory fallback failed for job ${shortId}:`, processingError);
+    }
   }
+};
+
+const getQueueHealth = () => {
+  const workerRunning = Boolean(
+    printWorker &&
+    typeof printWorker.isRunning === 'function' &&
+    printWorker.isRunning()
+  );
+  return {
+    configured: Boolean(connection && printQueue),
+    redisReady: Boolean(connection && connection.status === 'ready'),
+    workerReady: workerReady && workerRunning,
+    ready: Boolean(useRedis && connection && connection.status === 'ready' && printQueue && workerReady && workerRunning)
+  };
+};
+
+const closeQueueService = async () => {
+  clearInterval(cleanupTimer);
+  workerReady = false;
+  const worker = printWorker;
+  const queue = printQueue;
+  printWorker = null;
+  printQueue = null;
+  if (worker) await worker.close();
+  if (queue) await queue.close();
 };
 
 const calculateEstimatedWaitTime = async (shortId) => {
@@ -482,6 +727,7 @@ const cleanupStuckPrintingJobs = async (options = {}) => {
 const cleanupTimer = setInterval(async () => {
   try {
     const oneHourAgo = new Date(Date.now() - ABANDONED_JOB_TTL_MS);
+    const fifteenMinsAgo = new Date(Date.now() - 15 * 60000);
     const { deleteFile } = require('../utils/storage');
 
     // 1. Delete genuinely abandoned unlinked PENDING_PAYMENT jobs safely
@@ -491,25 +737,7 @@ const cleanupTimer = setInterval(async () => {
     await cleanupStuckPrintingJobs();
 
     // 3. Delete files for COMPLETED, FAILED, and REFUNDED jobs older than 1 hour
-    const oldFinishedJobs = await prisma.printJob.findMany({
-      where: {
-        status: { in: ['COMPLETED', 'FAILED', 'REFUNDED'] },
-        updatedAt: { lt: oneHourAgo }
-      },
-      include: { document: true }
-    });
-
-    for (const job of oldFinishedJobs) {
-      if (job.document && job.document.filename) {
-        await deleteFile(job.document.filename);
-        // Clear filename in DB so we don't try to delete it again
-        await prisma.document.update({
-          where: { id: job.document.id },
-          data: { filename: null, originalName: 'File deleted (retention period ended)' }
-        });
-        console.log(`🧹 Deleted stale file for job ${job.shortId}.`);
-      }
-    }
+    await cleanupExpiredJobFiles({ deleteFileFn: deleteFile });
   } catch (error) {
     console.error('Error during cleanup:', error);
   }
@@ -518,6 +746,96 @@ const cleanupTimer = setInterval(async () => {
 if (typeof cleanupTimer.unref === 'function') {
   cleanupTimer.unref();
 }
+
+/**
+ * Safely deletes files for COMPLETED, FAILED, and REFUNDED jobs older than the retention period.
+ * Excludes documents already cleaned (filename === '') and isolates errors per record.
+ */
+const cleanupExpiredJobFiles = async (options = {}) => {
+  const db = options.prismaClient || prisma;
+  const nowMs = options.now instanceof Date ? options.now.getTime() : Date.now();
+  const retentionMs = typeof options.retentionMs === 'number' ? options.retentionMs : 3600000; // 1 hour default
+  const cutoffDate = new Date(nowMs - retentionMs);
+  const deleteFileFn = options.deleteFileFn || require('../utils/storage').deleteFile;
+
+  const oldFinishedJobs = (await db.printJob.findMany({
+    where: {
+      status: { in: ['COMPLETED', 'FAILED', 'REFUNDED'] },
+      updatedAt: { lt: cutoffDate },
+      document: {
+        filename: { not: '' }
+      }
+    },
+    include: { document: true }
+  })) || [];
+
+  const summary = {
+    scannedCount: oldFinishedJobs.length,
+    cleanedCount: 0,
+    skippedCount: 0,
+    failedCount: 0,
+    errors: []
+  };
+
+  for (const job of oldFinishedJobs) {
+    try {
+      if (!job.document || !job.document.filename) {
+        summary.skippedCount++;
+        continue;
+      }
+
+      // Check if another active job is still referencing this document
+      if (job.document.id) {
+        const activeSiblingCount = await db.printJob.count({
+          where: {
+            documentId: job.document.id,
+            id: { not: job.id },
+            status: { in: ['PENDING_PAYMENT', 'PAID', 'PRINTING'] }
+          }
+        });
+
+        if (activeSiblingCount > 0) {
+          summary.skippedCount++;
+          continue;
+        }
+      }
+
+      const fileDeleted = await deleteFileFn(job.document.filename);
+      if (fileDeleted === false) {
+        summary.failedCount++;
+        summary.errors.push({
+          jobId: job.id,
+          shortId: job.shortId,
+          error: 'Storage deleteFile returned false'
+        });
+        console.error(`Failed to delete storage file for job ${job.shortId}. Skipping DB update.`);
+        continue;
+      }
+
+      // Clear filename in DB with empty string (satisfies non-nullable String schema)
+      await db.document.update({
+        where: { id: job.document.id },
+        data: {
+          filename: '',
+          originalName: 'File deleted (retention period ended)'
+        }
+      });
+
+      summary.cleanedCount++;
+      console.log(`🧹 Deleted stale file for job ${job.shortId}.`);
+    } catch (jobErr) {
+      summary.failedCount++;
+      summary.errors.push({
+        jobId: job.id,
+        shortId: job.shortId,
+        error: jobErr.message
+      });
+      console.error(`Error deleting stale file for job ${job.shortId}:`, jobErr.message);
+    }
+  }
+
+  return summary;
+};
 
 const _setQueueForTesting = (mockQueue, isRedis, io) => {
   printQueue = mockQueue;
@@ -535,8 +853,11 @@ module.exports = {
   calculateEstimatedWaitTime,
   initWorker,
   cleanupAbandonedJobs,
+  cleanupExpiredJobFiles,
   buildAbandonedJobWhere,
   hasProtectedJobReferences,
   cleanupStuckPrintingJobs,
-  _setQueueForTesting
+  _setQueueForTesting,
+  getQueueHealth,
+  closeQueueService
 };

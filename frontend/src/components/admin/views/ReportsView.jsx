@@ -8,9 +8,9 @@ export const ReportsView = ({ period }) => {
   const [downloading, setDownloading] = useState('');
 
   const reportCards = [
-    { id: 'sales', title: 'Daily Sales & Financial Report', desc: 'Aggregated real vs demo collections, orders count, and net revenue.', icon: DollarSign, color: '#059669', bg: '#ecfdf5' },
+    { id: 'sales', title: 'Daily Business & Print Value Report', desc: 'Actual collections, non-cash Service Value, completed print value and order count.', icon: DollarSign, color: '#059669', bg: '#ecfdf5' },
     { id: 'jobs', title: 'Complete Print Jobs Register', desc: 'All print jobs with machine names, pages, duplex settings, and status.', icon: FileText, color: '#4f46e5', bg: '#eef2ff' },
-    { id: 'payments', title: 'Gateway Payments Ledger', desc: 'Payment transaction IDs, gateway order IDs, amounts, and demo indicators.', icon: DollarSign, color: '#d97706', bg: '#fffbeb' },
+    { id: 'payments', title: 'Payments & Service Value Register', desc: 'Actual payment records and separately identified non-cash Service Value entries.', icon: DollarSign, color: '#d97706', bg: '#fffbeb' },
     { id: 'refunds', title: 'Refunds & Recovery Ledger', desc: 'Gateway refund references, refund amounts, reasons, and timestamps.', icon: RotateCcw, color: '#dc2626', bg: '#fef2f2' },
     { id: 'invoices', title: 'Statutory GST Invoices Register', desc: 'Tax invoice numbers, taxable values, CGST, SGST, and total amounts.', icon: Receipt, color: '#7c3aed', bg: '#f5f3ff' },
   ];
@@ -44,7 +44,7 @@ export const ReportsView = ({ period }) => {
           Data Export & Audit Reports Center
         </h3>
         <p style={{ margin: '4px 0 0', fontSize: '0.8125rem', color: '#64748b' }}>
-          Download authoritative CSV reports for tax filing, reconciliation, and business accounting. Current period filter: <strong>{period}</strong>.
+          Download itemized CSV reports showing completed print value separately from actual cash/online collections. Current period filter: <strong>{period}</strong>.
         </p>
       </div>
 

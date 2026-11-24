@@ -11,6 +11,108 @@ const VALID_SCOPES = new Set(['GLOBAL', 'MACHINE_SPECIFIC']);
 const VALID_PLACEMENTS = new Set(['ALL', 'KIOSK_ONLY', 'MOBILE_ONLY']);
 
 /**
+ * Validates external media URL: must be valid HTTPS and safe against SSRF.
+ * @param {string} urlStr
+ * @returns {{ isValid: boolean, error?: string, parsedUrl?: URL }}
+ */
+const validateExternalMediaUrl = (urlStr) => {
+  if (!urlStr || typeof urlStr !== 'string') {
+    return { isValid: false, error: 'Media URL is required' };
+  }
+  const trimmed = urlStr.trim();
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch (e) {
+    return { isValid: false, error: 'Invalid media URL format' };
+  }
+
+  if (parsed.protocol !== 'https:') {
+    return { isValid: false, error: 'External media URL must use https:// protocol' };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  // SSRF Protection: Deny localhost, private IPs, loopback, link-local, cloud metadata
+  const blockedHostnames = ['localhost', 'metadata.google.internal'];
+  if (blockedHostnames.includes(hostname)) {
+    return { isValid: false, error: 'External media URL host is not permitted' };
+  }
+
+  // Check IPv4 private and link-local ranges
+  const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  const match = hostname.match(ipv4Regex);
+  if (match) {
+    const [, a, b] = match.map(Number);
+    if (
+      a === 127 || // Loopback
+      a === 10 ||  // Private class A
+      a === 0 ||   // Zero network
+      (a === 172 && b >= 16 && b <= 31) || // Private class B
+      (a === 192 && b === 168) || // Private class C
+      (a === 169 && b === 254)    // Link-local / AWS / Cloud metadata
+    ) {
+      return { isValid: false, error: 'External media URL host is not permitted (private network / link-local address)' };
+    }
+  }
+
+  // IPv6 loopback / unique local addresses
+  if (hostname === '[::1]' || hostname === '::1' || hostname.startsWith('fc') || hostname.startsWith('fd') || hostname.startsWith('fe80')) {
+    return { isValid: false, error: 'External media URL host is not permitted' };
+  }
+
+  return { isValid: true, parsedUrl: parsed };
+};
+
+/**
+ * Safely deletes local media file from disk only if no other advertisement references it.
+ * Ensures path stays within adsUploadsDir to prevent path traversal.
+ * Never deletes external URLs.
+ * @param {string} mediaUrl
+ * @param {string} excludeAdId
+ */
+const safeDeleteMediaFile = async (mediaUrl, excludeAdId) => {
+  if (!mediaUrl || typeof mediaUrl !== 'string' || mediaUrl.startsWith('http://') || mediaUrl.startsWith('https://')) {
+    return;
+  }
+
+  try {
+    const sharedCount = await prisma.advertisement.count({
+      where: {
+        mediaUrl: mediaUrl,
+        ...(excludeAdId ? { id: { not: excludeAdId } } : {})
+      }
+    });
+
+    if (sharedCount > 0) {
+      logger.info(`Media file ${mediaUrl} retained; referenced by ${sharedCount} other advertisement(s).`);
+      return;
+    }
+
+    const filename = path.basename(mediaUrl);
+    const adsDir = path.resolve(getAdsUploadsDir());
+    const filePath = path.resolve(adsDir, filename);
+
+    // Path traversal prevention check
+    if (!filePath.startsWith(adsDir)) {
+      logger.warn(`Suspicious media path traversal attempt blocked: ${mediaUrl}`);
+      return;
+    }
+
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+        logger.info(`Successfully deleted unreferenced advertisement media: ${filename}`);
+      } catch (err) {
+        logger.warn(`Failed to unlink advertisement media ${filePath}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    logger.error('Error during safe media file cleanup:', err);
+  }
+};
+
+/**
  * Public: Get active advertisements respecting Level 1 -> Level 5 priority hierarchy.
  *
  * Query parameters:
@@ -208,8 +310,34 @@ const createAdvertisement = async (req, res, next) => {
       return next(new AppError('Advertisement title is required', 400));
     }
 
-    if (!req.file) {
-      return next(new AppError('Advertisement media file (photo or video) is required', 400));
+    let mediaUrl;
+    let type;
+    let fileSize = null;
+    let mimeType = null;
+
+    if (req.file) {
+      const mime = req.file.mimetype || '';
+      const isVideo = mime.startsWith('video/');
+      type = isVideo ? 'VIDEO' : 'IMAGE';
+      mediaUrl = `/uploads/ads/${req.file.filename}`;
+      fileSize = req.file.size;
+      mimeType = mime;
+    } else if (req.body.mediaUrl) {
+      const urlCheck = validateExternalMediaUrl(req.body.mediaUrl);
+      if (!urlCheck.isValid) {
+        return next(new AppError(urlCheck.error, 400));
+      }
+      mediaUrl = req.body.mediaUrl.trim();
+      const rawType = req.body.type ? String(req.body.type).toUpperCase().trim() : null;
+      if (rawType && (rawType === 'VIDEO' || rawType === 'IMAGE')) {
+        type = rawType;
+      } else {
+        const ext = path.extname(urlCheck.parsedUrl.pathname).toLowerCase();
+        type = (ext === '.mp4' || ext === '.webm' || ext === '.ogg') ? 'VIDEO' : 'IMAGE';
+      }
+      mimeType = type === 'VIDEO' ? 'video/mp4' : 'image/jpeg';
+    } else {
+      return next(new AppError('Advertisement media file or external HTTPS media URL is required', 400));
     }
 
     // Scope Validation Invariant
@@ -259,11 +387,6 @@ const createAdvertisement = async (req, res, next) => {
       return next(new AppError("Invalid placement: Must be 'ALL', 'KIOSK_ONLY', or 'MOBILE_ONLY'", 400));
     }
 
-    const mime = req.file.mimetype || '';
-    const isVideo = mime.startsWith('video/');
-    const type = isVideo ? 'VIDEO' : 'IMAGE';
-    const mediaUrl = `/uploads/ads/${req.file.filename}`;
-
     const ad = await prisma.advertisement.create({
       data: {
         title: title.trim(),
@@ -277,8 +400,8 @@ const createAdvertisement = async (req, res, next) => {
         machineId: resolvedMachineId,
         startDate: startDate ? new Date(startDate) : null,
         endDate: endDate ? new Date(endDate) : null,
-        fileSize: req.file.size,
-        mimeType: mime,
+        fileSize,
+        mimeType,
         createdBy: req.user?.id || null,
         companyId: targetCompanyId
       }
@@ -385,7 +508,7 @@ const updateAdvertisement = async (req, res, next) => {
       updateData.placement = placement;
     }
 
-    // If new file uploaded, update media and remove old file
+    // If new file uploaded or new external mediaUrl provided, update media
     if (req.file) {
       const mime = req.file.mimetype || '';
       const isVideo = mime.startsWith('video/');
@@ -394,16 +517,28 @@ const updateAdvertisement = async (req, res, next) => {
       updateData.fileSize = req.file.size;
       updateData.mimeType = mime;
 
-      if (existing.mediaUrl) {
-        const oldFilename = path.basename(existing.mediaUrl);
-        const oldFilePath = path.join(getAdsUploadsDir(), oldFilename);
-        if (fs.existsSync(oldFilePath)) {
-          try {
-            fs.unlinkSync(oldFilePath);
-          } catch (e) {
-            logger.warn('Failed to remove old media file:', e.message);
-          }
-        }
+      if (existing.mediaUrl && existing.mediaUrl !== updateData.mediaUrl) {
+        await safeDeleteMediaFile(existing.mediaUrl, existing.id);
+      }
+    } else if (req.body.mediaUrl !== undefined) {
+      const urlCheck = validateExternalMediaUrl(req.body.mediaUrl);
+      if (!urlCheck.isValid) {
+        return next(new AppError(urlCheck.error, 400));
+      }
+      const newMediaUrl = req.body.mediaUrl.trim();
+      updateData.mediaUrl = newMediaUrl;
+      const rawType = req.body.type ? String(req.body.type).toUpperCase().trim() : null;
+      if (rawType && (rawType === 'VIDEO' || rawType === 'IMAGE')) {
+        updateData.type = rawType;
+      } else {
+        const ext = path.extname(urlCheck.parsedUrl.pathname).toLowerCase();
+        updateData.type = (ext === '.mp4' || ext === '.webm' || ext === '.ogg') ? 'VIDEO' : 'IMAGE';
+      }
+      updateData.mimeType = updateData.type === 'VIDEO' ? 'video/mp4' : 'image/jpeg';
+      updateData.fileSize = null;
+
+      if (existing.mediaUrl && existing.mediaUrl !== newMediaUrl) {
+        await safeDeleteMediaFile(existing.mediaUrl, existing.id);
       }
     }
 
@@ -512,15 +647,7 @@ const deleteAdvertisement = async (req, res, next) => {
     await prisma.advertisement.delete({ where: { id } });
 
     if (existing.mediaUrl) {
-      const filename = path.basename(existing.mediaUrl);
-      const filePath = path.join(getAdsUploadsDir(), filename);
-      if (fs.existsSync(filePath)) {
-        try {
-          fs.unlinkSync(filePath);
-        } catch (e) {
-          logger.warn('Failed to delete media file:', e.message);
-        }
-      }
+      await safeDeleteMediaFile(existing.mediaUrl, existing.id);
     }
 
     res.json({

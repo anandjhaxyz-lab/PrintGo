@@ -252,10 +252,36 @@ const AdminDashboard = () => {
       auth: { token }
     });
 
+    let overviewRefreshTimer = null;
+
+    const scheduleOverviewRefresh = () => {
+      if (overviewRefreshTimer) {
+        clearTimeout(overviewRefreshTimer);
+      }
+      overviewRefreshTimer = setTimeout(() => {
+        axios.get(`${API_URL}/api/admin/analytics/overview?period=${period}`)
+          .then(res => {
+            if (res.data?.success && res.data?.data) {
+              setOverviewStats(res.data.data);
+            }
+          })
+          .catch(() => {});
+      }, 400);
+    };
+
     socket.on('job_status_changed', (updatedJob) => {
       setJobs(prev => {
         const exists = prev.find(j => j.id === updatedJob.id);
-        if (exists) return prev.map(j => j.id === updatedJob.id ? { ...j, ...updatedJob } : j);
+        if (exists) return prev.map(j => {
+          if (j.id !== updatedJob.id) return j;
+          const merged = { ...j, ...updatedJob };
+          // Status-only Prisma updates may omit relations. Preserve the previously
+          // loaded payment relation so a recorded Service Value is not shown as Unpaid.
+          if (!Object.prototype.hasOwnProperty.call(updatedJob, 'payment')) {
+            merged.payment = j.payment;
+          }
+          return merged;
+        });
         return [updatedJob, ...prev];
       });
       // Refresh KPIs softly
@@ -276,6 +302,24 @@ const AdminDashboard = () => {
           return updated.slice(Math.max(0, updated.length - 30));
         });
       }
+      if (status?.machineId) {
+        setMachines(prev => prev.map(m => {
+          if (m.id === status.machineId) {
+            return {
+              ...m,
+              printerModel: status.printerModel || status.printerName || m.printerModel || 'Unknown',
+              connectionType: status.connectionType || m.connectionType || 'Unknown',
+              paymentMode: status.paymentMode || m.paymentMode || 'CASH_AT_COUNTER',
+              isOnline: typeof status.isReady === 'boolean' ? status.isReady : !status.isError,
+              hardwareStatus: status.status || m.hardwareStatus,
+              statusMessage: status.statusMessage || m.statusMessage,
+              lastOnline: new Date().toISOString(),
+            };
+          }
+          return m;
+        }));
+        scheduleOverviewRefresh();
+      }
     });
 
     socket.on('printer_heartbeat', (payload) => {
@@ -286,7 +330,12 @@ const AdminDashboard = () => {
       setMachines(prev => updateMachineFromSocketEvent(prev, payload));
     });
 
-    return () => socket.disconnect();
+    return () => {
+      if (overviewRefreshTimer) {
+        clearTimeout(overviewRefreshTimer);
+      }
+      socket.disconnect();
+    };
   }, [isAuthenticated, period]);
 
   // Periodic soft refresh of machine status while dashboard is open (keeps 90s heartbeat status fresh)

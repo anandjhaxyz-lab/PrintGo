@@ -456,4 +456,279 @@ describe('S3K Batch 2 - Customer Mobile Checkout, Pricing, Security & Recovery',
     fireEvent.click(screen.getByRole('button', { name: /Already paid\? Check server status/i }));
     await waitFor(() => expect(screen.getByText('INV-BACK-1')).toBeInTheDocument());
   });
+
+  it('T10: Renders SIMULATE DEMO PAYMENT — STAGING ONLY button & warning only when enableDemoPayment=true, and dispatches to Step 4', async () => {
+    mockAxios.post.mockImplementation(async (url) => {
+      if (url.endsWith('/api/auth/session/from-printer-qr')) {
+        return {
+          data: {
+            success: true,
+            sessionCode: 'sess_demo_ui',
+            sessionToken: 'tok_demo_ui',
+            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+            cashfreeEnv: 'sandbox',
+            enableDemoPayment: true, // EXPLICITLY PERMITTED BY BACKEND STAGING
+            pricingProfile: {
+              bwSingleRate: 5,
+              bwDuplexRate: 8,
+              convenienceFee: 0,
+              minOrderAmount: 1,
+              gstEnabled: false,
+              isTaxInclusive: true,
+            },
+            printer: { name: 'EPSON L6460 Pilot', location: 'Staging Counter', isOnline: true },
+          },
+        };
+      }
+      if (url.endsWith('/api/upload')) {
+        return {
+          data: {
+            success: true,
+            file: { filename: '/uploads/demo.pdf', originalName: 'demo.pdf', size: 1024, pages: 1 },
+          },
+        };
+      }
+      if (url.endsWith('/api/jobs')) {
+        return {
+          data: {
+            success: true,
+            job: { shortId: 'jobDemo77', cost: 5, status: 'PENDING_PAYMENT' },
+          },
+        };
+      }
+      if (url.includes('/api/payments/demo-pay/jobDemo77')) {
+        return {
+          data: {
+            success: true,
+            dispatched: true,
+            message: 'Demo payment confirmed and dispatched to printer',
+            job: { shortId: 'jobDemo77', cost: 5, status: 'WAITING' },
+            payment: { gatewayOrderId: 'demo_order_jobDemo77_123', status: 'SUCCESS' }
+          },
+        };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    mockAxios.get.mockImplementation(async (url) => {
+      if (url.endsWith('/api/jobs/jobDemo77')) {
+        return { data: { success: true, job: { shortId: 'jobDemo77', status: 'WAITING', cost: 5 } } };
+      }
+      if (url.endsWith('/api/jobs/jobDemo77/invoice')) {
+        return { data: { success: true, invoice: { invoiceNumber: 'INV-DEMO-77', totalAmount: 5 } } };
+      }
+      return { data: { success: true } };
+    });
+
+    const { container } = renderMobileAt('/p/qr_pilot_1');
+
+    await waitFor(() => expect(screen.getByText('EPSON L6460 Pilot')).toBeInTheDocument());
+    const fileInput = container.querySelector('input[type="file"]');
+    const pdfFile = await makeValidPdfFile(1, 'demo.pdf');
+    fireEvent.change(fileInput, { target: { files: [pdfFile] } });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /Proceed to Payment/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /Proceed to Payment/i }));
+
+    // Step 3 Checkout: Verify both Cashfree button AND Staging Demo Payment button + Warning exist!
+    await waitFor(() => expect(screen.getByRole('button', { name: /SIMULATE DEMO PAYMENT — STAGING ONLY/i })).toBeInTheDocument());
+    expect(screen.getByText(/NO REAL PAYMENT WILL BE CHARGED\./i)).toBeInTheDocument();
+    expect(screen.getByText(/A REAL PHYSICAL PRINT WILL BE PRODUCED\./i)).toBeInTheDocument();
+
+    // Verify access code input is present and button is disabled when input is empty
+    const accessCodeInput = screen.getByPlaceholderText(/Enter demo access code/i);
+    expect(accessCodeInput).toBeInTheDocument();
+    expect(accessCodeInput.type).toBe('password');
+    const demoButton = screen.getByRole('button', { name: /SIMULATE DEMO PAYMENT — STAGING ONLY/i });
+    expect(demoButton).toBeDisabled();
+
+    // Enter valid demo access code
+    fireEvent.change(accessCodeInput, { target: { value: 'staging_secret_code_789' } });
+    expect(demoButton).not.toBeDisabled();
+
+    // Click Demo Payment
+    fireEvent.click(demoButton);
+
+    // Dispatches POST /api/payments/demo-pay/jobDemo77 with { accessCode } and transitions to Step 4
+    await waitFor(() => {
+      const demoPostCalls = mockAxios.post.mock.calls.filter((c) => c[0].includes('/api/payments/demo-pay/jobDemo77'));
+      expect(demoPostCalls.length).toBe(1);
+      expect(demoPostCalls[0][1]).toEqual({ accessCode: 'staging_secret_code_789' });
+    });
+
+    await waitFor(() => expect(screen.getByText('INV-DEMO-77')).toBeInTheDocument());
+  });
+
+  it('T10B: Omits demo access-code input and allows one-click Staging simulation when configured off', async () => {
+    mockAxios.post.mockImplementation(async (url) => {
+      if (url.endsWith('/api/auth/session/from-printer-qr')) {
+        return {
+          data: {
+            success: true,
+            sessionCode: 'sess_demo_no_code_ui',
+            sessionToken: 'tok_demo_no_code_ui',
+            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+            cashfreeEnv: 'sandbox',
+            enableDemoPayment: true,
+            demoAccessCodeRequired: false,
+            pricingProfile: {
+              bwSingleRate: 5,
+              bwDuplexRate: 8,
+              convenienceFee: 0,
+              minOrderAmount: 1,
+              gstEnabled: false,
+              isTaxInclusive: true,
+            },
+            printer: { name: 'EPSON L6460 Pilot', location: 'Staging Counter', isOnline: true },
+          },
+        };
+      }
+      if (url.endsWith('/api/upload')) {
+        return {
+          data: {
+            success: true,
+            file: { filename: '/uploads/demo_no_code.pdf', originalName: 'demo_no_code.pdf', size: 1024, pages: 1 },
+          },
+        };
+      }
+      if (url.endsWith('/api/jobs')) {
+        return {
+          data: {
+            success: true,
+            job: { shortId: 'jobDemoNoCode', cost: 5, status: 'PENDING_PAYMENT' },
+          },
+        };
+      }
+      if (url.includes('/api/payments/demo-pay/jobDemoNoCode')) {
+        return {
+          data: {
+            success: true,
+            dispatched: true,
+            message: 'Demo payment confirmed and dispatched to printer',
+            job: { shortId: 'jobDemoNoCode', cost: 5, status: 'WAITING' },
+            payment: { gatewayOrderId: 'demo_order_jobDemoNoCode_123', status: 'SUCCESS' }
+          },
+        };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    mockAxios.get.mockImplementation(async (url) => {
+      if (url.endsWith('/api/jobs/jobDemoNoCode')) {
+        return { data: { success: true, job: { shortId: 'jobDemoNoCode', status: 'WAITING', cost: 5 } } };
+      }
+      if (url.endsWith('/api/jobs/jobDemoNoCode/invoice')) {
+        return { data: { success: true, invoice: { invoiceNumber: 'INV-DEMO-NOCODE', totalAmount: 5 } } };
+      }
+      if (url.includes('/api/auth/pricing')) {
+        return { data: { success: true, enableDemoPayment: true, demoAccessCodeRequired: false } };
+      }
+      return { data: { success: true } };
+    });
+
+    const { container } = renderMobileAt('/p/qr_pilot_no_code');
+    await waitFor(() => expect(screen.getByText('EPSON L6460 Pilot')).toBeInTheDocument());
+    const pdfFile = await makeValidPdfFile(1, 'demo_no_code.pdf');
+    fireEvent.change(container.querySelector('input[type="file"]'), { target: { files: [pdfFile] } });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /Proceed to Payment/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /Proceed to Payment/i }));
+
+    const demoButton = await screen.findByRole('button', { name: /SIMULATE DEMO PAYMENT — STAGING ONLY/i });
+    expect(screen.getByText(/NO REAL PAYMENT WILL BE CHARGED\./i)).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/Enter demo access code/i)).toBeNull();
+    expect(demoButton).not.toBeDisabled();
+
+    fireEvent.click(demoButton);
+
+    await waitFor(() => {
+      const demoPostCalls = mockAxios.post.mock.calls.filter((call) => call[0].includes('/api/payments/demo-pay/jobDemoNoCode'));
+      expect(demoPostCalls).toHaveLength(1);
+      expect(demoPostCalls[0][1]).toEqual({});
+    });
+    await waitFor(() => expect(screen.getByText('INV-DEMO-NOCODE')).toBeInTheDocument());
+  });
+
+  it('T11: SEC-3T-01: Displays operator-attention notice on Step 4 when demo payment succeeds but print dispatch fails', async () => {
+    mockAxios.post.mockImplementation(async (url) => {
+      if (url.endsWith('/api/auth/session/from-printer-qr')) {
+        return {
+          data: {
+            success: true,
+            sessionCode: 'sess_demo_ui_fail',
+            sessionToken: 'tok_demo_ui_fail',
+            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+            cashfreeEnv: 'sandbox',
+            enableDemoPayment: true,
+            pricingProfile: {
+              bwSingleRate: 5,
+              bwDuplexRate: 8,
+              convenienceFee: 0,
+              minOrderAmount: 1,
+              gstEnabled: false,
+              isTaxInclusive: true,
+            },
+            printer: { name: 'EPSON L6460 Pilot', location: 'Staging Counter', isOnline: true },
+          },
+        };
+      }
+      if (url.endsWith('/api/upload')) {
+        return {
+          data: {
+            success: true,
+            file: { filename: '/uploads/demo.pdf', originalName: 'demo.pdf', size: 1024, pages: 1 },
+          },
+        };
+      }
+      if (url.endsWith('/api/jobs')) {
+        return {
+          data: {
+            success: true,
+            job: { shortId: 'jobDemo88', cost: 5, status: 'PENDING_PAYMENT' },
+          },
+        };
+      }
+      if (url.includes('/api/payments/demo-pay/jobDemo88')) {
+        return {
+          data: {
+            success: true,
+            dispatched: false,
+            message: 'Demo payment confirmed, but print queue dispatch encountered an error. Job is queued in WAITING state for operator retry.',
+            job: { shortId: 'jobDemo88', cost: 5, status: 'WAITING' },
+            payment: { gatewayOrderId: 'demo_order_jobDemo88_123', status: 'SUCCESS' }
+          },
+        };
+      }
+      throw new Error(`Unexpected POST ${url}`);
+    });
+
+    mockAxios.get.mockImplementation(async (url) => {
+      if (url.endsWith('/api/jobs/jobDemo88')) {
+        return { data: { success: true, job: { shortId: 'jobDemo88', status: 'WAITING', cost: 5 } } };
+      }
+      if (url.endsWith('/api/jobs/jobDemo88/invoice')) {
+        return { data: { success: true, invoice: { invoiceNumber: 'INV-DEMO-88', totalAmount: 5 } } };
+      }
+      return { data: { success: true } };
+    });
+
+    const { container } = renderMobileAt('/p/qr_pilot_fail');
+
+    await waitFor(() => expect(screen.getByText('EPSON L6460 Pilot')).toBeInTheDocument());
+    const fileInput = container.querySelector('input[type="file"]');
+    const pdfFile = await makeValidPdfFile(1, 'demo.pdf');
+    fireEvent.change(fileInput, { target: { files: [pdfFile] } });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /Proceed to Payment/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /Proceed to Payment/i }));
+
+    await waitFor(() => expect(screen.getByPlaceholderText(/Enter demo access code/i)).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText(/Enter demo access code/i), { target: { value: 'staging_secret_code_789' } });
+    fireEvent.click(screen.getByRole('button', { name: /SIMULATE DEMO PAYMENT — STAGING ONLY/i }));
+
+    // Verifies Step 4 renders with the clear operator attention notice and warning not to pay again
+    await waitFor(() => expect(screen.getByText(/Print Queue Notice — Operator Attention Required/i)).toBeInTheDocument());
+    expect(screen.getByText(/Do not pay again\./i)).toBeInTheDocument();
+    expect(screen.getByText(/inform the store operator to release Job ID/i)).toBeInTheDocument();
+  });
 });

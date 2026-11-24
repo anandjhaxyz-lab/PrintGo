@@ -60,6 +60,20 @@ export const OverviewView = ({ stats, charts, isLoading }) => {
           </div>
         </div>
 
+        {/* Completed Print Value */}
+        <div className="admin-kpi-card" style={{ borderLeft: '4px solid #0ea5e9' }}>
+          <div className="admin-kpi-header">
+            <span>Completed Print Value</span>
+            <Printer size={18} color="#0ea5e9" />
+          </div>
+          <div className="admin-kpi-value" style={{ color: '#0369a1' }}>
+            ₹{(financials.completedPrintValue ?? 0).toLocaleString('en-IN')}
+          </div>
+          <div className="admin-kpi-sub">
+            <span>Server-priced value of completed prints</span>
+          </div>
+        </div>
+
         {/* Total Orders */}
         <div className="admin-kpi-card" style={{ borderLeft: '4px solid #6366f1' }}>
           <div className="admin-kpi-header">
@@ -126,9 +140,9 @@ export const OverviewView = ({ stats, charts, isLoading }) => {
           <div style={{ fontSize: '1.125rem', fontWeight: 600, color: '#0f172a' }}>₹{financials.averageOrderValue}</div>
         </div>
         <div>
-          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Simulated Demo Volume</span>
+          <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Service Value Recorded</span>
           <div style={{ fontSize: '1.125rem', fontWeight: 600, color: '#d97706' }}>
-            ₹{financials.demoCollections} <span style={{ fontSize: '0.6875rem', fontWeight: 400 }}>(Isolated)</span>
+            ₹{financials.serviceValue ?? financials.demoCollections ?? 0} <span style={{ fontSize: '0.6875rem', fontWeight: 400 }}>(Non-cash)</span>
           </div>
         </div>
         <div>
@@ -143,8 +157,8 @@ export const OverviewView = ({ stats, charts, isLoading }) => {
         <div style={{ background: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '12px', padding: '1.25rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1rem' }}>
             <div>
-              <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, color: '#0f172a', margin: 0 }}>Daily Commercial Revenue</h3>
-              <p style={{ fontSize: '0.75rem', color: '#64748b', margin: 0 }}>Authoritative INR collections over time</p>
+              <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, color: '#0f172a', margin: 0 }}>Daily Print Value & Collections</h3>
+              <p style={{ fontSize: '0.75rem', color: '#64748b', margin: 0 }}>Completed print value, actual collections and non-cash service value</p>
             </div>
             <TrendingUp size={18} color="#6366f1" />
           </div>
@@ -162,8 +176,11 @@ export const OverviewView = ({ stats, charts, isLoading }) => {
                   <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
                   <XAxis dataKey="date" tick={{ fontSize: 11, fill: '#64748b' }} />
                   <YAxis tick={{ fontSize: 11, fill: '#64748b' }} tickFormatter={(v) => `₹${v}`} />
-                  <Tooltip formatter={(value) => [`₹${value}`, 'Gross Revenue']} />
-                  <Area type="monotone" dataKey="grossRevenue" stroke="#4f46e5" strokeWidth={2} fillOpacity={1} fill="url(#colorRevenue)" />
+                  <Tooltip formatter={(value, name) => [`₹${value}`, name === 'completedPrintValue' ? 'Completed Print Value' : name === 'serviceValue' ? 'Service Value' : 'Actual Collections']} />
+                  <Legend />
+                  <Area type="monotone" dataKey="grossRevenue" name="Actual Collections" stroke="#4f46e5" strokeWidth={2} fillOpacity={1} fill="url(#colorRevenue)" />
+                  <Area type="monotone" dataKey="serviceValue" name="Service Value" stroke="#7c3aed" strokeWidth={2} fillOpacity={0.06} fill="#7c3aed" />
+                  <Area type="monotone" dataKey="completedPrintValue" name="Completed Print Value" stroke="#0ea5e9" strokeWidth={2} fillOpacity={0.04} fill="#0ea5e9" />
                 </AreaChart>
               </ResponsiveContainer>
             ) : (

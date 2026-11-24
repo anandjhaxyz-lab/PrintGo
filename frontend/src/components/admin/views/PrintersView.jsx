@@ -19,7 +19,9 @@ import {
   VolumeX,
   Volume2,
   Clock,
-  Megaphone
+  Megaphone,
+  Banknote,
+  CreditCard
 } from 'lucide-react';
 import { TelemetryDashboard } from '../TelemetryDashboard';
 import {
@@ -31,6 +33,7 @@ import {
   PrinterQrLedgerModal
 } from './PrinterQrModals';
 import { PrinterAdSuppressionModal } from './PrinterAdSuppressionModal';
+import { PrinterFleetApprovalPanel } from './PrinterFleetApprovalPanel';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
@@ -114,7 +117,7 @@ export const PrintersView = ({
     setIsLoadingQrs(true);
     try {
       const res = await axios.get(`${API_URL}/api/admin/printer-qrs`, {
-        params: { limit: 100 }
+        params: { limit: 100, legacyOnly: true }
       });
 
       if (res.data?.success && res.data.data?.qrs) {
@@ -234,8 +237,29 @@ export const PrintersView = ({
     }
   };
 
+  // Switch Payment Mode with 1 click
+  const handleSwitchPaymentMode = async (machine, newMode) => {
+    if (machine.paymentMode === newMode) return;
+    setGlobalError('');
+    setGlobalSuccess('');
+    try {
+      const res = await axios.put(`${API_URL}/api/machines/${machine.id}/payment-mode`, {
+        paymentMode: newMode
+      });
+      if (res.data?.success) {
+        setGlobalSuccess(`Payment mode updated to "${newMode === 'CASH_AT_COUNTER' ? 'Cash at Counter' : newMode === 'DEMO_SIMULATION' ? 'Demo Simulation' : 'Cashfree Online'}" for printer "${machine.name}". New QR sessions will use this mode.`);
+        machine.paymentMode = newMode;
+      } else {
+        throw new Error(res.data?.error || 'Failed to update payment mode');
+      }
+    } catch (err) {
+      setGlobalError(err.response?.data?.error || err.message || 'Failed to switch payment mode');
+    }
+  };
+
   return (
     <div>
+      <PrinterFleetApprovalPanel currentUser={currentUser} />
       {/* Global Alerts */}
       {globalSuccess && (
         <div
@@ -402,7 +426,7 @@ export const PrintersView = ({
                       color: isOnline ? '#059669' : '#dc2626'
                     }}>
                       {isOnline ? <Wifi size={12} /> : <WifiOff size={12} />}
-                      {isOnline ? 'ONLINE' : 'OFFLINE'}
+                      {isOnline ? 'ONLINE' : (machine.hardwareStatus ? machine.hardwareStatus.replace('_', ' ') : 'OFFLINE')}
                     </span>
                   </div>
 
@@ -629,6 +653,132 @@ export const PrintersView = ({
                         </button>
                       )}
                     </div>
+                  </div>
+
+                  {/* MACHINE PAYMENT OPERATING MODE CONFIGURATION */}
+                  <div
+                    style={{
+                      border: '1px solid #e2e8f0',
+                      borderRadius: '10px',
+                      padding: '0.75rem',
+                      background: '#ffffff',
+                      marginBottom: '0.75rem'
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <Banknote size={16} color="#059669" />
+                        <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#1e293b' }}>
+                          Payment Operating Mode
+                        </span>
+                      </div>
+                      <span
+                        style={{
+                          fontSize: '0.625rem',
+                          fontWeight: 700,
+                          padding: '2px 8px',
+                          borderRadius: '9999px',
+                          background:
+                            machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode ? '#ecfdf5' :
+                            machine.paymentMode === 'DEMO_SIMULATION' ? '#fffbeb' : '#f0f9ff',
+                          color:
+                            machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode ? '#059669' :
+                            machine.paymentMode === 'DEMO_SIMULATION' ? '#b45309' : '#0284c7',
+                          border: `1px solid ${
+                            machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode ? '#a7f3d0' :
+                            machine.paymentMode === 'DEMO_SIMULATION' ? '#fde68a' : '#bae6fd'
+                          }`
+                        }}
+                      >
+                        {machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode
+                          ? '💵 CASH AT COUNTER (ACTIVE)'
+                          : machine.paymentMode === 'DEMO_SIMULATION'
+                            ? '🧪 DEMO SIMULATION'
+                            : '💳 CASHFREE ONLINE'}
+                      </span>
+                    </div>
+
+                    <p style={{ fontSize: '0.6875rem', color: '#64748b', margin: '0 0 8px 0', lineHeight: 1.4 }}>
+                      {machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode
+                        ? 'Customers pay cash at counter; printing starts after cashier confirms payment in Admin.'
+                        : machine.paymentMode === 'DEMO_SIMULATION'
+                          ? 'Supervised staging simulation producing real prints using demo access code.'
+                          : 'Online payments via Cashfree payment gateway (UPI, Cards, NetBanking).'}
+                    </p>
+
+                    {/* One-Click Mode Buttons */}
+                    {isAuthorized && (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '6px' }}>
+                        <button
+                          type="button"
+                          onClick={() => handleSwitchPaymentMode(machine, 'CASH_AT_COUNTER')}
+                          style={{
+                            padding: '6px 4px',
+                            borderRadius: '6px',
+                            fontSize: '0.6875rem',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            gap: '2px',
+                            background: machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode ? '#059669' : '#f8fafc',
+                            color: machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode ? '#ffffff' : '#334155',
+                            border: machine.paymentMode === 'CASH_AT_COUNTER' || !machine.paymentMode ? '1px solid #047857' : '1px solid #cbd5e1',
+                            transition: 'all 0.15s ease'
+                          }}
+                        >
+                          <span>💵 Cash</span>
+                          <span style={{ fontSize: '0.5625rem', opacity: 0.85 }}>At Counter</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleSwitchPaymentMode(machine, 'DEMO_SIMULATION')}
+                          style={{
+                            padding: '6px 4px',
+                            borderRadius: '6px',
+                            fontSize: '0.6875rem',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            gap: '2px',
+                            background: machine.paymentMode === 'DEMO_SIMULATION' ? '#d97706' : '#f8fafc',
+                            color: machine.paymentMode === 'DEMO_SIMULATION' ? '#ffffff' : '#334155',
+                            border: machine.paymentMode === 'DEMO_SIMULATION' ? '1px solid #b45309' : '1px solid #cbd5e1',
+                            transition: 'all 0.15s ease'
+                          }}
+                        >
+                          <span>🧪 Demo</span>
+                          <span style={{ fontSize: '0.5625rem', opacity: 0.85 }}>Simulation</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleSwitchPaymentMode(machine, 'CASHFREE_ONLINE')}
+                          style={{
+                            padding: '6px 4px',
+                            borderRadius: '6px',
+                            fontSize: '0.6875rem',
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            gap: '2px',
+                            background: machine.paymentMode === 'CASHFREE_ONLINE' ? '#0284c7' : '#f8fafc',
+                            color: machine.paymentMode === 'CASHFREE_ONLINE' ? '#ffffff' : '#334155',
+                            border: machine.paymentMode === 'CASHFREE_ONLINE' ? '1px solid #0369a1' : '1px solid #cbd5e1',
+                            transition: 'all 0.15s ease'
+                          }}
+                        >
+                          <span>💳 Cashfree</span>
+                          <span style={{ fontSize: '0.5625rem', opacity: 0.85 }}>Online</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
 
                   {/* MACHINE ADVERTISEMENT SUPPRESSION / STATUS */}

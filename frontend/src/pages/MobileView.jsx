@@ -3,10 +3,10 @@ import { useParams } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import axios from 'axios';
 import {
-  Upload, CheckCircle, Loader, CreditCard,
+  Upload, CheckCircle, Loader, CreditCard, Banknote,
   WifiOff, Printer, AlertTriangle, RefreshCw, FileText,
   ShieldCheck, ChevronRight, ChevronLeft, Check, Eye,
-  Download, Receipt, RotateCcw
+  Download, Receipt, RotateCcw, Zap, Sparkles, Lock
 } from 'lucide-react';
 import { StepIndicator } from '../components/mobile/StepIndicator';
 import { AdvertisementDisplay } from '../components/AdvertisementDisplay';
@@ -87,6 +87,54 @@ const MobileView = () => {
   const [pricingProfile, setPricingProfile] = useState(DEFAULT_PRICING_PROFILE);
   const [cashfreeEnv, setCashfreeEnv] = useState('sandbox');
   const [qrError, setQrError] = useState(null);
+  const [isRefreshingStatus, setIsRefreshingStatus] = useState(false);
+
+  const hardwareStatus = printerInfo?.hardwareStatus || (printerInfo?.isOnline ? 'ONLINE' : (printerInfo ? 'AGENT_OFFLINE' : 'UNKNOWN'));
+  const isPrinterReady = hardwareStatus === 'ONLINE';
+  const isAgentOffline = hardwareStatus === 'AGENT_OFFLINE';
+  const isPrinterDisconnected = hardwareStatus === 'PRINTER_DISCONNECTED';
+
+  const customerStatusText = useMemo(() => {
+    if (printerInfo?.statusMessage) return printerInfo.statusMessage;
+    switch (hardwareStatus) {
+      case 'ONLINE':
+        return 'Printer Ready';
+      case 'AGENT_OFFLINE':
+        return 'Printer Temporarily Offline';
+      case 'PRINTER_DISCONNECTED':
+        return 'Printer Disconnected';
+      case 'PAPER_OUT':
+        return 'Out of Paper';
+      case 'JAMMED':
+        return 'Paper Jam';
+      case 'UNKNOWN':
+      default:
+        return 'Printer Status Unavailable';
+    }
+  }, [hardwareStatus, printerInfo?.statusMessage]);
+
+  const handleRefreshPrinterStatus = async () => {
+    setIsRefreshingStatus(true);
+    try {
+      if (publicCode) {
+        const res = await axios.get(`${API_URL}/api/auth/printer-qr/${publicCode}`);
+        if (res.data?.printer) {
+          setPrinterInfo(res.data.printer);
+        }
+      } else if (activeSessionId || sessionId) {
+        const res = await axios.get(`${API_URL}/api/auth/pricing`, {
+          params: publicCode ? { publicCode } : {},
+        });
+        if (res.data?.printer) {
+          setPrinterInfo(res.data.printer);
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to refresh printer status:', err);
+    } finally {
+      setIsRefreshingStatus(false);
+    }
+  };
 
   const [socket, setSocket] = useState(null);
   const [isConnected, setIsConnected] = useState(true);
@@ -100,6 +148,12 @@ const MobileView = () => {
   const [isInitializingPayment, setIsInitializingPayment] = useState(false);
   const [isVerifyingPayment, setIsVerifyingPayment] = useState(false);
   const [paymentOutcome, setPaymentOutcome] = useState(null); // { type: 'FAILED'|'CANCELLED'|'DROPPED'|'PENDING'|'MISMATCH', message }
+  const [paymentMode, setPaymentMode] = useState('CASH_AT_COUNTER'); // 'CASH_AT_COUNTER' | 'DEMO_SIMULATION' | 'CASHFREE_ONLINE'
+  const [enableDemoPayment, setEnableDemoPayment] = useState(false);
+  const [demoAccessCode, setDemoAccessCode] = useState('');
+  const [demoAccessCodeRequired, setDemoAccessCodeRequired] = useState(true);
+  const [isExecutingDemoPay, setIsExecutingDemoPay] = useState(false);
+  const [dispatchWarning, setDispatchWarning] = useState(null);
   const [error, setError] = useState('');
   const [price, setPrice] = useState(0);
   const [serverBreakdown, setServerBreakdown] = useState(null);
@@ -124,6 +178,7 @@ const MobileView = () => {
   // Refs for cleanup and concurrency guards
   const previewUrlRef = useRef(null);
   const checkoutInFlightRef = useRef(false);
+  const demoPayInFlightRef = useRef(false);
   const submitSettingsInFlightRef = useRef(false);
 
   const [settings, setSettings] = useState({
@@ -286,12 +341,82 @@ const MobileView = () => {
           if (recovered.printerInfo) setPrinterInfo(recovered.printerInfo);
           if (recovered.pricingProfile) setPricingProfile(recovered.pricingProfile);
           if (recovered.cashfreeEnv) setCashfreeEnv(normalizeCashfreeMode(recovered.cashfreeEnv));
+          const recoveredMode = recovered.paymentMode || (recovered.enableDemoPayment ? 'DEMO_SIMULATION' : (recovered.cashfreeEnv || recovered.orderId ? 'CASHFREE_ONLINE' : 'CASH_AT_COUNTER'));
+          setPaymentMode(recoveredMode);
+          if (recovered.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(recovered.enableDemoPayment));
+          if (recovered.demoAccessCodeRequired !== undefined) setDemoAccessCodeRequired(Boolean(recovered.demoAccessCodeRequired));
           if (recovered.fileData) setFileData(recovered.fileData);
           if (recovered.settings) setSettings(recovered.settings);
           if (recovered.price) setPrice(recovered.price);
           if (recovered.pricingBreakdown) setServerBreakdown(recovered.pricingBreakdown);
           if (urlJobId || recovered.jobId) setJobId(urlJobId || recovered.jobId);
           if (urlOrderId || recovered.orderId) setOrderId(urlOrderId || recovered.orderId);
+
+          // Restore E2E encryption keys if session was encrypted
+          if (recovered.e2e?.isEncrypted) {
+            if (recovered.e2e.encryptedKey) setEncryptedKey(recovered.e2e.encryptedKey);
+            if (recovered.e2e.iv) setIv(recovered.e2e.iv);
+          }
+
+          // Advance to Step 2 if file was already uploaded and no checkout is active
+          if (recovered.fileData && !urlOrderId && !urlJobId && !recovered.jobId) {
+            setStep(2);
+          }
+
+          // Rehydrate preview Blob URL from the authenticated preview endpoint
+          if (recovered.fileData?.filename && token) {
+            const diskFilename = recovered.fileData.filename.split('/').pop();
+            axios
+              .get(`${API_URL}/api/upload/preview/${encodeURIComponent(diskFilename)}`, {
+                headers: { Authorization: `Bearer ${token}` },
+                responseType: 'arraybuffer',
+              })
+              .then(async (res) => {
+                if (cancelled || !res.data) return;
+                let finalBuffer = res.data;
+
+                // Client-side decryption if the recovered file was E2E encrypted
+                if (recovered.e2e?.isEncrypted && recovered.e2e?.rawKey && recovered.e2e?.rawIv) {
+                  try {
+                    const rawKeyStr = forge.util.decode64(recovered.e2e.rawKey);
+                    const rawIvStr = forge.util.decode64(recovered.e2e.rawIv);
+                    const rawKeyBytes = new Uint8Array(rawKeyStr.length);
+                    for (let i = 0; i < rawKeyStr.length; i++) rawKeyBytes[i] = rawKeyStr.charCodeAt(i);
+                    const rawIvBytes = new Uint8Array(rawIvStr.length);
+                    for (let i = 0; i < rawIvStr.length; i++) rawIvBytes[i] = rawIvStr.charCodeAt(i);
+
+                    const cryptoKey = await window.crypto.subtle.importKey(
+                      'raw',
+                      rawKeyBytes,
+                      { name: 'AES-GCM' },
+                      false,
+                      ['decrypt']
+                    );
+                    finalBuffer = await window.crypto.subtle.decrypt(
+                      { name: 'AES-GCM', iv: rawIvBytes },
+                      cryptoKey,
+                      res.data
+                    );
+                  } catch (decErr) {
+                    console.warn('Client-side decryption of recovered preview failed:', decErr);
+                    return;
+                  }
+                }
+
+                const mime = recovered.fileData.mimetype || 'application/pdf';
+                const blob = new Blob([finalBuffer], { type: mime });
+                assignPreviewBlob(blob, recovered.fileData.originalName);
+              })
+              .catch((err) => {
+                const status = err.response?.status;
+                console.warn('Preview blob rehydration status:', status || err.message);
+                if (status === 410) {
+                  clearRecoveredSession(scopeParams);
+                  setStep(1);
+                  showError('Session expired. Please scan the QR flyer again.');
+                }
+              });
+          }
 
           // Best-effort live pricing profile refresh without minting a new session
           axios
@@ -302,6 +427,10 @@ const MobileView = () => {
               if (!cancelled && pRes.data?.success) {
                 if (pRes.data.pricingProfile) setPricingProfile(pRes.data.pricingProfile);
                 if (pRes.data.cashfreeEnv) setCashfreeEnv(normalizeCashfreeMode(pRes.data.cashfreeEnv));
+                const modeFromPricing = pRes.data.paymentMode || (pRes.data.enableDemoPayment ? 'DEMO_SIMULATION' : (pRes.data.cashfreeEnv ? 'CASHFREE_ONLINE' : null));
+                if (modeFromPricing) setPaymentMode(modeFromPricing);
+                if (pRes.data.enableDemoPayment !== undefined) setEnableDemoPayment(Boolean(pRes.data.enableDemoPayment));
+                if (pRes.data.demoAccessCodeRequired !== undefined) setDemoAccessCodeRequired(Boolean(pRes.data.demoAccessCodeRequired));
               }
             })
             .catch(() => {});
@@ -316,6 +445,12 @@ const MobileView = () => {
             if (res.data.pricingProfile) setPricingProfile(res.data.pricingProfile);
             const envMode = normalizeCashfreeMode(res.data.cashfreeEnv);
             setCashfreeEnv(envMode);
+            const resolvedPaymentMode = res.data.paymentMode || (res.data.enableDemoPayment ? 'DEMO_SIMULATION' : (res.data.cashfreeEnv ? 'CASHFREE_ONLINE' : 'CASH_AT_COUNTER'));
+            setPaymentMode(resolvedPaymentMode);
+            const demoAllowed = Boolean(res.data.enableDemoPayment);
+            setEnableDemoPayment(demoAllowed);
+            const demoCodeRequired = res.data.demoAccessCodeRequired !== false;
+            setDemoAccessCodeRequired(demoCodeRequired);
 
             saveRecoveredSession(scopeParams, {
               publicCode,
@@ -324,6 +459,9 @@ const MobileView = () => {
               printerInfo: res.data.printer || null,
               pricingProfile: res.data.pricingProfile || DEFAULT_PRICING_PROFILE,
               cashfreeEnv: envMode,
+              paymentMode: resolvedPaymentMode,
+              enableDemoPayment: demoAllowed,
+              demoAccessCodeRequired: demoCodeRequired,
               expiresAt: res.data.expiresAt || null,
             });
           }
@@ -338,6 +476,12 @@ const MobileView = () => {
             if (res.data.pricingProfile) setPricingProfile(res.data.pricingProfile);
             const envMode = normalizeCashfreeMode(res.data.cashfreeEnv);
             setCashfreeEnv(envMode);
+            const resolvedPaymentMode = res.data.paymentMode || (res.data.enableDemoPayment ? 'DEMO_SIMULATION' : (res.data.cashfreeEnv ? 'CASHFREE_ONLINE' : 'CASH_AT_COUNTER'));
+            setPaymentMode(resolvedPaymentMode);
+            const demoAllowed = Boolean(res.data.enableDemoPayment);
+            setEnableDemoPayment(demoAllowed);
+            const demoCodeRequired = res.data.demoAccessCodeRequired !== false;
+            setDemoAccessCodeRequired(demoCodeRequired);
 
             saveRecoveredSession(scopeParams, {
               sessionCode: effectiveCode,
@@ -345,6 +489,9 @@ const MobileView = () => {
               machineId: res.data.machineId || null,
               pricingProfile: res.data.pricingProfile || DEFAULT_PRICING_PROFILE,
               cashfreeEnv: envMode,
+              paymentMode: resolvedPaymentMode,
+              enableDemoPayment: demoAllowed,
+              demoAccessCodeRequired: demoCodeRequired,
               expiresAt: res.data.expiresAt || null,
             });
           }
@@ -368,10 +515,36 @@ const MobileView = () => {
           setIsConnected(true);
           newSocket.emit('join_session', effectiveCode);
           newSocket.emit('mobile_connected', effectiveCode);
+          // Re-fetch authoritative status after reconnection
+          if (publicCode) {
+            axios
+              .get(`${API_URL}/api/auth/printer-qr/${publicCode}`)
+              .then((pRes) => {
+                if (!cancelled && pRes.data?.printer) setPrinterInfo(pRes.data.printer);
+              })
+              .catch(() => {});
+          }
         });
 
         newSocket.on('disconnect', () => setIsConnected(false));
         newSocket.on('connect_error', () => setIsConnected(false));
+
+        newSocket.on('printer_status_update', (statusData) => {
+          if (!cancelled && statusData && typeof statusData === 'object') {
+            setPrinterInfo((prev) => ({
+              ...(prev || {}),
+              name: statusData.name || prev?.name || 'Counter Printer',
+              location: statusData.location || prev?.location || 'Front Desk',
+              model: statusData.printerModel || prev?.model || 'Unknown',
+              isOnline: statusData.isReady ?? statusData.isOnline ?? false,
+              hardwareStatus: statusData.hardwareStatus || statusData.status || (statusData.isOnline ? 'ONLINE' : 'AGENT_OFFLINE'),
+              statusMessage: statusData.statusMessage,
+              paperStatus: statusData.paperStatus,
+              tonerStatus: statusData.tonerStatus,
+              jamStatus: statusData.jamStatus,
+            }));
+          }
+        });
 
         // Security rule: socket payment notifications MUST verify server-side rather than trusting event alone
         newSocket.on('kiosk_payment_success', async ({ jobId: eventJobId } = {}) => {
@@ -445,6 +618,9 @@ const MobileView = () => {
               const restoredJob = jobRes.data.job;
               setPrice(restoredJob.cost);
               setJobStatus(restoredJob.status);
+              if (restoredJob.paymentMode) {
+                setPaymentMode(restoredJob.paymentMode);
+              }
               if (['WAITING', 'PRINTING', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(restoredJob.status)) {
                 setStep(4);
               }
@@ -668,6 +844,7 @@ const MobileView = () => {
 
       // E2E Encryption Flow when publicKey & WebCrypto are available
       const hasSubtleCrypto = typeof window !== 'undefined' && window.crypto && window.crypto.subtle;
+      let e2eMetadata = null;
       if (publicKey && hasSubtleCrypto) {
         try {
           const rawKey = window.crypto.getRandomValues(new Uint8Array(32));
@@ -697,9 +874,21 @@ const MobileView = () => {
             mgf1: { md: forge.md.sha256.create() },
           });
 
-          setEncryptedKey(forge.util.encode64(encryptedRawKey));
-          setIv(forge.util.encode64(rawIvStr));
+          const encryptedRawKeyB64 = forge.util.encode64(encryptedRawKey);
+          const rawIvB64 = forge.util.encode64(rawIvStr);
+          const rawKeyB64 = forge.util.encode64(rawKeyStr);
+
+          setEncryptedKey(encryptedRawKeyB64);
+          setIv(rawIvB64);
           isEncrypted = true;
+
+          e2eMetadata = {
+            isEncrypted: true,
+            rawKey: rawKeyB64,
+            rawIv: rawIvB64,
+            encryptedKey: encryptedRawKeyB64,
+            iv: rawIvB64,
+          };
         } catch (encErr) {
           console.warn('E2E encryption failed, proceeding with direct upload:', encErr);
           isEncrypted = false;
@@ -735,6 +924,7 @@ const MobileView = () => {
 
         saveRecoveredSession(scopeParams, {
           fileData: data,
+          e2e: e2eMetadata || { isEncrypted: false },
         });
 
         const currentSid = activeSessionId || sessionId;
@@ -833,6 +1023,10 @@ const MobileView = () => {
           // ignore snapshot parse issues; liveBreakdown remains accurate fallback
         }
 
+        if (createdJob.paymentMode) {
+          setPaymentMode(createdJob.paymentMode);
+        }
+
         saveRecoveredSession(scopeParams, {
           jobId: createdJob.shortId,
           orderId: null,
@@ -840,6 +1034,7 @@ const MobileView = () => {
           pricingBreakdown: parsedBreakdown,
           fileData,
           settings,
+          paymentMode: createdJob.paymentMode || paymentMode,
           paymentState: 'READY',
         });
 
@@ -956,6 +1151,70 @@ const MobileView = () => {
     }
   };
 
+  // Simulated Staging Demo Payment Flow (Produces real physical print on Staging Epson printer)
+  const handleDemoPayment = async () => {
+    if (!jobId) {
+      showError('Missing Print Job ID. Please confirm your print settings again.');
+      return;
+    }
+    const trimmedCode = (demoAccessCode || '').trim();
+    if (demoAccessCodeRequired && !trimmedCode) {
+      showError('Demo access code is required for simulated physical printing.');
+      return;
+    }
+    if (demoPayInFlightRef.current || isExecutingDemoPay || isInitializingPayment || isVerifyingPayment) {
+      return;
+    }
+
+    demoPayInFlightRef.current = true;
+    setIsExecutingDemoPay(true);
+    setPaymentOutcome(null);
+
+    try {
+      const res = await axios.post(
+        `${API_URL}/api/payments/demo-pay/${encodeURIComponent(jobId)}`,
+        demoAccessCodeRequired ? { accessCode: trimmedCode } : {},
+        { headers: authHeaders() }
+      );
+
+      if (res.data?.success && res.data?.job) {
+        const returnedJob = res.data.job;
+        setJobId(returnedJob.shortId);
+        setJobStatus(returnedJob.status || 'WAITING');
+
+        if (res.data.dispatched === false) {
+          setDispatchWarning(
+            res.data.message || 'Demo payment confirmed, but print queue dispatch encountered an error. Please notify the counter operator to release your print job.'
+          );
+        } else {
+          setDispatchWarning(null);
+        }
+
+        setStep(4);
+        // Note: demoAccessCode is strictly NEVER persisted to localStorage or sessionStorage
+        saveRecoveredSession(scopeParams, {
+          jobId: returnedJob.shortId,
+          orderId: res.data.payment?.gatewayOrderId || `demo_order_${returnedJob.shortId}`,
+          paymentState: 'PAID',
+        });
+      } else {
+        throw new Error(res.data?.error || 'Demo payment failed.');
+      }
+    } catch (err) {
+      console.error('Demo payment error:', err);
+      const msg = extractErrorMessage(err, 'Failed to complete simulated demo payment.');
+      setPaymentOutcome({
+        type: 'FAILED',
+        message: msg,
+      });
+      showError(msg);
+    } finally {
+      setDemoAccessCode(''); // Always clear access code after use
+      setIsExecutingDemoPay(false);
+      demoPayInFlightRef.current = false;
+    }
+  };
+
   // Download Customer Receipt / Tax Invoice PDF cleanly via authenticated Blob fetch
   const handleDownloadCustomerReceipt = async () => {
     if (!jobId || downloadingReceipt) return;
@@ -984,9 +1243,7 @@ const MobileView = () => {
   const effectivePreviewUrl =
     previewUrl ||
     (fileData?.filename
-      ? fileData.filename.startsWith('http')
-        ? fileData.filename
-        : `${API_URL}${fileData.filename.startsWith('/') ? '' : '/'}${fileData.filename}`
+      ? `${API_URL}/api/upload/preview/${encodeURIComponent(fileData.filename.split('/').pop())}`
       : null);
 
   const displayedTotal = step >= 3 && price > 0 ? price : liveBreakdown.totalAmount;
@@ -1007,9 +1264,23 @@ const MobileView = () => {
       </div>
 
       <div className="flex items-center gap-2">
-        <div className="s3k-status-pill" title={printerInfo?.name || 'Main Shop Printer'}>
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-          <span>Kiosk Online</span>
+        <div
+          className="s3k-status-pill"
+          title={printerInfo?.name ? `${printerInfo.name} (${customerStatusText})` : customerStatusText}
+          style={{
+            borderColor: isPrinterReady
+              ? 'rgba(52, 211, 153, 0.4)'
+              : (isAgentOffline ? 'rgba(251, 191, 36, 0.4)' : 'rgba(239, 68, 68, 0.4)')
+          }}
+        >
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${
+              isPrinterReady
+                ? 'bg-emerald-400 animate-pulse'
+                : (isAgentOffline ? 'bg-amber-400' : (isPrinterDisconnected ? 'bg-red-400' : 'bg-slate-400'))
+            }`}
+          />
+          <span>{customerStatusText}</span>
         </div>
       </div>
     </header>
@@ -1064,12 +1335,12 @@ const MobileView = () => {
                     width: 34,
                     height: 34,
                     borderRadius: 8,
-                    background: 'rgba(30, 64, 175, 0.35)',
-                    border: '1px solid rgba(212, 175, 55, 0.35)',
+                    background: isPrinterReady ? 'rgba(30, 64, 175, 0.35)' : 'rgba(239, 68, 68, 0.15)',
+                    border: isPrinterReady ? '1px solid rgba(212, 175, 55, 0.35)' : '1px solid rgba(239, 68, 68, 0.3)',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    color: '#D4AF37',
+                    color: isPrinterReady ? '#D4AF37' : '#EF4444',
                     flexShrink: 0,
                   }}
                 >
@@ -1077,10 +1348,11 @@ const MobileView = () => {
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="text-xs font-bold text-white truncate leading-tight">
-                    {printerInfo?.name || 'Main Shop Printer'}
+                    {printerInfo?.name || 'Counter Printer'}
                   </p>
                   <p className="text-[10.5px] text-slate-300 truncate mt-0.5 leading-none">
-                    {printerInfo?.location || 'Counter Terminal'} • Ready to print
+                    {printerInfo?.location || 'Counter Terminal'} • {customerStatusText}
+                    {printerInfo?.lastTelemetryAt && ` • Freshness: ${new Date(printerInfo.lastTelemetryAt).toLocaleTimeString()}`}
                   </p>
                 </div>
               </div>
@@ -1091,22 +1363,62 @@ const MobileView = () => {
                     padding: '0.2rem 0.55rem',
                     fontSize: '0.68rem',
                     fontWeight: 700,
-                    color: '#34D399',
-                    background: 'rgba(16, 185, 129, 0.12)',
-                    border: '1px solid rgba(16, 185, 129, 0.3)',
+                    color: isPrinterReady ? '#34D399' : (isAgentOffline ? '#FBBF24' : '#EF4444'),
+                    background: isPrinterReady ? 'rgba(16, 185, 129, 0.12)' : (isAgentOffline ? 'rgba(245, 158, 11, 0.12)' : 'rgba(239, 68, 68, 0.12)'),
+                    border: `1px solid ${isPrinterReady ? 'rgba(16, 185, 129, 0.3)' : (isAgentOffline ? 'rgba(245, 158, 11, 0.3)' : 'rgba(239, 68, 68, 0.3)')}`,
                     borderRadius: '9999px',
                     display: 'inline-flex',
                     alignItems: 'center',
                     gap: '0.3rem',
                   }}
                 >
-                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#10B981', display: 'inline-block' }} />
-                  Fast Spool
+                  <span style={{ width: 5, height: 5, borderRadius: '50%', background: isPrinterReady ? '#10B981' : (isAgentOffline ? '#F59E0B' : '#EF4444'), display: 'inline-block' }} />
+                  {isPrinterReady ? 'Ready' : (isAgentOffline ? 'Offline' : (isPrinterDisconnected ? 'Disconnected' : 'Unavailable'))}
                 </span>
               </div>
             </div>
 
-            <div className="s3k-upload-dropzone">
+            {!isPrinterReady && (
+              <div
+                className="s3k-card text-center py-3 px-3 animate-fade-in"
+                style={{
+                  background: 'rgba(245, 158, 11, 0.1)',
+                  border: '1px solid rgba(245, 158, 11, 0.35)',
+                  borderRadius: 12,
+                }}
+              >
+                <div className="flex items-center justify-center gap-1.5 mb-1 text-amber-400 font-bold text-xs">
+                  <AlertTriangle size={15} />
+                  <span>{customerStatusText}</span>
+                </div>
+                <p className="text-slate-300 text-[11px] leading-relaxed mb-2.5">
+                  The printer at this counter is currently unavailable. File uploads and payments are temporarily paused.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleRefreshPrinterStatus}
+                  disabled={isRefreshingStatus}
+                  className="btn text-xs py-1 px-3 mx-auto"
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.1)',
+                    border: '1px solid rgba(255, 255, 255, 0.2)',
+                    color: '#FFFFFF',
+                    borderRadius: 8,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: '0.35rem',
+                  }}
+                >
+                  <RefreshCw size={12} className={isRefreshingStatus ? 'animate-spin' : ''} />
+                  Refresh Status
+                </button>
+              </div>
+            )}
+
+            <div
+              className="s3k-upload-dropzone"
+              style={!isPrinterReady ? { opacity: 0.55 } : {}}
+            >
               <div
                 style={{
                   width: 62,
@@ -1169,7 +1481,10 @@ const MobileView = () => {
                   </button>
                 </div>
               ) : (
-                <label className="s3k-primary-btn s3k-gold-btn max-w-xs mx-auto cursor-pointer">
+                <label
+                  className={`s3k-primary-btn s3k-gold-btn max-w-xs mx-auto ${!isPrinterReady ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
+                  style={!isPrinterReady ? { pointerEvents: 'none' } : {}}
+                >
                   <Upload size={18} />
                   Choose Files to Print
                   <input
@@ -1178,7 +1493,7 @@ const MobileView = () => {
                     accept=".pdf,image/png,image/jpeg,image/jpg,image/webp"
                     style={{ display: 'none' }}
                     onChange={handleFileUpload}
-                    disabled={uploading}
+                    disabled={uploading || !isPrinterReady}
                   />
                 </label>
               )}
@@ -1541,6 +1856,113 @@ const MobileView = () => {
           );
         }
 
+        // CASH AT COUNTER MODE: Simplified 1-screen customer experience
+        if (paymentMode === 'CASH_AT_COUNTER') {
+          return (
+            <div className="flex flex-col justify-center animate-scale-in" style={{ gap: '0.65rem' }}>
+              <div className="s3k-card s3k-card-gold text-center py-5 px-4 flex flex-col items-center justify-center">
+                <div
+                  style={{
+                    width: 58,
+                    height: 58,
+                    borderRadius: '50%',
+                    background: 'linear-gradient(135deg, rgba(16,185,129,0.3) 0%, rgba(15,23,42,0.8) 100%)',
+                    border: '1.5px solid rgba(16, 185, 129, 0.5)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    boxShadow: '0 0 16px rgba(16, 185, 129, 0.25)',
+                    marginBottom: '0.75rem',
+                  }}
+                >
+                  <Banknote size={32} style={{ color: '#10B981' }} />
+                </div>
+
+                <h2 className="text-xl font-black text-white mb-1">Pay at Counter</h2>
+
+                <div className="w-full bg-slate-900/90 border border-emerald-500/30 rounded-xl p-3.5 text-left mb-3">
+                  <p className="text-xs text-slate-200 leading-relaxed font-medium">
+                    Your print order is ready.<br />
+                    Show your Order ID to the cashier and pay the exact amount in cash.<br />
+                    Printing will start after the cashier confirms payment.
+                  </p>
+                </div>
+
+                {/* Prominent Order ID Box */}
+                <div className="w-full bg-slate-950/80 border border-amber-400/40 rounded-xl p-3 text-center mb-3">
+                  <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block mb-1">
+                    Order ID
+                  </span>
+                  <div className="text-2xl font-black text-amber-400 tracking-wider">
+                    #{jobId}
+                  </div>
+                </div>
+
+                {/* Authoritative Order Summary */}
+                <div className="w-full bg-slate-900/70 border border-slate-700/80 rounded-xl p-3 text-left mb-3">
+                  <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                    <span>Document</span>
+                    <span className="font-bold text-white truncate max-w-[170px]">{fileData?.originalName || 'Document'}</span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                    <span>Pages & Copies</span>
+                    <span className="font-bold text-white">
+                      {settings.pagesToPrint} {settings.pagesToPrint === 1 ? 'Page' : 'Pages'} × {settings.copies}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                    <span>Print Mode</span>
+                    <span className="font-bold text-white">
+                      {settings.color === 'color' ? 'Full Color' : 'Black & White'} •{' '}
+                      {settings.duplex === 'double' ? 'Double Sided' : 'Single Sided'}
+                    </span>
+                  </div>
+                  {displayedBreakdown?.convenienceFee > 0 && (
+                    <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                      <span>Convenience Fee</span>
+                      <span>₹{Number(displayedBreakdown.convenienceFee).toFixed(2)}</span>
+                    </div>
+                  )}
+                  {displayedBreakdown?.gstEnabled && displayedBreakdown?.totalTax > 0 && (
+                    <div className="flex justify-between items-center text-xs text-slate-300 mb-1.5">
+                      <span>GST ({displayedBreakdown.gstRatePercent}%)</span>
+                      <span>₹{Number(displayedBreakdown.totalTax).toFixed(2)}</span>
+                    </div>
+                  )}
+                  <div className="border-t border-slate-700/80 pt-2 flex justify-between items-center">
+                    <span className="text-xs font-bold text-amber-400">Total Payable in Cash</span>
+                    <span className="text-xl font-black text-emerald-400">₹{Number(displayedTotal).toFixed(2)}</span>
+                  </div>
+                </div>
+
+                {/* Live Real-time Status Notice */}
+                <div className="w-full bg-emerald-950/30 border border-emerald-500/30 rounded-xl px-3 py-2.5 text-center mb-2 flex items-center justify-center gap-2">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
+                  <span className="text-xs font-bold text-emerald-300">
+                    Awaiting Cashier Confirmation...
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-slate-400 text-center mb-1">
+                  Please show this screen to the counter staff. Printing starts automatically once confirmed.
+                </p>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPaymentOutcome(null);
+                    setStep(2);
+                  }}
+                  className="s3k-back-btn mt-2"
+                >
+                  <ChevronLeft size={13} className="text-amber-400" />
+                  <span>Modify Print Settings</span>
+                </button>
+              </div>
+            </div>
+          );
+        }
+
         return (
           <div className="flex flex-col justify-center animate-scale-in" style={{ gap: '0.65rem' }}>
             <div className="s3k-card s3k-card-gold text-center py-4 px-4 flex flex-col items-center justify-center">
@@ -1647,9 +2069,14 @@ const MobileView = () => {
                 type="button"
                 className="s3k-primary-btn s3k-gold-btn text-base py-3.5 w-full"
                 onClick={handleCashfreeCheckout}
-                disabled={isInitializingPayment || isVerifyingPayment}
+                disabled={isInitializingPayment || isVerifyingPayment || !isPrinterReady}
+                style={!isPrinterReady ? { opacity: 0.6, cursor: 'not-allowed' } : {}}
               >
-                {isInitializingPayment ? (
+                {!isPrinterReady ? (
+                  <>
+                    <AlertTriangle size={18} /> Printer Offline — Payment Paused
+                  </>
+                ) : isInitializingPayment ? (
                   <>
                     <Loader size={20} className="animate-spin" /> Opening Cashfree Checkout...
                   </>
@@ -1663,6 +2090,22 @@ const MobileView = () => {
                 )}
               </button>
 
+              {!isPrinterReady && (
+                <div className="mt-2.5 text-center">
+                  <p className="text-[11px] text-amber-400 font-semibold mb-1">
+                    ⚠️ {customerStatusText}. Payment is paused until the printer is online.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleRefreshPrinterStatus}
+                    disabled={isRefreshingStatus}
+                    className="text-[11px] text-slate-300 underline inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    <RefreshCw size={11} className={isRefreshingStatus ? 'animate-spin' : ''} /> Check Printer Status
+                  </button>
+                </div>
+              )}
+
               {orderId && (
                 <button
                   type="button"
@@ -1674,6 +2117,61 @@ const MobileView = () => {
                 >
                   <RotateCcw size={12} /> Already paid? Check server status
                 </button>
+              )}
+
+              {/* Staging-Only Simulated Demo Payment Section */}
+              {enableDemoPayment && (
+                <div className="w-full mt-4 pt-4 border-t border-slate-700/80">
+                  <div className="bg-amber-500/10 border border-amber-500/40 rounded-xl p-3 text-left mb-2.5">
+                    <div className="flex items-center gap-1.5 text-amber-400 font-bold text-xs uppercase tracking-wider mb-1">
+                      <Sparkles size={14} />
+                      <span>Staging Simulation Warning</span>
+                    </div>
+                    <p className="text-[11px] text-amber-200/90 font-semibold leading-relaxed">
+                      NO REAL PAYMENT WILL BE CHARGED.<br />
+                      A REAL PHYSICAL PRINT WILL BE PRODUCED.
+                    </p>
+                  </div>
+
+                  {demoAccessCodeRequired ? (
+                    <div className="mb-3 text-left">
+                      <label className="block text-xs font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
+                        <Lock size={12} className="text-amber-400" />
+                        <span>Supervised Demo Access Code</span>
+                      </label>
+                      <input
+                        type="password"
+                        value={demoAccessCode}
+                        onChange={(e) => setDemoAccessCode(e.target.value)}
+                        placeholder="Enter demo access code"
+                        autoComplete="off"
+                        disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 transition-colors"
+                      />
+                    </div>
+                  ) : (
+                    <p className="mb-3 text-xs text-emerald-200 text-left">
+                      Access code is disabled for this Staging demo. Press the button below to run the simulation and dispatch the real print.
+                    </p>
+                  )}
+
+                  <button
+                    type="button"
+                    className="s3k-primary-btn bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-black text-sm py-3.5 w-full shadow-lg transition-all flex items-center justify-center gap-2"
+                    onClick={handleDemoPayment}
+                    disabled={isInitializingPayment || isVerifyingPayment || isExecutingDemoPay || (demoAccessCodeRequired && !demoAccessCode.trim())}
+                  >
+                    {isExecutingDemoPay ? (
+                      <>
+                        <Loader size={18} className="animate-spin" /> Authorizing & Dispatching Print...
+                      </>
+                    ) : (
+                      <>
+                        <Zap size={16} /> SIMULATE DEMO PAYMENT — STAGING ONLY
+                      </>
+                    )}
+                  </button>
+                </div>
               )}
 
               <button
@@ -1695,6 +2193,7 @@ const MobileView = () => {
         const isCompleted = jobStatus === 'COMPLETED';
         const isPrinting = jobStatus === 'PRINTING';
         const isFailed = jobStatus === 'FAILED' || jobStatus === 'CANCELLED';
+        const isCashMode = paymentMode === 'CASH_AT_COUNTER';
 
         return (
           <div className="flex flex-col justify-center animate-scale-in" style={{ gap: '0.65rem' }}>
@@ -1743,10 +2242,17 @@ const MobileView = () => {
                     ? 'Printing Your Document...'
                     : isFailed
                       ? 'Printing Halted'
-                      : 'Payment Verified & Queued'}
+                      : isCashMode
+                        ? 'Cash Received — Printing Started'
+                        : 'Payment Verified & Queued'}
               </h2>
 
               <p className="text-xs text-slate-300 mb-3">
+                {isCashMode && !isCompleted && !isFailed ? (
+                  <span className="text-emerald-300 font-semibold block mb-1">
+                    Your payment is confirmed. Your print job is processing.
+                  </span>
+                ) : null}
                 Job ID: <strong className="text-amber-400">{jobId}</strong>
               </p>
 
@@ -1765,8 +2271,25 @@ const MobileView = () => {
                 }}
               >
                 <span className="w-2 h-2 rounded-full animate-ping" style={{ background: 'currentColor' }} />
-                Status: {jobStatus}
+                Status: {isCashMode
+                  ? (isCompleted ? 'Completed' : isPrinting ? 'Printing' : isFailed ? 'Failed' : 'Processing')
+                  : jobStatus}
               </div>
+
+              {/* Operator attention notice when payment succeeded but dispatch failed */}
+              {dispatchWarning && (
+                <div className="w-full bg-amber-500/15 border border-amber-500/50 rounded-xl p-3 text-left mb-3">
+                  <div className="flex items-center gap-1.5 text-amber-400 font-bold text-xs uppercase tracking-wider mb-1">
+                    <AlertTriangle size={14} />
+                    <span>Print Queue Notice — Operator Attention Required</span>
+                  </div>
+                  <p className="text-[11px] text-amber-200 font-medium leading-relaxed">
+                    Your demo payment was verified, but the print queue could not immediately start.
+                    <br />
+                    <strong>Do not pay again.</strong> Please inform the store operator to release Job ID <strong>{jobId}</strong> from the Admin Dashboard.
+                  </p>
+                </div>
+              )}
 
               <div className="w-full bg-slate-900/70 border border-slate-700/80 rounded-xl p-3 text-left mb-3">
                 <p className="text-xs font-bold text-amber-400 mb-1">Collection Details</p>
@@ -1915,6 +2438,7 @@ const MobileView = () => {
         fileName={previewFileName || fileData?.originalName}
         fileSize={fileData?.size}
         initialPages={fileData?.pages || 1}
+        sessionToken={sessionToken}
       />
     </div>
   );

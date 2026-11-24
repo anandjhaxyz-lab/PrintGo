@@ -4,6 +4,7 @@ const AppError = require('../../utils/AppError');
 const logger = require('../../utils/logger');
 const { isValidPaymentTransition, isValidJobTransition } = require('../../utils/stateMachine');
 const refundService = require('../../services/refund.service');
+const { computePrinterAvailability } = require('../../services/printerAvailability.service');
 const {
   getCashfreeConfig,
   getPublicAppUrl,
@@ -130,12 +131,42 @@ const createOrder = async (jobId, options = {}) => {
 
   const initialJob = await prisma.printJob.findUnique({
     where: { shortId: jobId },
-    include: { payment: true, customer: true }
+    include: {
+      payment: true,
+      customer: true,
+      machine: {
+        include: {
+          printerStatuses: {
+            take: 1,
+            orderBy: { timestamp: 'desc' }
+          }
+        }
+      }
+    }
   });
 
   if (!initialJob) throw new AppError('Job not found', 404);
   if (initialJob.status !== 'PENDING_PAYMENT') {
     throw new AppError(`Job cannot be paid. Current status: ${initialJob.status}`, 400);
+  }
+
+  // Cash at counter guard: online checkout is not allowed for cash orders
+  if (initialJob.paymentMode === 'CASH_AT_COUNTER') {
+    throw new AppError('Job is configured for Cash at Counter payment. Online checkout is not enabled.', 400);
+  }
+
+  // Authoritative Hardware Availability Guard: Never accept payment for an unserviceable job
+  if (!initialJob.machineId || !initialJob.machine) {
+    throw new AppError('Job is not assigned to a registered printer', 400);
+  }
+
+  const availability = computePrinterAvailability(initialJob.machine, initialJob.machine.printerStatuses?.[0] || null);
+  if (!availability.isReady || availability.status !== 'ONLINE') {
+    logger.warn(`Rejected payment order creation for job ${initialJob.shortId}: Printer '${initialJob.machine.name}' is ${availability.status} (${availability.statusMessage})`);
+    throw new AppError(
+      `Printer is currently unavailable (${availability.statusMessage}). Cannot accept payment until printer is online.`,
+      409
+    );
   }
 
   // A4: Guard against creating orders if payment already succeeded
@@ -909,6 +940,14 @@ const refundPayment = async (jobId, user = null, refundReason = 'PrintGo Custome
 
   if (!job.payment) throw new AppError('No payment record found for this job', 400);
 
+  if (job.status === 'COMPLETED') {
+    throw new AppError('Completed jobs cannot be refunded through the failure workflow as physical printing was already fulfilled.', 400);
+  }
+
+  if (job.status === 'PRINTING') {
+    throw new AppError('Cannot refund a job currently in PRINTING status. Resolve the physical print outcome first.', 400);
+  }
+
   const refundRecord = await refundService.createRefund({
     paymentId: job.payment.id,
     amount: options.amount,
@@ -926,7 +965,7 @@ const refundPayment = async (jobId, user = null, refundReason = 'PrintGo Custome
     where: { id: job.payment.id }
   });
 
-  if (!options.preserveJobStatus && updatedPayment?.status === 'REFUNDED' && job.status !== 'CANCELLED' && job.status !== 'FAILED') {
+  if (!options.preserveJobStatus && updatedPayment?.status === 'REFUNDED' && job.status !== 'CANCELLED') {
     const updatedJob = await prisma.printJob.update({
       where: { id: job.id },
       data: { status: 'CANCELLED' },

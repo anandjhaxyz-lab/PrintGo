@@ -2,8 +2,22 @@ const prisma = require('./utils/prisma');
 const logger = require('./utils/logger');
 const { isValidJobTransition } = require('./utils/stateMachine');
 const { computeIsOnline } = require('./modules/machines/machines.service');
+const { getMachineAvailability, computePrinterAvailability } = require('./services/printerAvailability.service');
 
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const {
+  handlePrinterAgentHello,
+  handlePrinterDeviceRegistryRequest,
+  handlePrinterInventoryReport,
+  handlePrinterDeviceTelemetry
+} = require('./services/printerAgentProtocol.service');
+const {
+  verifyPrinterDeviceReport,
+  authorizePrinterDeviceDispatch,
+  renewPrinterDeviceDispatchLease,
+  releasePrinterDeviceDispatchLease
+} = require('./services/printerDeviceJobBinding.service');
 
 const setupSockets = (io) => {
   // WebSocket Authentication Middleware
@@ -19,6 +33,10 @@ const setupSockets = (io) => {
         if (decoded.type === 'session') {
           socket.sessionId = decoded.sessionId;
           socket.machineId = decoded.machineId; // Optional
+        } else {
+          socket.userId = decoded.id;
+          socket.userRole = decoded.role;
+          socket.companyId = decoded.companyId;
         }
         return next();
       } 
@@ -37,6 +55,7 @@ const setupSockets = (io) => {
         socket.userType = 'printer';
         socket.machineId = machine.id;
         socket.machineName = machine.name;
+        socket.companyId = machine.companyId;
         logger.info(`Printer agent authenticated: ${machine.name} (${machine.id})`);
         return next();
       }
@@ -56,6 +75,22 @@ const setupSockets = (io) => {
       // Notify the printer it successfully registered
       socket.emit('printer_registered_success', { machineId: socket.machineId, name: socket.machineName });
 
+      // Broadcast fresh availability to customer sessions and admins
+      (async () => {
+        try {
+          const availability = await getMachineAvailability(socket.machineId, prisma);
+          if (availability) {
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', availability);
+            if (socket.companyId) {
+              io.to(`company_${socket.companyId}`).emit('printer_status_update', availability);
+            }
+            io.to('superadmins').emit('printer_status_update', availability);
+          }
+        } catch (err) {
+          logger.error('Error broadcasting machine availability on connect:', err);
+        }
+      })();
+
       // P4: Recovery System for dropped socket messages.
       // Reconcile active PRINTING jobs safely via agent journal rather than blindly re-emitting physical_print_job!
       (async () => {
@@ -65,13 +100,31 @@ const setupSockets = (io) => {
               machineId: socket.machineId,
               status: 'PRINTING'
             },
-            select: { shortId: true }
+            select: {
+              shortId: true,
+              printerDeviceId: true,
+              printerWindowsQueueName: true
+            }
           });
           
           if (stuckJobs.length > 0) {
             const jobIds = stuckJobs.map(j => j.shortId);
-            logger.info(`Requesting reconciliation for ${jobIds.length} active PRINTING job(s) from machine ${socket.machineId}: ${jobIds.join(', ')}`);
-            socket.emit('reconcile_active_jobs', { jobIds });
+            const requestId = `rec_${socket.machineId}_${Date.now()}_${crypto.randomUUID()}`;
+            const jobBindings = Object.fromEntries(stuckJobs.map((job) => [
+              job.shortId,
+              job.printerDeviceId ? {
+                printerDeviceId: job.printerDeviceId,
+                windowsPrinterName: job.printerWindowsQueueName || null
+              } : null
+            ]));
+            socket.activeReconciliation = {
+              requestId,
+              jobIds: new Set(jobIds),
+              jobBindings,
+              createdAt: Date.now()
+            };
+            logger.info(`Requesting reconciliation [ReqID: ${requestId}] for ${jobIds.length} active PRINTING job(s) from machine ${socket.machineId}: ${jobIds.join(', ')}`);
+            socket.emit('reconcile_active_jobs', { requestId, jobIds, jobBindings });
           }
         } catch (e) {
           logger.error('Error recovering stuck jobs for printer:', e);
@@ -79,11 +132,29 @@ const setupSockets = (io) => {
       })();
     } else if (socket.userType === 'session' && socket.machineId) {
       socket.join(`machine_${socket.machineId}`);
+
+      // Push current authoritative machine availability to newly joined customer session
+      (async () => {
+        try {
+          const availability = await getMachineAvailability(socket.machineId, prisma);
+          if (availability) {
+            socket.emit('printer_status_update', availability);
+          }
+        } catch (err) {
+          logger.error('Error sending availability to customer session socket:', err);
+        }
+      })();
     }
 
-    // Admin users join the 'admins' room for receiving printer status updates
+    // Admin users join their tenant company room; ONLY superadmins join global admin rooms
     if (socket.userType === 'admin') {
-      socket.join('admins');
+      if (socket.userRole === 'SUPERADMIN') {
+        socket.join('admins');
+        socket.join('superadmins');
+      }
+      if (socket.companyId) {
+        socket.join(`company_${socket.companyId}`);
+      }
     }
 
     socket.on('register_public_key', async ({ publicKey }) => {
@@ -98,6 +169,58 @@ const setupSockets = (io) => {
           logger.error(`Error registering public key for machine ${socket.machineId}:`, err);
         }
       }
+    });
+
+    // Backward-compatible Agent protocol negotiation. Older agents never emit
+    // this event and continue using the existing Machine Key + single-printer flow.
+    socket.on('printer_agent_hello', async (payload) => {
+      await handlePrinterAgentHello({ socket, prisma, logger, payload });
+    });
+
+    // Device-bound print requests fetch a fresh authenticated registry so an
+    // Admin approval/disable/remap is applied before any physical dispatch.
+    socket.on('printer_device_registry_request', async (payload = {}) => {
+      await handlePrinterDeviceRegistryRequest({
+        socket,
+        prisma,
+        logger,
+        requestId: payload?.requestId
+      });
+    });
+
+    // Final database authorization runs after Agent document preparation and
+    // immediately before the device-bound Windows driver submission.
+    socket.on('printer_device_dispatch_authorization_request', async (payload = {}) => {
+      await authorizePrinterDeviceDispatch({ socket, prisma, request: payload });
+    });
+
+    socket.on('printer_device_dispatch_lease_renewal', async (payload = {}) => {
+      const result = await renewPrinterDeviceDispatchLease({ socket, prisma, request: payload });
+      socket.emit('printer_device_dispatch_lease_renewal_result', {
+        requestId: payload?.requestId,
+        jobId: payload?.jobId,
+        printerDeviceId: payload?.printerDeviceId,
+        windowsPrinterName: payload?.windowsPrinterName,
+        renewed: result.renewed,
+        leaseId: result.leaseId || null,
+        expiresAt: result.expiresAt ? result.expiresAt.toISOString() : null,
+        code: result.code || null
+      });
+      if (!result.renewed) {
+        logger.warn(`Printer dispatch lease renewal refused for request ${payload?.requestId || 'unknown'}: ${result.code || 'unknown error'}`);
+      }
+    });
+
+    socket.on('printer_device_dispatch_lease_release', async (payload = {}) => {
+      const result = await releasePrinterDeviceDispatchLease({ socket, prisma, request: payload });
+      if (!result.released && result.code !== 'DISPATCH_LEASE_NOT_ACTIVE') {
+        logger.warn(`Printer dispatch lease release failed for request ${payload?.requestId || 'unknown'}: ${result.code || 'unknown error'}`);
+      }
+    });
+
+    // Discovery is persisted for Admin review only; it never approves a device.
+    socket.on('printer_inventory_report', async (payload) => {
+      await handlePrinterInventoryReport({ socket, io, logger, prisma, payload });
     });
 
     // Kiosk <-> Mobile Sync
@@ -182,12 +305,53 @@ const setupSockets = (io) => {
     });
 
     socket.on('printer_status_update', async (status) => {
+      // Child-printer telemetry: process through device telemetry bridge.
+      // If the emitting device is the verified sole active default printer,
+      // it bridges to machine-level availability and broadcasts to customer/admin rooms.
+      if (status?.printerDeviceId) {
+        try {
+          const result = await handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status });
+          if (result?.bridged === true && socket.machineId) {
+            const availability = await getMachineAvailability(socket.machineId, prisma);
+            const broadcastPayload = {
+              ...status,
+              ...(availability || {}),
+              printerModel: availability?.printerModel || 'Unknown',
+              connectionType: (status?.connectionType || availability?.connectionType || 'Unknown'),
+              machineId: socket.machineId,
+            };
+
+            if (availability) {
+              io.to(`machine_${socket.machineId}`).emit('printer_status_update', broadcastPayload);
+            }
+            if (socket.companyId) {
+              io.to(`company_${socket.companyId}`).emit('printer_status_update', broadcastPayload);
+            }
+            io.to('superadmins').emit('printer_status_update', broadcastPayload);
+          }
+        } catch (err) {
+          logger.error('Error handling printer device telemetry bridge:', err);
+        }
+        return;
+      }
+
       if (socket.machineId) {
         try {
+          const printerModel = (status?.printerModel || status?.printerName || status?.model || '').trim();
+          const connectionType = (status?.connectionType || status?.telemetry?.connectionType || '').trim();
+
           const now = new Date();
+          const machineUpdateData = { lastOnline: now };
+          if (printerModel) {
+            machineUpdateData.printerModel = printerModel;
+          }
+          if (connectionType) {
+            machineUpdateData.connectionType = connectionType;
+          }
+
           const machine = await prisma.machine.update({
             where: { id: socket.machineId },
-            data: { lastOnline: now }
+            data: machineUpdateData
           });
 
           await prisma.printerStatus.create({
@@ -195,29 +359,174 @@ const setupSockets = (io) => {
               machineId: socket.machineId,
               isOnline: !status.isError,
               paperStatus: status.errorMessage === 'Out of Paper' ? 'OUT' : 'OK',
-              jamStatus: status.errorMessage === 'Paper Jam'
+              jamStatus: status.errorMessage === 'Paper Jam',
+              connectionType: connectionType || undefined
             }
           });
-          
+
           const isOnline = computeIsOnline(machine, now);
           io.to('admins').emit('printer_heartbeat', {
             machineId: socket.machineId,
             lastOnline: machine.lastOnline,
             isOnline
           });
+
+          const availability = await getMachineAvailability(socket.machineId, prisma);
+          const broadcastPayload = {
+            ...status,
+            ...(availability || {}),
+            printerModel: printerModel || availability?.printerModel || 'Unknown',
+            connectionType: connectionType || availability?.connectionType || 'Unknown',
+            machineId: socket.machineId,
+          };
+
+          if (availability) {
+            // Broadcast authoritative availability to customer sessions AND tenant/superadmin sockets
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', broadcastPayload);
+          }
+          if (socket.companyId) {
+            io.to(`company_${socket.companyId}`).emit('printer_status_update', broadcastPayload);
+          }
+          io.to('superadmins').emit('printer_status_update', broadcastPayload);
         } catch(err) {
           logger.error('Error saving printer status', err);
         }
+      } else {
+        if (socket.companyId) {
+          io.to(`company_${socket.companyId}`).emit('printer_status_update', status);
+        }
+        io.to('superadmins').emit('printer_status_update', status);
       }
-      // Send printer status ONLY to admin sockets, not to customer phones
-      io.to('admins').emit('printer_status_update', status);
     });
 
-    socket.on('print_spooler_success', async ({ jobId }) => {
-      // Only printer agents should report spooler results
-      if (socket.userType !== 'printer') return;
-      logger.info(`Print spooler accepted job ${jobId}. Awaiting physical completion...`);
-      // P3-001: We do NOT mark it COMPLETED here anymore. It stays PRINTING until physical success.
+    socket.on('job_reconciliation_report', async (report) => {
+      const { requestId, jobId, status } = report || {};
+      // 1. Verify authenticated Agent identity and printer type
+      if (socket.userType !== 'printer' || !socket.machineId) {
+        logger.warn(`Unauthorized or non-printer socket attempted reconciliation report`);
+        return;
+      }
+
+      logger.info(`Agent on machine ${socket.machineId} reported reconciliation for job ${jobId}: ${status} [ReqID: ${requestId || 'none'}]`);
+
+      // 2. Correlation verification: verify report matches active reconciliation request
+      const active = socket.activeReconciliation;
+      if (!active) {
+        logger.warn(`Rejected reconciliation report for job ${jobId}: No active reconciliation request on socket`);
+        return;
+      }
+
+      // Check request ID matching and timeout (60 seconds)
+      const isExpired = (Date.now() - active.createdAt) > 60000;
+      if (isExpired || active.requestId !== requestId || !active.jobIds || !active.jobIds.has(jobId)) {
+        logger.warn(`Rejected stale/uncorrelated reconciliation report for job ${jobId} (ReqID match: ${active.requestId === requestId}, Expired: ${isExpired})`);
+        return;
+      }
+
+      // Immediately consume the jobId from the active set to prevent concurrent duplicate processing
+      active.jobIds.delete(jobId);
+
+      // Do not consume the one-shot reconciliation slot until the authenticated
+      // Agent has proven the exact DB job/device binding and Machine ownership.
+      let reportIdentityValidated = false;
+      let transitionSuccess = false;
+      try {
+        await prisma.$transaction(async (tx) => {
+          const job = await tx.printJob.findUnique({
+            where: { shortId: jobId },
+            include: { payment: true, printerDevice: true }
+          });
+
+          if (!job) {
+            logger.warn(`Reconciliation failed: Job ${jobId} not found`);
+            return;
+          }
+
+          // Device-bound and legacy jobs must report the exact expected printer identity.
+          if (!verifyPrinterDeviceReport(job, report)) {
+            logger.warn(`Reconciliation rejected: PrinterDevice identity mismatch for job ${jobId}`);
+            return;
+          }
+
+          // Verify exact Machine ownership before consuming the correlated request.
+          if (job.machineId !== socket.machineId) {
+            logger.warn(`Reconciliation security rejection: Job ${jobId} belongs to machine ${job.machineId}, but reported by ${socket.machineId}`);
+            return;
+          }
+          reportIdentityValidated = true;
+
+          // Valid non-NOT_DISPATCHED reports consume the slot but never trigger a reprint.
+          if (status !== 'NOT_DISPATCHED') return;
+
+          // Must be currently in PRINTING status
+          if (job.status !== 'PRINTING') {
+            logger.warn(`Reconciliation skipped: Job ${jobId} status is ${job.status}, expected PRINTING`);
+            return;
+          }
+
+          // 4. Verify payment was successfully confirmed
+          if (!job.payment || job.payment.status !== 'SUCCESS') {
+            logger.warn(`Reconciliation rejected: Job ${jobId} payment is not SUCCESS (payment status: ${job.payment?.status})`);
+            return;
+          }
+
+          // 5. Atomic conditional update: PRINTING -> WAITING
+          const resetCount = await tx.printJob.updateMany({
+            where: {
+              id: job.id,
+              shortId: jobId,
+              machineId: socket.machineId,
+              status: 'PRINTING'
+            },
+            data: { status: 'WAITING' }
+          });
+
+          if (resetCount.count === 1) {
+            transitionSuccess = true;
+            logger.info(`Job ${jobId} safely restored from PRINTING to WAITING for re-dispatch after verified NOT_DISPATCHED report`);
+          }
+        }, { maxWait: 5000, timeout: 10000 });
+      } catch (txErr) {
+        logger.error(`Transaction error during reconciliation reset for job ${jobId}:`, txErr);
+        return;
+      }
+
+      if (!reportIdentityValidated) {
+        // Leave the request slot available so a valid report can still reconcile it.
+        active.jobIds.add(jobId);
+        return;
+      }
+
+      // Never automatically reset jobs when Agent reports anything other than NOT_DISPATCHED.
+      if (status !== 'NOT_DISPATCHED') {
+        logger.info(`Job ${jobId} reported status "${status}". Not eligible for automatic NOT_DISPATCHED re-dispatch.`);
+        return;
+      }
+
+      // 6 & 7. Invoke queueService.startPrintingProcess() reusing the WAITING -> PRINTING atomic claim
+      if (transitionSuccess) {
+        const queueService = require('./services/queueService');
+        if (queueService && typeof queueService.startPrintingProcess === 'function') {
+          logger.info(`Re-dispatching recovered job ${jobId} to printer agent`);
+          await queueService.startPrintingProcess(jobId, io);
+        }
+      }
+    });
+
+    socket.on('print_spooler_success', async (report) => {
+      if (socket.userType !== 'printer' || !socket.machineId) return;
+      const jobId = report?.jobId;
+      try {
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { printerDevice: true }
+        });
+        if (!currentJob || currentJob.machineId !== socket.machineId) return;
+        if (!verifyPrinterDeviceReport(currentJob, report)) return;
+        logger.info(`Print spooler accepted job ${jobId}. Awaiting physical completion...`);
+      } catch (error) {
+        logger.error(`Failed to verify spooler acceptance for job ${jobId}:`, error);
+      }
     });
 
     socket.on('print_physical_success', async (payload) => {
@@ -225,11 +534,14 @@ const setupSockets = (io) => {
       const jobId = typeof payload === 'object' ? payload.jobId : payload;
       logger.info(`Physical print success reported for job ${jobId}`);
       try {
-        const currentJob = await prisma.printJob.findUnique({ 
-          where: { shortId: jobId }, 
-          include: { document: true } 
+        const normalizedReport = typeof payload === 'object' && payload !== null ? payload : { jobId };
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { document: true, printerDevice: true }
         });
         if (!currentJob) return;
+
+        if (!verifyPrinterDeviceReport(currentJob, normalizedReport)) return;
 
         // P0: Enforce Machine Ownership
         if (currentJob.machineId !== socket.machineId) {
@@ -264,7 +576,7 @@ const setupSockets = (io) => {
               : (payload?.wasSeenInQueue ? 'Verified via Windows spooler polling' : 'Verified via driver dispatch confirmation'),
             completedAt: new Date()
           }
-        });
+        }, { maxWait: 5000, timeout: 10000 });
 
         // Acknowledge receipt to the agent
         socket.emit('ack_job_completed', { jobId });
@@ -274,13 +586,18 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_physical_ambiguous', async ({ jobId, reason, wasSeenInQueue }) => {
-      if (socket.userType !== 'printer') return;
+    socket.on('print_physical_ambiguous', async (report) => {
+      if (socket.userType !== 'printer' || !socket.machineId) return;
+      const { jobId, reason, wasSeenInQueue } = report || {};
       logger.warn(`Job ${jobId} physical outcome ambiguous: ${reason}. Keeping status as PRINTING for operator reconciliation.`);
       try {
         await prisma.$transaction(async (tx) => {
-          const currentJob = await tx.printJob.findUnique({ where: { shortId: jobId } });
+          const currentJob = await tx.printJob.findUnique({
+            where: { shortId: jobId },
+            include: { printerDevice: true }
+          });
           if (!currentJob) return;
+          if (!verifyPrinterDeviceReport(currentJob, report)) return;
 
           // P0: Enforce Machine Ownership
           if (currentJob.machineId && socket.machineId && currentJob.machineId !== socket.machineId) {
@@ -317,11 +634,16 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_physical_error', async ({ jobId, error }) => {
-      if (socket.userType !== 'printer') return;
+    socket.on('print_physical_error', async (report) => {
+      if (socket.userType !== 'printer' || !socket.machineId) return;
+      const { jobId, error } = report || {};
       logger.error(`Physical print error for job ${jobId}: ${error}`);
       try {
-        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { printerDevice: true }
+        });
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report)) return;
         if (!currentJob || !isValidJobTransition(currentJob.status, 'FAILED')) return;
 
         // P0: Enforce Machine Ownership
@@ -333,7 +655,7 @@ const setupSockets = (io) => {
         const failedJob = await prisma.printJob.update({
           where: { shortId: jobId },
           data: { status: 'FAILED' },
-          include: { document: true }
+          include: { document: true, payment: true }
         });
 
         // P3-002: Automated Refund on Print Failure
@@ -347,15 +669,20 @@ const setupSockets = (io) => {
       }
     });
 
-    socket.on('print_spooler_error', async ({ jobId, error }) => {
-      if (socket.userType !== 'printer') {
+    socket.on('print_spooler_error', async (report) => {
+      if (socket.userType !== 'printer' || !socket.machineId) {
         logger.warn(`Non-printer socket ${socket.id} tried to report spooler error`);
         return;
       }
+      const { jobId, error } = report || {};
       logger.error(`Print spooler failed for job ${jobId}: ${error}`);
       try {
         // Validate state transition before updating
-        const currentJob = await prisma.printJob.findUnique({ where: { shortId: jobId } });
+        const currentJob = await prisma.printJob.findUnique({
+          where: { shortId: jobId },
+          include: { printerDevice: true }
+        });
+        if (currentJob && !verifyPrinterDeviceReport(currentJob, report)) return;
         if (!currentJob || !isValidJobTransition(currentJob.status, 'FAILED')) {
           logger.warn(`Ignoring spooler error for job ${jobId}: invalid transition from ${currentJob?.status}`);
           return;
@@ -370,8 +697,29 @@ const setupSockets = (io) => {
         const failedJob = await prisma.printJob.update({
           where: { shortId: jobId },
           data: { status: 'FAILED' },
-          include: { document: true }
+          include: { document: true, payment: true }
         });
+
+        // This event is used for Agent failures before durable driver intent,
+        // including a final backend authorization denial. Refund only payments
+        // that have already reached SUCCESS and use a stable idempotency key.
+        if (failedJob.paymentId && failedJob.payment?.status === 'SUCCESS') {
+          try {
+            const paymentsService = require('./modules/payments/payments.service');
+            await paymentsService.refundPayment(
+              failedJob.shortId,
+              null,
+              `Automatic refund: Printer Agent could not submit the document. ${error || 'Unknown spooler error'}`,
+              {
+                initiatedBy: 'SYSTEM',
+                preserveJobStatus: true,
+                idempotencyKey: `agent_spooler_failure_${failedJob.id}_${failedJob.paymentId}`
+              }
+            );
+          } catch (refundError) {
+            logger.error(`Automatic refund failed for spooler error on job ${jobId}:`, refundError);
+          }
+        }
       } catch (err) {
         logger.error(`Failed to update job ${jobId} to FAILED:`, err);
         io.to(`machine_${socket.machineId}`).emit('job_status_changed', { id: 'error', shortId: jobId, status: 'FAILED', error });
@@ -379,7 +727,7 @@ const setupSockets = (io) => {
     });
 
     socket.on('disconnect', async () => {
-      logger.info(`User disconnected: ${socket.id}`);
+      logger.info(`User disconnected: ${socket.id} (Type: ${socket.userType})`);
       if (socket.userType === 'printer' && socket.machineId) {
         try {
           const machine = await prisma.machine.findUnique({
@@ -392,9 +740,23 @@ const setupSockets = (io) => {
               lastOnline: machine.lastOnline,
               isOnline
             });
+
+            const offlineState = computePrinterAvailability({ ...machine, lastOnline: null }, null);
+            const payload = {
+              machineId: socket.machineId,
+              name: machine.name,
+              location: machine.location,
+              printerModel: machine.printerModel || 'EPSON L6460 Series',
+              ...offlineState
+            };
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', payload);
+            if (machine.companyId) {
+              io.to(`company_${machine.companyId}`).emit('printer_status_update', payload);
+            }
+            io.to('superadmins').emit('printer_status_update', payload);
           }
         } catch (err) {
-          logger.error(`Error handling disconnect for machine ${socket.machineId}:`, err);
+          logger.error('Error broadcasting printer disconnect:', err);
         }
       }
     });
