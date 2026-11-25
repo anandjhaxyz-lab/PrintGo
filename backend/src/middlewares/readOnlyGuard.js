@@ -21,6 +21,24 @@ const ALLOWED_CASH_MUTATION_PATTERNS = [
 ];
 
 const STAGING_PRINTER_APPROVAL_PATTERN = /^\/api\/admin\/printer-discoveries\/[a-zA-Z0-9_-]+\/approve$/;
+// One-device emergency staging exception. Immutable ID read from staging DB.
+const STAGING_CANON_DISABLE_DEVICE_ID = '114c0092-e3c6-4432-b17f-e7c6f42ec334';
+const STAGING_CANON_DISABLE_PATH = '/api/admin/printer-devices/' + STAGING_CANON_DISABLE_DEVICE_ID + '/disable';
+
+const isAllowedStagingCanonDisable = (req) => {
+  if (process.env.APP_ENV !== 'staging') return false;
+  if (process.env.RENDER !== 'true') return false;
+  if (process.env.RENDER_SERVICE_ID !== STAGING_SERVICE_ID) return false;
+  if (process.env.RENDER_SERVICE_NAME !== STAGING_SERVICE_NAME) return false;
+  if (process.env.RENDER_GIT_BRANCH !== STAGING_GIT_BRANCH) return false;
+  if (process.env.STAGING_CANON_DISABLE_ENABLED !== 'true') return false;
+  if ((req.method || '').toUpperCase() !== 'POST') return false;
+  if (getCleanPath(req) !== STAGING_CANON_DISABLE_PATH) return false;
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  if (reason.length < 10 || reason.length > 500) return false;
+  logger?.warn?.('[READ_ONLY_GUARD] Authorized exact Canon staging disable exception; service layer enforces role, lease lock and audit log.');
+  return true;
+};
 
 const getCleanPath = (req) => {
   let target = '';
@@ -212,6 +230,10 @@ const readOnlyGuard = (req, res, next) => {
         return next();
       }
 
+      if (isAllowedStagingCanonDisable(req)) {
+        return next();
+      }
+
       const cleanPath = getCleanPath(req);
       logger?.warn?.(`[READ_ONLY_GUARD] Blocked mutation: ${req.method} ${cleanPath} (ADMIN_READ_ONLY=true)`);
 
@@ -230,6 +252,8 @@ module.exports = {
   isAllowedCashMutation,
   isAllowedStagingPaymentModeConfig,
   isAllowedStagingPrinterApproval,
+  isAllowedStagingCanonDisable,
+  STAGING_CANON_DISABLE_DEVICE_ID,
   getCleanPath,
   ALLOWED_AD_MUTATION_PATTERNS,
   ALLOWED_CASH_MUTATION_PATTERNS,
