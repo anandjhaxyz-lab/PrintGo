@@ -65,6 +65,11 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
   }
 
   if (job.paymentId && job.payment?.status === 'SUCCESS') {
+    const validJobCost = Number(job.cost);
+    if (!Number.isFinite(validJobCost) || validJobCost <= 0) {
+      throw new Error(`Invalid job cost (${job.cost}) for job ${job.shortId}; cannot issue automated refund`);
+    }
+
     try {
       const paymentsService = require('../modules/payments/payments.service');
       await paymentsService.refundPayment(
@@ -74,6 +79,7 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
         {
           initiatedBy: 'SYSTEM',
           preserveJobStatus: true,
+          amount: validJobCost,
           idempotencyKey: `device_dispatch_blocked_${job.id}_${job.paymentId}`
         }
       );
@@ -89,6 +95,7 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
             ]
           }
         });
+        const isTimeout = refundError.code === 'ECONNABORTED' || Boolean(refundError.message?.includes('timeout'));
         let failedRefundId = existingFailed?.id;
         if (!existingFailed) {
           const refundRecord = await prisma.refund.create({
@@ -97,12 +104,12 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
               paymentId: job.paymentId,
               printJobId: job.id,
               gatewayRefundId: `ref_blocked_${job.shortId}_${Date.now()}`,
-              amount: job.payment?.amount || 0,
+              amount: validJobCost,
               currency: job.payment?.currency || 'INR',
               reason: `Automatic refund failed after physical printer dispatch blocked (${code}): ${reason}`,
-              status: 'FAILED',
+              status: isTimeout ? 'PROCESSING' : 'FAILED',
               failureReason: refundError.message,
-              retryEligible: true,
+              retryEligible: !isTimeout,
               initiatedBy: 'SYSTEM'
             }
           });
@@ -114,13 +121,15 @@ const failBlockedDeviceDispatch = async (job, expectedStatus, code, reason) => {
             refundId: failedRefundId || null,
             printJobId: job.id,
             status: 'PENDING_RECONCILIATION',
-            discrepancyType: 'FAILED_AUTOMATIC_REFUND',
+            discrepancyType: isTimeout ? 'AMBIGUOUS_GATEWAY_OUTCOME' : 'FAILED_AUTOMATIC_REFUND',
             details: JSON.stringify({
               code,
               reason,
               error: refundError.message,
               jobShortId: job.shortId
-            })
+            }),
+            resolved: false,
+            dispatchState: isTimeout ? 'OUTCOME_UNKNOWN' : 'NOT_DISPATCHED'
           }
         }).catch(() => {});
       } catch (recordError) {
@@ -230,6 +239,31 @@ const processJob = async (shortId) => {
       where: { shortId },
       include: { document: true, printerDevice: true, payment: true }
     });
+
+    if (!updatedJob) {
+      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: claimed successfully but record could not be re-fetched from database`);
+      return;
+    }
+
+    // QG-01: Check document presence and filename
+    if (!updatedJob.document || !updatedJob.document.filename) {
+      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: missing document or filename. Cannot print. Marking job FAILED.`);
+      await prisma.printJob.update({
+        where: { shortId },
+        data: { status: 'FAILED' }
+      });
+      return;
+    }
+
+    // QG-02: Check machine assignment
+    if (!updatedJob.machineId) {
+      console.error(`[POST_CLAIM_ERROR] Job ${shortId}: no machineId assigned. Cannot route to printer. Marking job FAILED.`);
+      await prisma.printJob.update({
+        where: { shortId },
+        data: { status: 'FAILED' }
+      });
+      return;
+    }
 
     // Re-check immediately before sending the Agent event. A concurrent Admin
     // disable/remap after the initial read must fail closed, never fall back.

@@ -94,6 +94,19 @@ const mockSandboxConfig = () => ({
   NODE_ENV: 'test'
 });
 
+const mockMachine = {
+  id: 'machine-1',
+  name: 'Main Shop Printer',
+  status: 'ACTIVE',
+  lastOnline: new Date(),
+  printerStatuses: [{
+    isOnline: true,
+    paperStatus: 'OK',
+    jamStatus: false,
+    timestamp: new Date()
+  }]
+};
+
 /**
  * Builds a minimal PrintJob record suitable for unit tests.
  */
@@ -105,6 +118,8 @@ const makeJob = (overrides = {}) => ({
   isTest: true,
   customer: null,
   payment: null,
+  machineId: 'machine-1',
+  machine: mockMachine,
   ...overrides
 });
 

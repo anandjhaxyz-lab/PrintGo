@@ -9,6 +9,19 @@ describe('Printer Agent Provisioning & Lifecycle Matrix', () => {
   const keysDir = path.join(sandboxDir, 'keys');
   const journalPath = path.join(dataDir, 'jobs.journal.json');
   const markerPath = path.join(dataDir, '.installation_marker');
+  const origMachineKey = process.env.MACHINE_KEY;
+
+  beforeAll(() => {
+    process.env.MACHINE_KEY = 'test-suite-provision-machine-key';
+  });
+
+  afterAll(() => {
+    if (origMachineKey !== undefined) {
+      process.env.MACHINE_KEY = origMachineKey;
+    } else {
+      delete process.env.MACHINE_KEY;
+    }
+  });
 
   beforeEach(() => {
     if (fs.existsSync(sandboxDir)) {
@@ -75,8 +88,22 @@ describe('Printer Agent Provisioning & Lifecycle Matrix', () => {
 
   // 4. Existing machine with missing private key
   test('4. Existing machine with missing private key maintains journal integrity and backfills keys on startup', () => {
-    // Machine has valid marker and journal, but keys/private.pem was not generated yet
-    fs.writeFileSync(markerPath, JSON.stringify({ installationId: 'existing-uuid-nokey', schemaVersion: 1 }));
+    // Machine has valid marker, secret and journal, but keys/private.pem was not generated yet
+    const journalSecret = require('../src/journalSecret');
+    const secretPath = path.join(dataDir, '.journal_secret');
+    journalSecret.provisionSecret({
+      secretPath,
+      installationId: 'existing-uuid-nokey',
+      machineKey: 'test-suite-provision-machine-key'
+    });
+    fs.writeFileSync(markerPath, JSON.stringify({
+      installationId: 'existing-uuid-nokey',
+      schemaVersion: 1,
+      securityContext: {
+        userSid: journalSecret.getCurrentWindowsSid(),
+        userName: process.env.USERNAME
+      }
+    }));
     fs.writeFileSync(journalPath, JSON.stringify({ version: 1, jobs: { job_p1: { state: 'PRINTING' } } }));
 
     // Provisioning is safely refused because valid installation is already active

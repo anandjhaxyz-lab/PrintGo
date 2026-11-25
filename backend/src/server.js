@@ -39,6 +39,7 @@ const prisma = require('./utils/prisma');
 const queueService = require('./services/queueService');
 const uploadWorkerService = require('./services/uploadWorker');
 const uploadQueueController = require('./modules/upload/upload.controller');
+const reconciliationWorker = require('./services/reconciliationWorker.service');
 
 let redisAdapterSubClient = null;
 let redisAdapterReady = false;
@@ -288,6 +289,12 @@ app.get('/api/ready', async (req, res) => {
     ? (redisAdapterReady ? 'ready' : 'not_ready')
     : 'disabled';
 
+  const reconciliationEnabled = process.env.ENABLE_RECONCILIATION_WORKER === 'true';
+  const reconciliationStatus = reconciliationWorker.getReconciliationWorkerHealth();
+  checks.reconciliationWorker = reconciliationEnabled
+    ? (reconciliationStatus.status === 'healthy' ? 'ready' : (reconciliationStatus.status === 'starting' ? 'starting' : 'not_ready'))
+    : 'disabled';
+
   const queueInfrastructureReady =
     !queueInfrastructureRequired ||
     (
@@ -297,9 +304,15 @@ app.get('/api/ready', async (req, res) => {
       checks.uploadQueueEvents === 'ready'
     );
 
+  const reconciliationReady =
+    !reconciliationEnabled ||
+    checks.reconciliationWorker === 'ready' ||
+    checks.reconciliationWorker === 'starting';
+
   const ready =
     checks.database === 'ready' &&
     queueInfrastructureReady &&
+    reconciliationReady &&
     (!adapterEnabled || checks.socketIoRedisAdapter === 'ready');
 
   res.status(ready ? 200 : 503).json({
@@ -337,6 +350,7 @@ if (process.env.SENTRY_DSN) {
 app.use(errorHandler);
 
 const port = process.env.PORT || 5000;
+let enrollmentChallengeCleanupTimer = null;
 
 // Auto-seed database on startup for fresh deployments
 const autoSeed = async () => {
@@ -415,6 +429,17 @@ const startServer = async () => {
   await verifyDatabaseIdentity();
   await autoSeed();
 
+  // WP-2H.3: periodic bounded retention cleanup for expired enrollment challenges.
+  const { cleanupEnrollmentChallenges } = require('./modules/machines/machines.service');
+  const runEnrollmentChallengeCleanup = () => {
+    cleanupEnrollmentChallenges().catch((error) => {
+      logger.warn('Enrollment challenge cleanup deferred:', error.message);
+    });
+  };
+  runEnrollmentChallengeCleanup();
+  enrollmentChallengeCleanupTimer = setInterval(runEnrollmentChallengeCleanup, 6 * 60 * 60 * 1000);
+  enrollmentChallengeCleanupTimer.unref();
+
   if (connection) {
     await waitForRedisReady(15000);
   }
@@ -423,6 +448,17 @@ const startServer = async () => {
   await queueService.initWorker(io);
   await uploadWorkerService.initUploadWorker();
   await uploadQueueController.waitForUploadQueueReady();
+
+  if (process.env.ENABLE_RECONCILIATION_WORKER === 'true') {
+    await reconciliationWorker.startReconciliationWorkerLoop({
+      pollIntervalMs: parseInt(process.env.RECONCILIATION_POLL_INTERVAL_MS, 10) || 60000,
+      batchSize: parseInt(process.env.RECONCILIATION_BATCH_SIZE, 10) || 10,
+      initialDelayMs: process.env.NODE_ENV === 'test' ? 100 : 5000
+    });
+    logger.info('Reconciliation worker background loop initialized');
+  } else {
+    logger.info('Reconciliation worker is disabled by configuration (ENABLE_RECONCILIATION_WORKER != true)');
+  }
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -438,6 +474,10 @@ let shutdownStarted = false;
 const shutdown = async (signal) => {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  if (enrollmentChallengeCleanupTimer) {
+    clearInterval(enrollmentChallengeCleanupTimer);
+    enrollmentChallengeCleanupTimer = null;
+  }
   logger.info(`Received ${signal}; beginning graceful PrintGo shutdown.`);
 
   const forceExitTimer = setTimeout(() => {
@@ -452,7 +492,8 @@ const shutdown = async (signal) => {
     await Promise.all([
       queueService.closeQueueService(),
       uploadWorkerService.closeUploadWorker(),
-      uploadQueueController.closeUploadQueue()
+      uploadQueueController.closeUploadQueue(),
+      reconciliationWorker.stopReconciliationWorkerLoop({ timeoutMs: 10000 })
     ]);
 
     if (redisAdapterSubClient && redisAdapterSubClient.status !== 'end') {
@@ -491,5 +532,6 @@ module.exports = {
   verifyDatabaseIdentity,
   initializeRedisAdapter,
   startServer,
-  shutdown
+  shutdown,
+  reconciliationWorker
 };

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const journalSecret = require('./journalSecret');
 
 const CURRENT_JOURNAL_VERSION = 2;
 
@@ -61,6 +62,15 @@ class JobJournal {
       : (hasProvisionArg || hasProvisionEnv);
     this.forceReprovision = !!options.forceReprovision || process.argv.includes('--force-reprovision');
     this.checkKeys = options.checkKeys !== undefined ? options.checkKeys : true;
+    this.secretPath = options.secretPath || path.join(path.dirname(this.filePath), '.journal_secret');
+    this.secret = null;
+    this.checkSecret = options.checkSecret !== undefined ? options.checkSecret : this.checkKeys;
+    const rawMachineKey = options.machineKey !== undefined ? options.machineKey : process.env.MACHINE_KEY;
+    this.machineKey = typeof rawMachineKey === 'string' ? rawMachineKey.trim() : rawMachineKey;
+    this.currentSid = options.currentSid || null;
+    this.expectedSid = options.expectedSid || null;
+    this.dpapiProvider = options.dpapiProvider || null;
+    this.provisioningInstallationId = options.installationId || null;
 
     this.ensureDir();
     this.cleanupTempFiles();
@@ -139,15 +149,30 @@ class JobJournal {
 
   isExistingInstallation() {
     if (fs.existsSync(this.markerPath)) return true;
+    if (this.checkSecret && fs.existsSync(this.secretPath)) return true;
     if (this.checkKeys && fs.existsSync(path.join(this.keysDir, 'private.pem'))) return true;
     return false;
   }
 
-  writeMarker() {
+  writeMarker(options = {}) {
+    const instId = options.installationId || this.provisioningInstallationId || crypto.randomUUID();
+    let userSid = options.userSid || this.currentSid;
+    let userName = options.userName || process.env.USERNAME || null;
+    if (!userSid) {
+      try {
+        userSid = journalSecret.getCurrentWindowsSid();
+      } catch (e) {
+        userSid = null;
+      }
+    }
     const markerData = {
-      installationId: crypto.randomUUID(),
+      installationId: instId,
       provisionedAt: new Date().toISOString(),
-      schemaVersion: 1
+      schemaVersion: 1,
+      securityContext: {
+        userSid: userSid || null,
+        userName: userName
+      }
     };
     const markerPayload = JSON.stringify(markerData, null, 2);
     const tempMarker = `${this.markerPath}.tmp.${Date.now()}_${crypto.randomUUID()}`;
@@ -211,9 +236,41 @@ class JobJournal {
         return {};
       }
 
-      // If journal exists but marker is missing, backfill marker to ensure future safety
+      // If journal exists but marker is missing: FAIL CLOSED!
+      // Must not silently backfill marker for unanchored/legacy journal without authorized migration.
       if (!fs.existsSync(this.markerPath)) {
-        this.writeMarker();
+        this.isCorrupted = true;
+        this.corruptionReason = 'Existing journal detected but installation marker is missing. Fails closed to prevent duplicate physical prints.';
+        return {};
+      }
+
+      try {
+        this.installationInfo = JSON.parse(fs.readFileSync(this.markerPath, 'utf8'));
+      } catch (err) {
+        this.isCorrupted = true;
+        this.corruptionReason = `Installation marker exists but is corrupted: ${err.message}`;
+        return {};
+      }
+
+      // WP-1 Secret Verification: in runtime, verify journal secret under current Windows SID
+      if (!this.isProvisioning && this.checkSecret) {
+        try {
+          const expectedSid = this.expectedSid || (this.installationInfo && this.installationInfo.securityContext && this.installationInfo.securityContext.userSid);
+          this.secret = journalSecret.loadSecret({
+            secretPath: this.secretPath,
+            expectedSid: expectedSid,
+            currentSid: this.currentSid,
+            dpapiProvider: this.dpapiProvider,
+            markerPath: this.markerPath,
+            machineKey: this.machineKey
+          });
+        } catch (secErr) {
+          this.isCorrupted = true;
+          const codePrefix = secErr.code ? `[${secErr.code}] ` : '';
+          this.corruptionReason = `Journal secret verification failed: ${codePrefix}${secErr.message}`;
+          this.secret = null;
+          return {};
+        }
       }
 
       const raw = fs.readFileSync(this.filePath, 'utf8');

@@ -3,6 +3,7 @@
  * Phase 4A: Financial Recovery, Multi-Partial Refunds, Idempotency & Gateway Integration
  */
 
+const crypto = require('crypto');
 const prisma = require('../utils/prisma');
 const logger = require('../utils/logger');
 const AppError = require('../utils/AppError');
@@ -23,6 +24,7 @@ const fromCents = (cents) => Math.round(cents) / 100;
 const createRefund = async (params) => {
   const {
     paymentId,
+    printJobId = null,
     amount,
     reason = 'Customer Requested Refund',
     idempotencyKey = null,
@@ -83,10 +85,25 @@ const createRefund = async (params) => {
     throw new AppError('Demo/simulated payments cannot be processed through real financial refund channels', 400);
   }
 
-  // 4. Safe Decimal Balance Calculation
+  // C-02: Explicit printJobId ownership & validation
+  let targetJob = null;
+  if (printJobId) {
+    targetJob = payment.printJobs?.find(j => j.id === printJobId);
+    if (!targetJob) {
+      throw new AppError(`Specified printJobId '${printJobId}' does not belong to Payment '${paymentId}'`, 400);
+    }
+  } else {
+    // If not explicitly provided, reject ambiguous multi-job payments
+    if (payment.printJobs && payment.printJobs.length > 1) {
+      throw new AppError('Payment is associated with multiple print jobs; explicit printJobId is required to prevent ambiguous refund attribution', 400);
+    }
+    targetJob = payment.printJobs?.[0] || null;
+  }
+
+  // 4. Safe Decimal Balance Calculation (Payment & Job-level caps)
   const paymentCents = toCents(payment.amount);
   
-  // Calculate existing non-failed refunds
+  // Calculate existing non-failed refunds for the payment
   const activeExistingRefunds = payment.refunds.filter(
     r => r.status === 'SUCCESS' || r.status === 'PROCESSING' || r.status === 'PENDING'
   );
@@ -98,10 +115,25 @@ const createRefund = async (params) => {
     throw new AppError('Payment is already fully refunded', 400);
   }
 
+  // C-03: Per-Job Cumulative Cap Calculation
+  let remainingJobCents = null;
+  if (targetJob) {
+    const jobCostCents = toCents(targetJob.cost);
+    const activeJobRefunds = payment.refunds.filter(
+      r => r.printJobId === targetJob.id && (r.status === 'SUCCESS' || r.status === 'PROCESSING' || r.status === 'PENDING')
+    );
+    const existingJobRefundedCents = activeJobRefunds.reduce((sum, r) => sum + toCents(r.amount), 0);
+    remainingJobCents = jobCostCents - existingJobRefundedCents;
+
+    if (remainingJobCents <= 0) {
+      throw new AppError(`Print job '${targetJob.shortId || targetJob.id}' is already fully refunded`, 400);
+    }
+  }
+
   // Determine requested refund amount
   const requestedCents = amount !== undefined && amount !== null
     ? toCents(amount)
-    : remainingCents;
+    : (remainingJobCents !== null ? Math.min(remainingCents, remainingJobCents) : remainingCents);
 
   if (isNaN(requestedCents) || requestedCents <= 0) {
     throw new AppError('Refund amount must be a positive number greater than zero', 400);
@@ -115,12 +147,26 @@ const createRefund = async (params) => {
     );
   }
 
+  if (remainingJobCents !== null && requestedCents > remainingJobCents) {
+    const reqAmount = fromCents(requestedCents);
+    const remJobAmount = fromCents(remainingJobCents);
+    throw new AppError(
+      `Requested refund amount (Rs. ${reqAmount.toFixed(2)}) exceeds remaining refundable balance for print job (Rs. ${remJobAmount.toFixed(2)})`,
+      400
+    );
+  }
+
   const finalRefundAmount = fromCents(requestedCents);
-  const uniqueRefundId = `ref_${payment.gatewayOrderId || payment.id.slice(0, 8)}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const nonce = crypto.randomBytes(3).toString('hex');
+  const sanitizedOrderId = (payment.gatewayOrderId || payment.id.slice(0, 8)).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 14);
+  const uniqueRefundId = `ref_${sanitizedOrderId}_${Date.now()}_${nonce}`.slice(0, 40);
 
   // 5. TRANSACTIONAL ADVISORY LOCKING & GATEWAY DISPATCH
-  const result = await prisma.$transaction(async (tx) => {
-    // Acquire exclusive transaction advisory lock scoped to this specific payment
+  const claimResult = await prisma.$transaction(async (tx) => {
+    // Acquire hierarchical advisory locks: Tier 1 printjob_refund_ then Tier 2 payment_refund_
+    if (targetJob) {
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('printjob_refund_${targetJob.id}'))`);
+    }
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('payment_refund_${payment.id}'))`);
 
     // Re-verify idempotency inside lock
@@ -133,11 +179,11 @@ const createRefund = async (params) => {
           throw new AppError(`Idempotency key '${idempotencyKey}' is already bound to another payment (${freshExisting.paymentId}). Cross-payment key reuse is forbidden.`, 409);
         }
         if (freshExisting.status === 'SUCCESS' || freshExisting.status === 'PROCESSING') {
-          return freshExisting;
+          return { refund: freshExisting, isClaimedOrCreated: false };
         }
         if (freshExisting.status === 'FAILED') {
           if (!freshExisting.retryEligible) {
-            return freshExisting;
+            return { refund: freshExisting, isClaimedOrCreated: false };
           }
           // Atomic claim for retry: transition status to PROCESSING and clear retryEligible
           claimedRefund = await tx.refund.update({
@@ -173,6 +219,20 @@ const createRefund = async (params) => {
       );
     }
 
+    // Re-verify live per-job cumulative cap inside lock
+    if (targetJob) {
+      const freshJobRefunds = freshRefunds.filter(r => r.printJobId === targetJob.id);
+      const freshJobCreditedCents = freshJobRefunds.reduce((sum, r) => sum + toCents(r.amount), 0);
+      const freshJobRemainingCents = toCents(targetJob.cost) - freshJobCreditedCents;
+
+      if (requestedCents > freshJobRemainingCents) {
+        throw new AppError(
+          `Concurrent refund rejected: Requested Rs. ${finalRefundAmount.toFixed(2)} exceeds live remaining balance for print job Rs. ${fromCents(freshJobRemainingCents).toFixed(2)}`,
+          400
+        );
+      }
+    }
+
     if (claimedRefund) {
       await tx.transaction.create({
         data: {
@@ -184,15 +244,15 @@ const createRefund = async (params) => {
           ipAddress: user?.ip || null
         }
       });
-      return claimedRefund;
+      return { refund: claimedRefund, isClaimedOrCreated: true };
     }
 
-    // Create local PENDING Refund record
+    // Create local PENDING Refund record (Strictly no arbitrary fallback)
     const createdRefund = await tx.refund.create({
       data: {
         idempotencyKey: idempotencyKey || null,
         paymentId: payment.id,
-        printJobId: payment.printJobs?.[0]?.id || null,
+        printJobId: targetJob ? targetJob.id : null,
         gatewayRefundId: uniqueRefundId,
         amount: finalRefundAmount,
         currency: payment.currency || 'INR',
@@ -215,13 +275,14 @@ const createRefund = async (params) => {
       }
     });
 
-    return createdRefund;
+    return { refund: createdRefund, isClaimedOrCreated: true };
   });
 
-  // If another concurrent caller already completed the refund or is processing it with another gatewayRefundId:
-  if (result.status === 'SUCCESS' || (result.status === 'PROCESSING' && result.gatewayRefundId !== uniqueRefundId)) {
-    return result;
+  // If another concurrent caller already completed the refund or is processing it:
+  if (!claimResult.isClaimedOrCreated) {
+    return claimResult.refund;
   }
+  const result = claimResult.refund;
 
   // 6. CALL GATEWAY ADAPTER (OUTSIDE DB TRANSACTION TO PREVENT CONNECTION POOL EXHAUSTION)
   let gatewayResult;
@@ -234,9 +295,11 @@ const createRefund = async (params) => {
     });
   } catch (err) {
     logger.error(`Cashfree Gateway refund invocation threw unexpected error: ${err.message}`);
+    const isTimeout = err.code === 'ECONNABORTED' || Boolean(err.message?.includes('timeout'));
     gatewayResult = {
       success: false,
-      status: 'FAILED',
+      status: isTimeout ? 'PROCESSING' : 'FAILED',
+      isTimeout,
       error: err.message,
       rawResponse: { error: err.message }
     };
@@ -244,7 +307,10 @@ const createRefund = async (params) => {
 
   // 7. FINALIZE REFUND STATE AND TRIGGER CREDIT NOTE
   const finalized = await prisma.$transaction(async (tx) => {
-    // Re-acquire advisory lock to update payment and invoice status
+    // Re-acquire hierarchical advisory locks to update payment and invoice status
+    if (targetJob) {
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('printjob_refund_${targetJob.id}'))`);
+    }
     await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext('payment_refund_${payment.id}'))`);
 
     if (gatewayResult.success) {
@@ -298,7 +364,8 @@ const createRefund = async (params) => {
             resolved: true,
             resolvedAt: new Date(),
             resolvedBy: user?.id || initiatedBy || 'SYSTEM_RETRY',
-            resolutionNotes: 'Resolved automatically via successful refund retry'
+            resolutionNotes: 'Resolved automatically via successful refund retry',
+            dispatchState: 'GATEWAY_CONFIRMED'
           }
         }).catch(() => {});
       }
@@ -306,7 +373,7 @@ const createRefund = async (params) => {
       return updatedRefund;
     } else {
       // Gateway Failure or Timeout
-      const isTimeout = gatewayResult.isTimeout;
+      const isTimeout = Boolean(gatewayResult.isTimeout || gatewayResult.status === 'TIMEOUT' || gatewayResult.status === 'PROCESSING');
       const finalStatus = isTimeout ? 'PROCESSING' : 'FAILED';
 
       const updatedRefund = await tx.refund.update({
@@ -329,6 +396,27 @@ const createRefund = async (params) => {
           gatewayResponse: redactSensitiveData(gatewayResult.rawResponse)
         }
       });
+
+      // If ambiguous timeout/processing outcome, record discrepancy for inquiry recovery
+      if (isTimeout && tx.reconciliationRecord) {
+        await tx.reconciliationRecord.create({
+          data: {
+            paymentId: payment.id,
+            refundId: result.id,
+            printJobId: targetJob ? targetJob.id : null,
+            status: 'PENDING_RECONCILIATION',
+            discrepancyType: 'AMBIGUOUS_GATEWAY_OUTCOME',
+            details: JSON.stringify({
+              reason: 'Gateway timeout during refund dispatch. Inquiry verification required.',
+              refundId: result.id,
+              gatewayOrderId: payment.gatewayOrderId,
+              gatewayRefundId: uniqueRefundId
+            }),
+            resolved: false,
+            dispatchState: 'OUTCOME_UNKNOWN'
+          }
+        }).catch(() => {});
+      }
 
       return updatedRefund;
     }
@@ -356,7 +444,9 @@ const createRefund = async (params) => {
             printJobId: jobWithInvoice.id,
             status: 'PENDING_RECONCILIATION',
             discrepancyType: 'MISSING_CREDIT_NOTE',
-            details: JSON.stringify({ error: cnError.message, refundAmount: finalized.amount })
+            details: JSON.stringify({ error: cnError.message, refundAmount: finalized.amount }),
+            resolved: false,
+            dispatchState: 'GATEWAY_CONFIRMED'
           }
         }).catch(() => {});
       }

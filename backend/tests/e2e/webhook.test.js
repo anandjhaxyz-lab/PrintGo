@@ -254,7 +254,7 @@ describe('Payment Webhooks & Refund Tests', () => {
           refund: {
             findUnique: jest.fn().mockResolvedValue(null),
             findMany: jest.fn().mockResolvedValue([]),
-            create: jest.fn().mockResolvedValue(createdRefund)
+            create: jest.fn().mockImplementation(({ data }) => ({ id: 'refund-uuid-1', ...data }))
           },
           transaction: { create: jest.fn() }
         };

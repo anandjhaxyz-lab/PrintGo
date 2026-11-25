@@ -28,6 +28,10 @@ const {
   validatePrinterDeviceRegistry
 } = require('./src/agentProtocol');
 const journal = new JobJournal();
+if (journal.isCorrupted || !journal.secret) {
+  console.error(`🚨 CRITICAL: Journal integrity / security context check failed: ${journal.corruptionReason || 'Missing secret'}`);
+  console.error(`🚨 Agent running in LOCKED mode: all physical dispatches will be refused.`);
+}
 const agentPackage = require('./package.json');
 
 process.on('uncaughtException', (err) => {
@@ -536,6 +540,20 @@ const processPhysicalPrintJob = async (jobData) => {
     printerDeviceId: jobData.printerDeviceId,
     windowsPrinterName: jobData.windowsPrinterName
   } : {};
+
+  // Security Gate: Journal Integrity and Secret Verification (WP-1)
+  if (journal.isCorrupted || !journal.secret) {
+    const reason = journal.corruptionReason || 'Journal secret verification required before dispatch.';
+    console.error(`🚨 DISPATCH BLOCKED: Job ${jobData.jobId}: ${reason}`);
+    socket.emit('print_physical_ambiguous', {
+      jobId: jobData.jobId,
+      reason: `Security gate refused physical dispatch: ${reason}`,
+      wasSeenInQueue: false,
+      ...deviceBinding
+    });
+    return;
+  }
+
   const existingJournalEntry = journal.getJob(jobData.jobId);
 
   // A completed journal entry can acknowledge a duplicate only when its immutable

@@ -240,7 +240,7 @@ const runReconciliation = async (options = {}) => {
 /**
  * Creates an append-only ReconciliationRecord if not in dryRun mode.
  */
-const recordDiscrepancy = async ({ paymentId, refundId, printJobId, status, discrepancyType, details, dryRun }) => {
+const recordDiscrepancy = async ({ paymentId, refundId, printJobId, status, discrepancyType, details, dispatchState = null, dryRun }) => {
   if (dryRun) {
     return { paymentId, refundId, status, discrepancyType, details, dryRun: true };
   }
@@ -257,6 +257,27 @@ const recordDiscrepancy = async ({ paymentId, refundId, printJobId, status, disc
 
   if (existing) return existing;
 
+  // Determine safe dispatchState if not explicitly provided
+  let effectiveDispatchState = dispatchState;
+  if (!effectiveDispatchState) {
+    if (discrepancyType === 'MISSING_CREDIT_NOTE') {
+      effectiveDispatchState = 'GATEWAY_CONFIRMED';
+    } else if (discrepancyType === 'GATEWAY_REFUND_FAILED') {
+      effectiveDispatchState = 'GATEWAY_FAILED';
+    } else if (discrepancyType === 'AMBIGUOUS_GATEWAY_OUTCOME') {
+      effectiveDispatchState = 'OUTCOME_UNKNOWN';
+    } else if (
+      status === 'MANUAL_REVIEW_REQUIRED' ||
+      discrepancyType === 'GATEWAY_PAYMENT_NOT_CONFIRMED' ||
+      discrepancyType === 'PAYMENT_AMOUNT_MISMATCH' ||
+      discrepancyType === 'DUPLICATE_WEBHOOK_EVENT'
+    ) {
+      effectiveDispatchState = 'MANUAL_REVIEW_REQUIRED';
+    } else {
+      effectiveDispatchState = 'NOT_DISPATCHED';
+    }
+  }
+
   return await prisma.reconciliationRecord.create({
     data: {
       paymentId: paymentId || null,
@@ -265,7 +286,8 @@ const recordDiscrepancy = async ({ paymentId, refundId, printJobId, status, disc
       status,
       discrepancyType,
       details: typeof details === 'string' ? details : JSON.stringify(details),
-      resolved: false
+      resolved: false,
+      dispatchState: effectiveDispatchState
     }
   });
 };
@@ -354,8 +376,11 @@ const getReconciliationRecords = async (options = {}) => {
   };
 };
 
+const reconciliationWorker = require('./reconciliationWorker.service');
+
 module.exports = {
   runReconciliation,
   resolveDiscrepancy,
-  getReconciliationRecords
+  getReconciliationRecords,
+  ...reconciliationWorker
 };

@@ -94,6 +94,7 @@ model Machine {
   printerDiscoveries PrinterDiscovery[]
   printPricingProfile PrintPricingProfile?
   advertisements  Advertisement[]
+  enrollmentChallenges InstallationEnrollmentChallenge[]
 
   // Advertisement Suppression Control
   adSuppressionMode   AdSuppressionMode @default(ENABLED)
@@ -102,12 +103,41 @@ model Machine {
   adSuppressedBy      String?
   adSuppressedAt      DateTime?
 
+  // WP-2H Asymmetric Installation Identity Key Enrollment
+  activeInstallationId        String?
+  installationPublicKey       String?        @db.Text
+  installationKeyAlgorithm    String?        // 'ECDSA_P256'
+  installationKeyFormat       String?        // 'spki_pem'
+  installationKeyFingerprint  String?
+  installationEnrolledAt      DateTime?
+  installationKeyStatus       String?        // 'ACTIVE', 'REVOKED', 'REPLACED'
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([companyId])
   @@index([status])
   @@index([adSuppressionMode, adSuppressionUntil])
+  @@index([activeInstallationId])
+}
+
+model InstallationEnrollmentChallenge {
+  id             String    @id @default(uuid())
+  challengeId    String    @unique
+  machineId      String
+  installationId String
+  nonceHash      String
+  purpose        String    @default("INSTALLATION_KEY_ENROLLMENT")
+  status         String    @default("PENDING") // PENDING, CONSUMED, EXPIRED
+  issuedAt       DateTime  @default(now())
+  expiresAt      DateTime
+  consumedAt     DateTime?
+  consumedByIp   String?
+
+  machine        Machine   @relation(fields: [machineId], references: [id], onDelete: Cascade)
+
+  @@index([machineId, status])
+  @@index([expiresAt])
 }
 
 model PrinterDevice {
@@ -686,7 +716,7 @@ model CreditNote {
   invoice          Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   printJobId       String?
   paymentId        String?
-  refundId         String?
+  refundId         String?   @unique
   refund           Refund?   @relation(fields: [refundId], references: [id], onDelete: SetNull)
   reason           String
   subtotal         Float
@@ -727,6 +757,11 @@ model ReconciliationRecord {
   resolvedBy      String?  // Admin user ID
   resolutionNotes String?  @db.Text
   
+  workerId        String?
+  leaseExpiresAt  DateTime?
+  fencingToken    BigInt   @default(0)
+  dispatchState   String   @default("NOT_DISPATCHED")
+
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -734,6 +769,7 @@ model ReconciliationRecord {
   @@index([refundId])
   @@index([status])
   @@index([resolved])
+  @@index([status, resolved, leaseExpiresAt])
 }
 
 // ==============================================

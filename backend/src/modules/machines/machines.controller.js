@@ -142,6 +142,41 @@ const getPaymentMode = async (req, res, next) => {
   }
 };
 
+const issueEnrollmentChallenge = async (req, res, next) => {
+  try {
+    const result = await machinesService.issueEnrollmentChallenge({
+      machine: req.machine,
+      payload: req.body,
+      clientIp: req.ip
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const enrollInstallationKey = async (req, res, next) => {
+  try {
+    const result = await machinesService.enrollInstallationKey({
+      machine: req.machine,
+      payload: req.body,
+      clientIp: req.ip
+    });
+    res.status(result.status === 'ALREADY_ENROLLED' ? 200 : 201).json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+const getInstallationKey = async (req, res, next) => {
+  try {
+    const status = await machinesService.getInstallationKeyStatus(req.params.id);
+    res.json({ success: true, ...status });
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getMachines,
   createMachine,
@@ -153,5 +188,8 @@ module.exports = {
   cancelAdSuppression,
   getAdSuppressionStatus,
   updatePaymentMode,
-  getPaymentMode
+  getPaymentMode,
+  issueEnrollmentChallenge,
+  enrollInstallationKey,
+  getInstallationKey
 };

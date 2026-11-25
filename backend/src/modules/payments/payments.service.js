@@ -948,9 +948,14 @@ const refundPayment = async (jobId, user = null, refundReason = 'PrintGo Custome
     throw new AppError('Cannot refund a job currently in PRINTING status. Resolve the physical print outcome first.', 400);
   }
 
+  const refundAmount = (options.amount !== undefined && options.amount !== null)
+    ? options.amount
+    : job.cost;
+
   const refundRecord = await refundService.createRefund({
     paymentId: job.payment.id,
-    amount: options.amount,
+    printJobId: job.id,
+    amount: refundAmount,
     reason: refundReason,
     idempotencyKey: options.idempotencyKey || `job_refund_${job.id}_${job.payment.id}`,
     user,

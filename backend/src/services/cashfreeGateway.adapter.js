@@ -157,11 +157,21 @@ class CashfreeGatewayAdapter {
       };
     } catch (err) {
       const errResponse = err?.response?.data || { message: err.message };
+      const statusCode = err?.response?.status || 500;
+      const isNotFound = statusCode === 404;
+      const isTimeout = err.code === 'ECONNABORTED' || Boolean(err.message?.includes('timeout'));
+
+      let status = 'UNKNOWN';
+      if (isNotFound) status = 'NOT_FOUND';
+      else if (isTimeout) status = 'TIMEOUT';
+
       return {
         success: false,
-        status: 'UNKNOWN',
+        status,
+        isNotFound,
+        isTimeout,
         error: errResponse?.message || err.message,
-        statusCode: err?.response?.status || 500,
+        statusCode,
         rawResponse: errResponse
       };
     }

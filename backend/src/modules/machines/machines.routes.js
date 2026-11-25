@@ -15,6 +15,11 @@ router.get('/agent-version', protectMachine, machinesController.getAgentVersion)
 
 router.get('/:id/public-key', machinesController.getPublicKey);
 
+// WP-2H / WP-2H.1: Server-Issued Challenge-Response Public-Key Enrollment
+router.post('/enroll-challenge', protectMachine, machinesController.issueEnrollmentChallenge);
+router.post('/enroll-installation', protectMachine, machinesController.enrollInstallationKey);
+router.get('/:id/installation-key', protectMachine, machinesController.getInstallationKey);
+
 // Machine Payment Mode Configuration (Cash at Counter / Demo Simulation / Cashfree Online)
 router.get('/:id/payment-mode', protect, restrictTo('SUPERADMIN', 'FRANCHISEE', 'STAFF'), machinesController.getPaymentMode);
 router.put('/:id/payment-mode', protect, restrictTo('SUPERADMIN', 'FRANCHISEE'), readOnlyGuard, machinesController.updatePaymentMode);

@@ -61,12 +61,26 @@ jest.mock('../src/utils/prisma', () => {
 });
 
 describe('Batch A: Cashfree Order Idempotency, Concurrency & Recovery', () => {
+  const mockMachine = {
+    id: 'machine-1',
+    name: 'Main Shop Printer',
+    status: 'ACTIVE',
+    lastOnline: new Date(),
+    printerStatuses: [{
+      isOnline: true,
+      paperStatus: 'OK',
+      jamStatus: false,
+      timestamp: new Date()
+    }]
+  };
+
   const mockJob = {
     id: 'job-uuid-123',
     shortId: 'JOB123',
     status: 'PENDING_PAYMENT',
     cost: 25.0,
     machineId: 'machine-1',
+    machine: mockMachine,
     customer: { id: 'cust-1', name: 'Test Customer', phone: '9876543210', email: 'test@printgo.in' }
   };
 

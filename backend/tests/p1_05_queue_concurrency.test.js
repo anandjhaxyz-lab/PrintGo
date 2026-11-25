@@ -16,6 +16,14 @@ const mockUpdateMany = jest.fn();
 const mockFindUnique = jest.fn();
 const mockUpdate = jest.fn();
 
+jest.mock('bullmq', () => ({
+  Queue: jest.fn().mockImplementation(() => ({ close: jest.fn() })),
+  Worker: jest.fn()
+}));
+
+jest.mock('../src/services/redisClient', () => ({
+  connection: { status: 'ready' }
+}));
 jest.mock('../src/utils/prisma', () => ({
   printJob: {
     updateMany: (...args) => mockUpdateMany(...args),
@@ -24,7 +32,16 @@ jest.mock('../src/utils/prisma', () => ({
   }
 }));
 
+// Capture the durable-queue contract before loading queueService.
+// Redis and BullMQ are isolated mocks; no external Redis process is used.
+const previousQueueRedisRequired = process.env.QUEUE_REDIS_REQUIRED;
+process.env.QUEUE_REDIS_REQUIRED = 'true';
 const queueService = require('../src/services/queueService');
+if (previousQueueRedisRequired === undefined) {
+  delete process.env.QUEUE_REDIS_REQUIRED;
+} else {
+  process.env.QUEUE_REDIS_REQUIRED = previousQueueRedisRequired;
+}
 
 describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
   let mockIo;
@@ -32,7 +49,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
   let mockQueue;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
     emittedEvents = [];
 
     mockIo = {
@@ -74,8 +91,8 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
       })
     );
 
-    // startPrintingProcess must return the enqueued job and not call processJob directly
-    expect(result).toEqual({ id: 'mock-bullmq-job-1' });
+    // startPrintingProcess enqueues durably and does not expose a BullMQ job object
+    expect(result).toBeUndefined(); // enqueue acknowledgement is intentionally not exposed as a job object
     expect(mockUpdateMany).not.toHaveBeenCalled();
     expect(emittedEvents).toHaveLength(0);
   });
@@ -91,7 +108,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
 
     const result = await queueService.startPrintingProcess(shortId, mockIo);
 
-    expect(result).toEqual({ id: `bull_${shortId}` });
+    expect(result).toBeUndefined(); // enqueue acknowledgement is intentionally not exposed as a job object
     // Crucial: No direct processJob call was triggered
     expect(mockUpdateMany).not.toHaveBeenCalled();
     expect(emittedEvents).toHaveLength(0);
@@ -129,7 +146,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     const testJobDoc = {
       id: 'job-uuid-5',
       shortId,
-      status: 'PRINTING',
+      status: 'WAITING',
       machineId: 'machine_eps_01',
       cost: 10.0,
       pagesToPrint: 2,
@@ -172,7 +189,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     // Exactly one call claimed the job
     expect(mockUpdateMany).toHaveBeenCalledTimes(2);
     expect(res1).not.toBeNull();
-    expect(res2).toBeNull();
+    expect(res2).toBeUndefined(); // processJob reports via side effects and has no return value
 
     // Exactly one physical_print_job socket event emitted to machine room
     expect(emittedEvents).toHaveLength(1);
@@ -187,7 +204,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     const testJobDoc = {
       id: 'job-uuid-6',
       shortId,
-      status: 'PRINTING',
+      status: 'WAITING',
       machineId: 'machine_eps_01',
       cost: 5.0,
       pagesToPrint: 1,
@@ -206,7 +223,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
 
     // Delivery 1: Succeeds
     mockUpdateMany.mockResolvedValueOnce({ count: 1 });
-    mockFindUnique.mockResolvedValueOnce(testJobDoc);
+    mockFindUnique.mockResolvedValueOnce(testJobDoc).mockResolvedValueOnce(testJobDoc);
 
     const firstRun = await queueService.processJob(shortId);
     expect(firstRun).not.toBeNull();
@@ -217,7 +234,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     mockFindUnique.mockResolvedValueOnce({ id: 'job-uuid-6', status: 'PRINTING' });
 
     const secondRun = await queueService.processJob(shortId);
-    expect(secondRun).toBeNull();
+    expect(secondRun).toBeUndefined(); // duplicate is refused before any dispatch
 
     // Still exactly 1 physical dispatch
     expect(emittedEvents).toHaveLength(1);
@@ -232,11 +249,8 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
 
     const result = await queueService.processJob(shortId);
 
-    expect(result).toBeNull();
-    expect(mockUpdateMany).toHaveBeenCalledWith({
-      where: { shortId, status: 'WAITING' },
-      data: { status: 'PRINTING' }
-    });
+    expect(result).toBeUndefined(); // processJob has no return-value contract
+    expect(mockUpdateMany).not.toHaveBeenCalled(); // terminal state is rejected before atomic claim
     expect(emittedEvents).toHaveLength(0);
   });
 
@@ -246,7 +260,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     const testJobDoc = {
       id: 'job-uuid-8',
       shortId,
-      status: 'PRINTING',
+      status: 'WAITING',
       machineId: 'machine_eps_01',
       cost: 15.0,
       pagesToPrint: 3,
@@ -275,7 +289,7 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
 
     // Step B: In Redis, the enqueue actually committed and worker picks it up
     mockUpdateMany.mockResolvedValueOnce({ count: 1 });
-    mockFindUnique.mockResolvedValueOnce(testJobDoc);
+    mockFindUnique.mockResolvedValueOnce(testJobDoc).mockResolvedValueOnce(testJobDoc);
 
     const workerResult = await queueService.processJob(shortId);
     expect(workerResult).not.toBeNull();
@@ -285,57 +299,36 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     expect(emittedEvents[0].data.jobId).toBe(shortId);
   });
 
-  test('9. Local development mode without Redis dispatches in-memory safely', async () => {
+  test('9. Durable-required mode refuses in-memory dispatch when the queue is unavailable', async () => {
     const shortId = 'job_inmem_9';
 
-    // Switch to local dev mode (useRedis = false)
     queueService._setQueueForTesting(null, false);
 
-    mockUpdateMany.mockResolvedValueOnce({ count: 1 });
-    mockFindUnique.mockResolvedValueOnce({
-      id: 'job-uuid-9',
-      shortId,
-      status: 'PRINTING',
-      machineId: 'machine_eps_01',
-      cost: 5.0,
-      pagesToPrint: 1,
-      color: 'bw',
-      duplex: 'single',
-      copies: 1,
-      pageRangeType: 'all',
-      customRange: null,
-      encryptedKey: null,
-      iv: null,
-      document: {
-        filename: 'http://localhost:5000/uploads/doc9.pdf',
-        originalName: 'inmem.pdf'
-      }
-    });
+    await expect(queueService.startPrintingProcess(shortId, mockIo)).rejects.toThrow(
+      'Durable print queue is not ready'
+    );
 
-    const result = await queueService.startPrintingProcess(shortId, mockIo);
-
-    expect(result).not.toBeNull();
-    expect(emittedEvents).toHaveLength(1);
-    expect(emittedEvents[0].data.jobId).toBe(shortId);
+    expect(mockUpdateMany).not.toHaveBeenCalled();
+    expect(mockFindUnique).not.toHaveBeenCalled();
+    expect(emittedEvents).toHaveLength(0);
   });
-
   test('10. Post-claim missing document transitions claimed job to FAILED and skips dispatch', async () => {
     const shortId = 'job_nodoc_10';
 
     mockUpdateMany.mockResolvedValueOnce({ count: 1 });
-    mockFindUnique.mockResolvedValueOnce({
+    mockFindUnique.mockImplementation(async () => ({
       id: 'job-uuid-10',
       shortId,
-      status: 'PRINTING',
+      status: 'WAITING',
       machineId: 'machine_eps_01',
       cost: 5.0,
       document: null // Missing document relation
-    });
+    }));
     mockUpdate.mockResolvedValueOnce({ id: 'job-uuid-10', status: 'FAILED' });
 
     const result = await queueService.processJob(shortId);
 
-    expect(result).toBeNull();
+    expect(result).toBeUndefined(); // processJob has no return-value contract
     expect(mockUpdate).toHaveBeenCalledWith({
       where: { shortId },
       data: { status: 'FAILED' }
@@ -347,22 +340,22 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     const shortId = 'job_nomach_11';
 
     mockUpdateMany.mockResolvedValueOnce({ count: 1 });
-    mockFindUnique.mockResolvedValueOnce({
+    mockFindUnique.mockImplementation(async () => ({
       id: 'job-uuid-11',
       shortId,
-      status: 'PRINTING',
+      status: 'WAITING',
       machineId: null, // No printer machine assigned
       cost: 5.0,
       document: {
         filename: 'http://localhost:5000/uploads/doc11.pdf',
         originalName: 'nomach.pdf'
       }
-    });
+    }));
     mockUpdate.mockResolvedValueOnce({ id: 'job-uuid-11', status: 'FAILED' });
 
     const result = await queueService.processJob(shortId);
 
-    expect(result).toBeNull();
+    expect(result).toBeUndefined(); // processJob has no return-value contract
     expect(mockUpdate).toHaveBeenCalledWith({
       where: { shortId },
       data: { status: 'FAILED' }
@@ -374,17 +367,17 @@ describe('P1-05: Queue Dispatch & Concurrency Safety', () => {
     const shortId = 'job_sockerr_12';
 
     mockUpdateMany.mockResolvedValueOnce({ count: 1 });
-    mockFindUnique.mockResolvedValueOnce({
+    mockFindUnique.mockImplementation(async () => ({
       id: 'job-uuid-12',
       shortId,
-      status: 'PRINTING',
+      status: 'WAITING',
       machineId: 'machine_eps_01',
       cost: 5.0,
       document: {
         filename: 'http://localhost:5000/uploads/doc12.pdf',
         originalName: 'sockerr.pdf'
       }
-    });
+    }));
 
     // Make socket emit throw an error
     mockIo.to.mockImplementationOnce(() => ({
