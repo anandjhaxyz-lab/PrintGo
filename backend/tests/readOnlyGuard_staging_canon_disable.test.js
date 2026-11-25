@@ -1,7 +1,8 @@
 const {
   readOnlyGuard,
   isAllowedStagingCanonDisable,
-  STAGING_CANON_DISABLE_DEVICE_ID
+  STAGING_CANON_DISABLE_DEVICE_ID,
+  STAGING_CANON_DISABLE_GIT_BRANCH
 } = require('../src/middlewares/readOnlyGuard');
 const {
   STAGING_SERVICE_ID,
@@ -28,7 +29,7 @@ describe('readOnlyGuard — exact single-device Canon staging disable exception'
     process.env.RENDER = 'true';
     process.env.RENDER_SERVICE_ID = STAGING_SERVICE_ID;
     process.env.RENDER_SERVICE_NAME = STAGING_SERVICE_NAME;
-    process.env.RENDER_GIT_BRANCH = STAGING_GIT_BRANCH;
+    process.env.RENDER_GIT_BRANCH = STAGING_CANON_DISABLE_GIT_BRANCH;
     process.env.STAGING_CANON_DISABLE_ENABLED = 'true';
   });
   afterAll(() => { process.env = originalEnv; });
@@ -65,6 +66,7 @@ describe('readOnlyGuard — exact single-device Canon staging disable exception'
     ['wrong Render service ID', 'RENDER_SERVICE_ID', 'srv-production'],
     ['wrong Render service name', 'RENDER_SERVICE_NAME', 'printgo-backend-production'],
     ['wrong branch', 'RENDER_GIT_BRANCH', 'main'],
+    ['shared payment branch must not authorize Canon exception', 'RENDER_GIT_BRANCH', STAGING_GIT_BRANCH],
     ['feature flag missing', 'STAGING_CANON_DISABLE_ENABLED', undefined],
     ['feature flag false', 'STAGING_CANON_DISABLE_ENABLED', 'false']
   ])('fails closed for %s', (_label, key, value) => {

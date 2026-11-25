@@ -23,6 +23,7 @@ const ALLOWED_CASH_MUTATION_PATTERNS = [
 const STAGING_PRINTER_APPROVAL_PATTERN = /^\/api\/admin\/printer-discoveries\/[a-zA-Z0-9_-]+\/approve$/;
 // One-device emergency staging exception. Immutable ID read from staging DB.
 const STAGING_CANON_DISABLE_DEVICE_ID = '114c0092-e3c6-4432-b17f-e7c6f42ec334';
+const STAGING_CANON_DISABLE_GIT_BRANCH = 'fix/staging-canon-disable-minimal';
 const STAGING_CANON_DISABLE_PATH = '/api/admin/printer-devices/' + STAGING_CANON_DISABLE_DEVICE_ID + '/disable';
 
 const isAllowedStagingCanonDisable = (req) => {
@@ -30,7 +31,7 @@ const isAllowedStagingCanonDisable = (req) => {
   if (process.env.RENDER !== 'true') return false;
   if (process.env.RENDER_SERVICE_ID !== STAGING_SERVICE_ID) return false;
   if (process.env.RENDER_SERVICE_NAME !== STAGING_SERVICE_NAME) return false;
-  if (process.env.RENDER_GIT_BRANCH !== STAGING_GIT_BRANCH) return false;
+  if (process.env.RENDER_GIT_BRANCH !== STAGING_CANON_DISABLE_GIT_BRANCH) return false;
   if (process.env.STAGING_CANON_DISABLE_ENABLED !== 'true') return false;
   if ((req.method || '').toUpperCase() !== 'POST') return false;
   if (getCleanPath(req) !== STAGING_CANON_DISABLE_PATH) return false;
@@ -254,6 +255,7 @@ module.exports = {
   isAllowedStagingPrinterApproval,
   isAllowedStagingCanonDisable,
   STAGING_CANON_DISABLE_DEVICE_ID,
+  STAGING_CANON_DISABLE_GIT_BRANCH,
   getCleanPath,
   ALLOWED_AD_MUTATION_PATTERNS,
   ALLOWED_CASH_MUTATION_PATTERNS,
