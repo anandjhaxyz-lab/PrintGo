@@ -36,6 +36,7 @@ const {
   closeRedisConnection
 } = require('./services/redisClient');
 const prisma = require('./utils/prisma');
+const { assertDatabaseIdentity } = require('./utils/databaseIdentityGuard');
 const queueService = require('./services/queueService');
 const uploadWorkerService = require('./services/uploadWorker');
 const uploadQueueController = require('./modules/upload/upload.controller');
@@ -383,26 +384,20 @@ const autoSeed = async () => {
 };
 
 /**
- * Fail-Closed Database Identity Guard
- * Enforces that local server execution connects strictly to printgo_disposable_target on port 5433.
- * Aborts startup immediately BEFORE autoSeed() or any database mutation if targeting printgo_db or another DB.
+ * Fail-closed database identity guard.
+ * Local development is pinned to the disposable target; staging/production
+ * must explicitly declare their expected database host, name, and port.
  */
 const verifyDatabaseIdentity = async () => {
-  const isCloudEnv = process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging';
-  if (isCloudEnv) return;
-
-  const prisma = require('./utils/prisma');
-  const meta = await prisma.$queryRawUnsafe('SELECT current_database(), inet_server_port();');
-  const currentDb = meta[0]?.current_database;
-  const currentPort = Number(meta[0]?.inet_server_port);
-
-  if (currentDb !== 'printgo_disposable_target' || currentPort !== 5433) {
-    const errorMsg = `[DATABASE SAFETY GUARD] FATAL: Server startup aborted. Connected to unauthorized database '${currentDb}' on port ${currentPort}. Local startup requires 'printgo_disposable_target' on port 5433.`;
-    logger.error(errorMsg);
-    throw new Error(errorMsg);
+  try {
+    const verified = await assertDatabaseIdentity({ env: process.env, prisma });
+    logger.info(
+      `[DATABASE SAFETY GUARD] Verified: '${verified.name}' on ${verified.host}:${verified.port}.`
+    );
+  } catch (error) {
+    logger.error('[DATABASE SAFETY GUARD] FATAL: Server startup aborted.', error.message);
+    throw error;
   }
-
-  logger.info(`[DATABASE SAFETY GUARD] Verified: Connected to '${currentDb}' on port ${currentPort}.`);
 };
 
 const startServer = async () => {
