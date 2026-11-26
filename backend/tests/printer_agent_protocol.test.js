@@ -138,6 +138,7 @@ describe('Printer Agent protocol — negotiation and machine isolation', () => {
       logger: { error: jest.fn() },
       payload: {
         ...windowsHello(),
+        connectionId: 'agent-connection-001',
         machineId: 'machine-attacker-b'
       }
     });
@@ -153,9 +154,14 @@ describe('Printer Agent protocol — negotiation and machine isolation', () => {
     const registryEvent = socket.emit.mock.calls.find(([event]) => event === 'printer_device_registry');
     expect(registryEvent[1]).toEqual(expect.objectContaining({
       machineId: 'machine-authenticated-a',
-      protocolVersion: 1
+      protocolVersion: 1,
+      connectionId: 'agent-connection-001'
     }));
     expect(registryEvent[1].devices.map(item => item.id)).toEqual(['device-1', 'device-2']);
+    expect(socket.emit).toHaveBeenCalledWith('printer_agent_hello_ack', expect.objectContaining({
+      accepted: true,
+      connectionId: 'agent-connection-001'
+    }));
     expect(registryEvent[1].devices[1].status).toBe('PENDING_APPROVAL');
 
     // The authenticated registry response includes only an allowlisted DTO, not
@@ -166,6 +172,42 @@ describe('Printer Agent protocol — negotiation and machine isolation', () => {
     }));
     expect(registryEvent[1].devices[0].machineKey).toBeUndefined();
     expect(registryEvent[1].devices[0].publicKey).toBeUndefined();
+  });
+
+  test('correlates initial registry failure with the active Agent connection', async () => {
+    const socket = { userType: 'printer', machineId: 'machine-a', emit: jest.fn() };
+    const result = await handlePrinterAgentHello({
+      socket,
+      prisma: { printerDevice: { findMany: jest.fn().mockRejectedValue(new Error('database unavailable')) } },
+      logger: { error: jest.fn() },
+      payload: windowsHello({ connectionId: 'agent-connection-error-01' })
+    });
+    expect(result).toEqual(expect.objectContaining({ accepted: true, supportsMultiPrinter: true, registryLoaded: false }));
+    expect(socket.emit).toHaveBeenCalledWith('printer_device_registry_error', expect.objectContaining({
+      connectionId: 'agent-connection-error-01', code: 'REGISTRY_UNAVAILABLE', retryable: true
+    }));
+  });
+
+  test('keeps older multi-printer agents without connection IDs backward compatible', async () => {
+    const socket = { userType: 'printer', machineId: 'machine-legacy-agent', emit: jest.fn() };
+    const prisma = { printerDevice: { findMany: jest.fn().mockResolvedValue([]) } };
+
+    const result = await handlePrinterAgentHello({
+      socket,
+      prisma,
+      logger: { error: jest.fn() },
+      payload: windowsHello()
+    });
+
+    expect(result).toEqual(expect.objectContaining({ accepted: true, supportsMultiPrinter: true }));
+    expect(socket.emit).toHaveBeenCalledWith('printer_agent_hello_ack', expect.objectContaining({
+      accepted: true,
+      supportsMultiPrinter: true
+    }));
+    const ack = socket.emit.mock.calls.find(([event]) => event === 'printer_agent_hello_ack')[1];
+    const registry = socket.emit.mock.calls.find(([event]) => event === 'printer_device_registry')[1];
+    expect(ack.connectionId).toBeUndefined();
+    expect(registry.connectionId).toBeUndefined();
   });
 
   test('does not return a fleet registry to non-printer sockets', async () => {
@@ -198,6 +240,28 @@ describe('Printer Agent protocol — negotiation and machine isolation', () => {
     expect(socket.emit).toHaveBeenCalledWith('printer_agent_hello_ack', expect.objectContaining({
       accepted: true,
       supportsMultiPrinter: false
+    }));
+  });
+
+  test('rejects malformed connection identity and clears any prior fleet capability', async () => {
+    const socket = {
+      userType: 'printer',
+      machineId: 'machine-a',
+      agentProtocol: { supportsMultiPrinter: true },
+      emit: jest.fn()
+    };
+    const result = await handlePrinterAgentHello({
+      socket,
+      prisma: { printerDevice: { findMany: jest.fn() } },
+      logger: { error: jest.fn() },
+      payload: windowsHello({ connectionId: 'invalid connection id' })
+    });
+
+    expect(result).toEqual(expect.objectContaining({ accepted: false, code: 'INVALID_CONNECTION_ID' }));
+    expect(socket.agentProtocol).toBeNull();
+    expect(socket.emit).toHaveBeenCalledWith('printer_agent_hello_ack', expect.objectContaining({
+      accepted: false,
+      code: 'INVALID_CONNECTION_ID'
     }));
   });
 
@@ -531,7 +595,7 @@ describe('Printer Agent protocol — authenticated registry refresh', () => {
     const socket = {
       userType: 'printer',
       machineId: 'machine-authenticated',
-      agentProtocol: { supportsMultiPrinter: true },
+      agentProtocol: { supportsMultiPrinter: true, connectionId: 'agent-connection-002' },
       emit: jest.fn()
     };
     const devices = [device('device-a', 'Epson L6460')];
@@ -564,6 +628,7 @@ describe('Printer Agent protocol — authenticated registry refresh', () => {
       protocolVersion: 1,
       machineId: 'machine-authenticated',
       requestId,
+      connectionId: 'agent-connection-002',
       devices: [expect.objectContaining({
         id: 'device-a',
         displayName: 'Epson L6460',
@@ -631,7 +696,7 @@ describe('Printer Agent protocol — authenticated registry refresh', () => {
     const socket = {
       userType: 'printer',
       machineId: 'machine-a',
-      agentProtocol: { supportsMultiPrinter: true },
+      agentProtocol: { supportsMultiPrinter: true, connectionId: 'agent-connection-error-02' },
       emit: jest.fn()
     };
     const prisma = {
@@ -654,6 +719,7 @@ describe('Printer Agent protocol — authenticated registry refresh', () => {
     });
     expect(socket.emit).toHaveBeenCalledWith('printer_device_registry_error', expect.objectContaining({
       requestId,
+      connectionId: 'agent-connection-error-02',
       code: 'REGISTRY_UNAVAILABLE',
       retryable: true
     }));

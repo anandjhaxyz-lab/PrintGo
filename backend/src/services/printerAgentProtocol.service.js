@@ -220,9 +220,18 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
 
   // A repeated malformed hello must revoke any previously negotiated fleet capability.
   socket.agentProtocol = null;
+  const rawConnectionId = payload?.connectionId;
+  const connectionId = rawConnectionId === undefined || rawConnectionId === null
+    ? null
+    : (typeof rawConnectionId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(rawConnectionId) ? rawConnectionId : null);
+  if (rawConnectionId !== undefined && rawConnectionId !== null && !connectionId) {
+    const rejected = { accepted: false, code: 'INVALID_CONNECTION_ID', reason: 'Agent connection identity is invalid.' };
+    socket.emit('printer_agent_hello_ack', rejected);
+    return rejected;
+  }
   const hello = validateAgentHello(payload);
   if (!hello.accepted) {
-    socket.emit('printer_agent_hello_ack', hello);
+    socket.emit('printer_agent_hello_ack', { ...hello, ...(connectionId ? { connectionId } : {}) });
     return hello;
   }
 
@@ -232,6 +241,7 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
     installationId: hello.installationId,
     journalSchemaVersion: hello.journalSchemaVersion,
     supportsMultiPrinter: hello.supportsMultiPrinter,
+    ...(connectionId ? { connectionId } : {}),
     connectedAt: new Date()
   };
 
@@ -241,7 +251,8 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
     machineId: socket.machineId,
     supportsMultiPrinter: hello.supportsMultiPrinter,
     maxPrinters: hello.maxPrinters,
-    journalSchemaVersion: hello.journalSchemaVersion
+    journalSchemaVersion: hello.journalSchemaVersion,
+    ...(connectionId ? { connectionId } : {})
   });
 
   if (!hello.supportsMultiPrinter) {
@@ -254,12 +265,14 @@ async function handlePrinterAgentHello({ socket, prisma, logger, payload }) {
       protocolVersion: AGENT_PROTOCOL_VERSION,
       machineId: socket.machineId,
       issuedAt: new Date().toISOString(),
+      ...(connectionId ? { connectionId } : {}),
       devices
     });
     return { accepted: true, supportsMultiPrinter: true, deviceCount: devices.length };
   } catch (error) {
     logger?.error?.(`Failed to load PrinterDevice registry for Machine ${socket.machineId}:`, error);
     socket.emit('printer_device_registry_error', {
+      ...(connectionId ? { connectionId } : {}),
       code: error.code || 'REGISTRY_UNAVAILABLE',
       retryable: true,
       message: 'Printer registry could not be loaded. Existing legacy printer operation is unchanged.'
@@ -275,6 +288,7 @@ async function handlePrinterDeviceRegistryRequest({ socket, prisma, logger, requ
   if (socket.agentProtocol?.supportsMultiPrinter !== true) {
     socket.emit('printer_device_registry_error', {
       requestId: typeof requestId === 'string' ? requestId : null,
+      ...(socket.agentProtocol?.connectionId ? { connectionId: socket.agentProtocol.connectionId } : {}),
       code: 'AGENT_PROTOCOL_NOT_NEGOTIATED',
       retryable: false,
       message: 'Multi-printer protocol must be negotiated before requesting a device registry.'
@@ -284,6 +298,7 @@ async function handlePrinterDeviceRegistryRequest({ socket, prisma, logger, requ
   if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(requestId)) {
     socket.emit('printer_device_registry_error', {
       requestId: null,
+      ...(socket.agentProtocol?.connectionId ? { connectionId: socket.agentProtocol.connectionId } : {}),
       code: 'INVALID_REGISTRY_REQUEST_ID',
       retryable: false,
       message: 'A valid registry request ID is required.'
@@ -299,6 +314,7 @@ async function handlePrinterDeviceRegistryRequest({ socket, prisma, logger, requ
       machineId: socket.machineId,
       issuedAt: new Date().toISOString(),
       requestId,
+      ...(socket.agentProtocol?.connectionId ? { connectionId: socket.agentProtocol.connectionId } : {}),
       devices
     });
     return { accepted: true, requestId, deviceCount: devices.length };
@@ -306,6 +322,7 @@ async function handlePrinterDeviceRegistryRequest({ socket, prisma, logger, requ
     logger?.error?.(`Failed to refresh PrinterDevice registry for Machine ${socket.machineId}:`, error);
     socket.emit('printer_device_registry_error', {
       requestId,
+      ...(socket.agentProtocol?.connectionId ? { connectionId: socket.agentProtocol.connectionId } : {}),
       code: error.code || 'REGISTRY_UNAVAILABLE',
       retryable: true,
       message: 'Printer registry could not be refreshed. Device-bound dispatch must remain blocked.'
