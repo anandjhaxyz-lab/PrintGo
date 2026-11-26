@@ -41,6 +41,52 @@ const isAllowedStagingCanonDisable = (req) => {
   return true;
 };
 
+// Exact staging-only QR mutation exception. This does NOT disable ADMIN_READ_ONLY.
+const STAGING_PRINTER_QR_GIT_BRANCH = 'fix/staging-canon-disable-minimal';
+const STAGING_PLACEHOLDER_QR_ID = '09363ed8-b14c-491a-aff2-c5d6c6d588f7';
+const STAGING_PRINTER_QR_DEVICES = Object.freeze({
+  '114c0092-e3c6-4432-b17f-e7c6f42ec334': 'Canon Generic Plus UFR II (Copy 2)',
+  '619665e1-3c64-44eb-8f57-cb8c3c895e9b': 'EPSON L6460 Series',
+  '77554510-b102-40c7-957f-6f735eba0bdc': 'HP LaserJet Professional M1136 MFP (Copy 1)'
+});
+
+const isAllowedStagingPrinterQrMutation = (req) => {
+  if (process.env.APP_ENV !== 'staging') return false;
+  if (process.env.RENDER !== 'true') return false;
+  if (process.env.RENDER_SERVICE_ID !== STAGING_SERVICE_ID) return false;
+  if (process.env.RENDER_SERVICE_NAME !== STAGING_SERVICE_NAME) return false;
+  if (process.env.RENDER_GIT_BRANCH !== STAGING_PRINTER_QR_GIT_BRANCH) return false;
+  if (process.env.STAGING_PRINTER_QR_MUTATIONS_ENABLED !== 'true') return false;
+
+  const method = (req.method || '').toUpperCase();
+  const cleanPath = getCleanPath(req);
+
+  if (method === 'POST' && cleanPath === `/api/admin/printer-qrs/${STAGING_PLACEHOLDER_QR_ID}/revoke`) {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+    if (Object.keys(body).some((key) => key !== 'reason')) return false;
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (reason.length < 10 || reason.length > 500) return false;
+    logger?.warn?.('[READ_ONLY_GUARD] Authorized exact staging placeholder printer QR revocation exception.');
+    return true;
+  }
+
+  if (method === 'POST') {
+    const match = cleanPath.match(/^\/api\/admin\/printer-devices\/([0-9a-f-]{36})\/qr$/i);
+    if (!match) return false;
+    const expectedLabel = STAGING_PRINTER_QR_DEVICES[match[1].toLowerCase()];
+    if (!expectedLabel) return false;
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+    if (Object.keys(body).some((key) => key !== 'label')) return false;
+    if (body.label !== expectedLabel) return false;
+    logger?.warn?.(`[READ_ONLY_GUARD] Authorized exact staging printer QR creation exception for device ${match[1]}.`);
+    return true;
+  }
+
+  return false;
+};
+
 const getCleanPath = (req) => {
   let target = '';
   if (req.baseUrl && req.path) {
@@ -235,6 +281,10 @@ const readOnlyGuard = (req, res, next) => {
         return next();
       }
 
+      if (isAllowedStagingPrinterQrMutation(req)) {
+        return next();
+      }
+
       const cleanPath = getCleanPath(req);
       logger?.warn?.(`[READ_ONLY_GUARD] Blocked mutation: ${req.method} ${cleanPath} (ADMIN_READ_ONLY=true)`);
 
@@ -254,6 +304,10 @@ module.exports = {
   isAllowedStagingPaymentModeConfig,
   isAllowedStagingPrinterApproval,
   isAllowedStagingCanonDisable,
+  isAllowedStagingPrinterQrMutation,
+  STAGING_PLACEHOLDER_QR_ID,
+  STAGING_PRINTER_QR_DEVICES,
+  STAGING_PRINTER_QR_GIT_BRANCH,
   STAGING_CANON_DISABLE_DEVICE_ID,
   STAGING_CANON_DISABLE_GIT_BRANCH,
   getCleanPath,
