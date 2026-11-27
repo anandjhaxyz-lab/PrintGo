@@ -1,5 +1,7 @@
 const AppError = require('../utils/AppError');
 
+const countNonWhitespaceCharacters = (value) => value.replace(/\s/g, '').length;
+
 const validateLegacyQrAlias = ({ qr, binding, device }) => {
   if (!qr || qr.status !== 'ACTIVE' || !qr.machineId) throw new AppError('Legacy QR is not active or machine-bound.', 403);
   if (!binding || binding.status !== 'ACTIVE' || !binding.approvedAt || !binding.approvedBy) throw new AppError('Legacy QR has no explicitly approved physical-printer alias.', 403);
@@ -31,7 +33,7 @@ const validateLegacyQrAlias = ({ qr, binding, device }) => {
 };
 
 const approveLegacyQrBinding = async ({ prisma, qrId, printerDeviceId, reason, user }) => {
-  if (!reason || typeof reason !== 'string' || reason.trim().length < 10) throw new AppError('A meaningful approval reason of at least 10 non-whitespace characters is required.', 400);
+  if (!reason || typeof reason !== 'string' || countNonWhitespaceCharacters(reason) < 10) throw new AppError('A meaningful approval reason of at least 10 non-whitespace characters is required.', 400);
   if (!user || user.role !== 'SUPERADMIN') throw new AppError('Only SUPERADMIN may approve a legacy QR printer alias.', 403);
   return prisma.$transaction(async (tx) => {
     const qrs = await tx.$queryRawUnsafe('SELECT id, "machineId", "printerDeviceId", status FROM "PrinterQr" WHERE id = $1 FOR UPDATE', qrId);
@@ -67,7 +69,7 @@ const approveLegacyQrBinding = async ({ prisma, qrId, printerDeviceId, reason, u
 };
 
 const revokeLegacyQrBinding = async ({ prisma, qrId, reason, user }) => {
-  if (!reason || typeof reason !== 'string' || reason.trim().length < 10) throw new AppError('A meaningful revocation reason of at least 10 non-whitespace characters is required.', 400);
+  if (!reason || typeof reason !== 'string' || countNonWhitespaceCharacters(reason) < 10) throw new AppError('A meaningful revocation reason of at least 10 non-whitespace characters is required.', 400);
   if (!user || user.role !== 'SUPERADMIN') throw new AppError('Only SUPERADMIN may revoke a legacy QR printer alias.', 403);
   return prisma.$transaction(async (tx) => {
     const qrs = await tx.$queryRawUnsafe('SELECT id, status FROM "PrinterQr" WHERE id = $1 FOR UPDATE', qrId);

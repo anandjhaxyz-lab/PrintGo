@@ -12,6 +12,11 @@ describe('legacy QR alias revocation lifecycle', () => {
     expect(result).toMatchObject({ id: 'b1', status: 'REVOKED', printerDeviceId: 'd1' });
     expect(tx.$executeRawUnsafe).toHaveBeenCalledWith(expect.stringContaining('revokedReason'), 'REVOKED', 'root-1', 'Retiring old counter mapping', 'b1');
   });
+  test('counts only non-whitespace characters in revocation reasons', async () => {
+    await expect(revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: 'abc def ghi', user })).rejects.toThrow(/10 non-whitespace/);
+    await expect(revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: 'abc def ghij', user })).resolves.toMatchObject({ status: 'REVOKED' });
+    await expect(revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: 'abc\tdef\nghij', user })).resolves.toMatchObject({ status: 'REVOKED' });
+  });
   test('revocation is idempotent for an already revoked binding', async () => {
     const tx = makeTx({ id: 'b1', status: 'REVOKED', printerDeviceId: 'd1' });
     await expect(revokeLegacyQrBinding({ prisma: prismaFor(tx), qrId: 'q1', reason: 'Retiring old counter mapping', user })).resolves.toMatchObject({ status: 'REVOKED', alreadyRevoked: true });

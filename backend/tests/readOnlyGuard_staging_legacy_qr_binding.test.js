@@ -51,6 +51,18 @@ describe('readOnlyGuard - exact staging legacy QR binding mutations', () => {
   });
 
   test.each([
+    ['nine non-whitespace characters separated by spaces', 'abc def ghi', false],
+    ['ten non-whitespace characters separated by spaces', 'abc def ghij', true],
+    ['ten non-whitespace characters with tabs and newline', 'abc\tdef\nghij', true],
+    ['whitespace-only reason', '          ', false]
+  ])('validates meaningful reason length: %s', (_label, reason, expected) => {
+    const approval = request('POST', path(), { printerDeviceId: deviceId, reason });
+    const revocation = request('POST', path('/revoke'), { reason });
+    expect(isAllowedStagingLegacyQrBindingMutation(approval)).toBe(expected);
+    expect(isAllowedStagingLegacyQrBindingMutation(revocation)).toBe(expected);
+  });
+
+  test.each([
     ['production app', 'APP_ENV', 'production'],
     ['Render disabled', 'RENDER', 'false'],
     ['wrong service ID', 'RENDER_SERVICE_ID', 'srv-production'],

@@ -263,7 +263,7 @@ const isAllowedStagingLegacyQrBindingMutation = (req) => {
   const keys = Object.keys(body).sort();
   const expected = approval ? ['printerDeviceId', 'reason'] : ['reason'];
   if (keys.length !== expected.length || keys.some((key, i) => key !== expected[i])) return false;
-  if (typeof body.reason !== 'string' || body.reason.trim().length < 10 || body.reason.trim().length > 500) return false;
+  if (typeof body.reason !== 'string' || body.reason.replace(/\s/g, '').length < 10 || body.reason.trim().length > 500) return false;
   if (approval && (typeof body.printerDeviceId !== 'string' || !body.printerDeviceId.trim())) return false;
   logger?.warn?.('[READ_ONLY_GUARD] Authorized exact staging legacy printer QR binding mutation.');
   return true;
