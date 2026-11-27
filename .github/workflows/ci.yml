@@ -29,6 +29,7 @@ on:
       - feat/multi-printer-device-qr-session-binding
       - docs/hyderabad-windows-physical-certification
       - fix/multi-printer-release-review-blockers
+      - fix/dedicated-printer-status-device-scope
 
 jobs:
   # =========================================================================
