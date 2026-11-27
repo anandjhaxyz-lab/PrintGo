@@ -220,6 +220,8 @@ router.get('/printer-qrs/:id', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQr
 router.post('/printer-qrs', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.generatePrinterQr);
 router.post('/printer-devices/:id/qr', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.generatePrinterDeviceQr);
 router.post('/printer-qrs/:id/revoke', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.revokePrinterQr);
+router.post('/printer-qrs/:id/legacy-binding', restrictTo('SUPERADMIN'), printerQrAdminController.approveLegacyQrBinding);
+router.post('/printer-qrs/:id/legacy-binding/revoke', restrictTo('SUPERADMIN'), printerQrAdminController.revokeLegacyQrBinding);
 router.post('/printer-qrs/:id/replace', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.replacePrinterQr);
 router.get('/machines/:id/qr', restrictTo('SUPERADMIN', 'FRANCHISEE'), printerQrAdminController.getMachineQrLedger);
 

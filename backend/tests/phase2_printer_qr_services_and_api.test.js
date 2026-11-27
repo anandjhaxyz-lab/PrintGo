@@ -378,6 +378,11 @@ if (process.env.DATABASE_URL) {
       }
     },
 
+    legacyPrinterQrBinding: {
+      // Existing QR fixtures have no alias; preserve legacy machine-level behavior.
+      findUnique: async () => null
+    },
+
     printPricingProfile: {
       findFirst: async () => null,
       findUnique: async () => null,
