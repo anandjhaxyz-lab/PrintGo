@@ -7,7 +7,7 @@ const { getPricingProfile, serializePublicPricingProfile } = require('./pricing.
 const { resolveCashfreeEnv } = require('../config/cashfree.config');
 const { isDemoPaymentPermitted, isDemoAccessCodeRequired } = require('../utils/demoPaymentGuard');
 const { DEFAULT_PAYMENT_MODE } = require('../constants/paymentModes');
-const { getMachineAvailability } = require('./printerAvailability.service');
+const { getMachineAvailability, getPrinterDeviceAvailability } = require('./printerAvailability.service');
 
 const isMultiPrinterDispatchEnabled = () => process.env.ENABLE_MULTI_PRINTER_DISPATCH === 'true';
 const isLegacyPlaceholderDevice = (device) => Boolean(
@@ -701,6 +701,7 @@ const resolvePrinterQr = async (publicCode) => {
     {
       sessionId: session.code,
       machineId: qr.machine_id,
+      ...(session.printerDeviceId ? { printerDeviceId: session.printerDeviceId } : {}),
       paymentMode: effectivePaymentMode,
       type: 'session',
       role: 'mobile'
@@ -713,7 +714,9 @@ const resolvePrinterQr = async (publicCode) => {
   const pricingProfile = serializePublicPricingProfile(rawProfile);
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
-  const availability = await getMachineAvailability(qr.machine_id, prisma);
+  const availability = session.printerDeviceId
+    ? await getPrinterDeviceAvailability(qr.machine_id, session.printerDeviceId, prisma)
+    : await getMachineAvailability(qr.machine_id, prisma);
   const isReady = availability ? availability.isReady : false;
   const hardwareStatus = availability ? availability.status : 'UNKNOWN';
   const statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
@@ -745,7 +748,9 @@ const resolvePrinterQr = async (publicCode) => {
       agentOnline: availability ? availability.agentOnline : false,
       paperStatus: availability ? availability.paperStatus : 'UNKNOWN',
       tonerStatus: availability ? availability.tonerStatus : 'UNKNOWN',
-      jamStatus: availability ? availability.jamStatus : false
+      jamStatus: availability ? availability.jamStatus : false,
+      printerDeviceId: session.printerDeviceId || null,
+      lastTelemetryAt: availability?.lastTelemetryAt || null
     }
   };
 };
@@ -815,7 +820,9 @@ const getPublicPrinterQrInfo = async (publicCode) => {
   const pricingProfile = serializePublicPricingProfile(rawProfile);
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
-  const availability = await getMachineAvailability(qr.machine.id, prisma);
+  const availability = qr.printerDeviceId && !legacyPlaceholderDevice
+    ? await getPrinterDeviceAvailability(qr.machine.id, qr.printerDeviceId, prisma)
+    : await getMachineAvailability(qr.machine.id, prisma);
   let isReady = availability ? availability.isReady : false;
   let hardwareStatus = availability ? availability.status : 'UNKNOWN';
   let statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
@@ -823,32 +830,9 @@ const getPublicPrinterQrInfo = async (publicCode) => {
 
   if (qr.printerDevice && !legacyPlaceholderDevice) {
     lastTelemetryAt = qr.printerDevice.lastTelemetryAt ? qr.printerDevice.lastTelemetryAt.toISOString() : null;
-    const devHealth = qr.printerDevice.healthStatus || 'UNKNOWN';
-    if (!availability || !availability.agentOnline) {
-      hardwareStatus = 'AGENT_OFFLINE';
-      isReady = false;
-      statusMessage = 'Printer Agent Offline';
-    } else if (devHealth === 'ONLINE') {
-      hardwareStatus = 'ONLINE';
-      isReady = true;
-      statusMessage = 'Printer Ready';
-    } else if (devHealth === 'PAPER_OUT') {
-      hardwareStatus = 'PAPER_OUT';
-      isReady = false;
-      statusMessage = 'Out of Paper';
-    } else if (devHealth === 'JAMMED') {
-      hardwareStatus = 'JAMMED';
-      isReady = false;
-      statusMessage = 'Paper Jam';
-    } else if (devHealth === 'OFFLINE') {
-      hardwareStatus = 'OFFLINE';
-      isReady = false;
-      statusMessage = 'Physical Printer Offline';
-    } else {
-      hardwareStatus = 'ERROR';
-      isReady = false;
-      statusMessage = 'Printer Error';
-    }
+    hardwareStatus = availability?.status || 'UNKNOWN';
+    isReady = Boolean(availability?.isReady);
+    statusMessage = availability?.statusMessage || 'Printer Status Unavailable';
   }
 
   return {

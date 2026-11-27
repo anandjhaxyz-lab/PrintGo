@@ -529,11 +529,16 @@ const MobileView = () => {
         newSocket.on('disconnect', () => setIsConnected(false));
         newSocket.on('connect_error', () => setIsConnected(false));
 
-        newSocket.on('printer_status_update', (statusData) => {
-          if (!cancelled && statusData && typeof statusData === 'object') {
-            setPrinterInfo((prev) => ({
+        const applyPrinterStatusUpdate = (statusData, expectedDeviceId = null) => {
+          if (cancelled || !statusData || typeof statusData !== 'object') return;
+          setPrinterInfo((prev) => {
+            // Device QR sessions accept only their own device event. Legacy sessions
+            // continue to consume machine-wide status, never the other way around.
+            if (expectedDeviceId && (!prev?.printerDeviceId || statusData.printerDeviceId !== expectedDeviceId || prev.printerDeviceId !== expectedDeviceId)) return prev;
+            if (!expectedDeviceId && prev?.printerDeviceId) return prev;
+            return {
               ...(prev || {}),
-              name: statusData.name || prev?.name || 'Counter Printer',
+              name: statusData.name || statusData.displayName || prev?.name || 'Counter Printer',
               location: statusData.location || prev?.location || 'Front Desk',
               model: statusData.printerModel || prev?.model || 'Unknown',
               isOnline: statusData.isReady ?? statusData.isOnline ?? false,
@@ -542,8 +547,14 @@ const MobileView = () => {
               paperStatus: statusData.paperStatus,
               tonerStatus: statusData.tonerStatus,
               jamStatus: statusData.jamStatus,
-            }));
-          }
+              lastTelemetryAt: statusData.lastTelemetryAt || prev?.lastTelemetryAt || null,
+            };
+          });
+        };
+
+        newSocket.on('printer_status_update', (statusData) => applyPrinterStatusUpdate(statusData));
+        newSocket.on('printer_device_status_update', (statusData) => {
+          if (statusData?.printerDeviceId) applyPrinterStatusUpdate(statusData, statusData.printerDeviceId);
         });
 
         // Security rule: socket payment notifications MUST verify server-side rather than trusting event alone

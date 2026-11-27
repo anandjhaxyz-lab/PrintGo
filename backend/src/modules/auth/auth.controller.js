@@ -8,7 +8,7 @@ const { getPricingProfile, serializePublicPricingProfile } = require('../../serv
 const { resolveCashfreeEnv } = require('../../config/cashfree.config');
 const { isDemoPaymentPermitted, isDemoAccessCodeRequired } = require('../../utils/demoPaymentGuard');
 const { DEFAULT_PAYMENT_MODE } = require('../../constants/paymentModes');
-const { getMachineAvailability } = require('../../services/printerAvailability.service');
+const { getMachineAvailability, getPrinterDeviceAvailability } = require('../../services/printerAvailability.service');
 
 const login = async (req, res, next) => {
   try {
@@ -160,7 +160,7 @@ const joinSession = async (req, res, next) => {
 
     // Issue a session token for the mobile user
     const sessionToken = jwt.sign(
-      { sessionId: session.code, machineId: session.machineId || null, type: 'session', role: 'mobile' },
+      { sessionId: session.code, machineId: session.machineId || null, ...(session.printerDeviceId ? { printerDeviceId: session.printerDeviceId } : {}), type: 'session', role: 'mobile' },
       process.env.JWT_SECRET,
       { expiresIn: '1h' }
     );
@@ -171,7 +171,9 @@ const joinSession = async (req, res, next) => {
 
     let printer = null;
     if (session.machineId) {
-      const availability = await getMachineAvailability(session.machineId, prisma);
+      const availability = session.printerDeviceId
+        ? await getPrinterDeviceAvailability(session.machineId, session.printerDeviceId, prisma)
+        : await getMachineAvailability(session.machineId, prisma);
       if (availability) {
         printer = {
           name: availability.name,
@@ -184,6 +186,8 @@ const joinSession = async (req, res, next) => {
           paperStatus: availability.paperStatus,
           tonerStatus: availability.tonerStatus,
           jamStatus: availability.jamStatus,
+          printerDeviceId: session.printerDeviceId || null,
+          lastTelemetryAt: availability.lastTelemetryAt || null,
         };
       }
     }

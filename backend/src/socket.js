@@ -1,7 +1,7 @@
 const prisma = require('./utils/prisma');
 const logger = require('./utils/logger');
 const { isValidJobTransition } = require('./utils/stateMachine');
-const { getMachineAvailability, computePrinterAvailability } = require('./services/printerAvailability.service');
+const { getMachineAvailability, getPrinterDeviceAvailability, computePrinterAvailability } = require('./services/printerAvailability.service');
 
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -32,6 +32,7 @@ const setupSockets = (io) => {
         if (decoded.type === 'session') {
           socket.sessionId = decoded.sessionId;
           socket.machineId = decoded.machineId; // Optional
+          socket.printerDeviceId = decoded.printerDeviceId || null; // Signed server-issued QR binding only
         } else {
           socket.userId = decoded.id;
           socket.userRole = decoded.role;
@@ -130,14 +131,20 @@ const setupSockets = (io) => {
         }
       })();
     } else if (socket.userType === 'session' && socket.machineId) {
-      socket.join(`machine_${socket.machineId}`);
+      if (socket.printerDeviceId) {
+        socket.join(`printer_device_${socket.printerDeviceId}`);
+      } else {
+        socket.join(`machine_${socket.machineId}`);
+      }
 
-      // Push current authoritative machine availability to newly joined customer session
+      // Dedicated QR sessions receive only the device bound in their signed token.
       (async () => {
         try {
-          const availability = await getMachineAvailability(socket.machineId, prisma);
+          const availability = socket.printerDeviceId
+            ? await getPrinterDeviceAvailability(socket.machineId, socket.printerDeviceId, prisma)
+            : await getMachineAvailability(socket.machineId, prisma);
           if (availability) {
-            socket.emit('printer_status_update', availability);
+            socket.emit(socket.printerDeviceId ? 'printer_device_status_update' : 'printer_status_update', availability);
           }
         } catch (err) {
           logger.error('Error sending availability to customer session socket:', err);
@@ -675,6 +682,29 @@ const setupSockets = (io) => {
         try {
           const machine = await prisma.machine.findUnique({ where: { id: socket.machineId } });
           if (machine) {
+            const devices = await prisma.printerDevice.findMany({
+              where: { machineId: socket.machineId, status: 'ACTIVE' },
+              select: { id: true, displayName: true, printerModel: true, lastTelemetryAt: true }
+            });
+            for (const device of devices) {
+              // Recompute from the current DB heartbeat instead of blindly forcing
+              // offline: an older socket may disconnect after a replacement reconnects.
+              const availability = await getPrinterDeviceAvailability(socket.machineId, device.id, prisma);
+              io.to(`printer_device_${device.id}`).emit('printer_device_status_update', {
+                machineId: socket.machineId,
+                printerDeviceId: device.id,
+                name: device.displayName,
+                printerModel: device.printerModel || 'Unknown',
+                status: availability?.status || 'UNKNOWN',
+                isReady: Boolean(availability?.isReady),
+                agentOnline: Boolean(availability?.agentOnline),
+                statusMessage: availability?.statusMessage || 'Printer Status Unavailable',
+                paperStatus: availability?.paperStatus || 'UNKNOWN',
+                tonerStatus: availability?.tonerStatus || 'UNKNOWN',
+                jamStatus: Boolean(availability?.jamStatus),
+                lastTelemetryAt: availability?.lastTelemetryAt || (device.lastTelemetryAt ? device.lastTelemetryAt.toISOString() : null)
+              });
+            }
             const offlineState = computePrinterAvailability({ ...machine, lastOnline: null }, null);
             const payload = {
               machineId: socket.machineId,

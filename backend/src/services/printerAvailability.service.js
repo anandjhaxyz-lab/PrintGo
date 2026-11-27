@@ -220,6 +220,31 @@ const computePrinterAvailability = (machine, latestPrinterStatus = null, now = n
  * @param {Object} [dbClient=prisma]
  * @param {Date} [now=new Date()]
  */
+const computePrinterDeviceAvailability = (machine, device, now = new Date()) => {
+  const refTimeMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  if (!machine || machine.status !== 'ACTIVE' || !machine.lastOnline) return { status: PRINTER_STATES.AGENT_OFFLINE, isReady: false, agentOnline: false, statusMessage: 'Printer Agent Offline', paperStatus: 'UNKNOWN', tonerStatus: 'UNKNOWN', jamStatus: false };
+  const heartbeatMs = new Date(machine.lastOnline).getTime();
+  const heartbeatAge = refTimeMs - heartbeatMs;
+  if (!Number.isFinite(heartbeatMs) || !Number.isFinite(refTimeMs) || heartbeatAge < 0 || heartbeatAge > ONLINE_HEARTBEAT_WINDOW_MS) return { status: PRINTER_STATES.AGENT_OFFLINE, isReady: false, agentOnline: false, statusMessage: 'Printer Agent Offline', paperStatus: 'UNKNOWN', tonerStatus: 'UNKNOWN', jamStatus: false };
+  const telemetryMs = device && device.lastTelemetryAt ? new Date(device.lastTelemetryAt).getTime() : NaN;
+  const telemetryAge = refTimeMs - telemetryMs;
+  if (!device || device.status !== 'ACTIVE' || !Number.isFinite(telemetryMs) || telemetryAge < 0 || telemetryAge > TELEMETRY_STALE_WINDOW_MS) return { status: PRINTER_STATES.UNKNOWN, isReady: false, agentOnline: true, statusMessage: CUSTOMER_STATUS_MESSAGES[PRINTER_STATES.UNKNOWN], paperStatus: 'UNKNOWN', tonerStatus: 'UNKNOWN', jamStatus: false };
+  const state = String(device.healthStatus || 'UNKNOWN').toUpperCase();
+  const mapped = { ONLINE: [PRINTER_STATES.ONLINE, true], PAPER_OUT: [PRINTER_STATES.PAPER_OUT, false], JAMMED: [PRINTER_STATES.JAMMED, false], OFFLINE: [PRINTER_STATES.PRINTER_DISCONNECTED, false] }[state];
+  if (!mapped) return { status: PRINTER_STATES.UNKNOWN, isReady: false, agentOnline: true, statusMessage: CUSTOMER_STATUS_MESSAGES[PRINTER_STATES.UNKNOWN], paperStatus: 'UNKNOWN', tonerStatus: 'UNKNOWN', jamStatus: false };
+  return { status: mapped[0], isReady: mapped[1], agentOnline: true, statusMessage: CUSTOMER_STATUS_MESSAGES[mapped[0]], paperStatus: state === 'PAPER_OUT' ? 'OUT' : 'OK', tonerStatus: 'UNKNOWN', jamStatus: state === 'JAMMED' };
+};
+
+const getPrinterDeviceAvailability = async (machineId, printerDeviceId, dbClient = prisma, now = new Date()) => {
+  if (!machineId || !printerDeviceId) return null;
+  const [machine, device] = await Promise.all([
+    dbClient.machine.findUnique({ where: { id: machineId }, select: { id: true, status: true, lastOnline: true } }),
+    dbClient.printerDevice.findFirst({ where: { id: printerDeviceId, machineId }, select: { id: true, displayName: true, printerModel: true, status: true, healthStatus: true, lastTelemetryAt: true } })
+  ]);
+  if (!machine || !device) return null;
+  return { machineId: machine.id, printerDeviceId: device.id, name: device.displayName, printerModel: device.printerModel || 'Unknown', lastTelemetryAt: device.lastTelemetryAt ? device.lastTelemetryAt.toISOString() : null, ...computePrinterDeviceAvailability(machine, device, now) };
+};
+
 const getMachineAvailability = async (machineId, dbClient = prisma, now = new Date()) => {
   if (!machineId) return null;
 
@@ -255,5 +280,7 @@ module.exports = {
   PRINTER_STATES,
   CUSTOMER_STATUS_MESSAGES,
   computePrinterAvailability,
+  computePrinterDeviceAvailability,
+  getPrinterDeviceAvailability,
   getMachineAvailability,
 };

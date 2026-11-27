@@ -1,5 +1,7 @@
 const { recordPrinterDiscoveryInventory } = require('./printerDiscovery.service');
 
+const { getPrinterDeviceAvailability } = require('./printerAvailability.service');
+
 const AGENT_PROTOCOL_VERSION = 1;
 const MAX_REGISTERED_PRINTERS = 10;
 const MAX_DISCOVERED_QUEUES = 50;
@@ -461,6 +463,7 @@ async function handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status
     };
 
     const companyId = socket.companyId || device.machine?.companyId || null;
+    const availability = await getPrinterDeviceAvailability(socket.machineId, device.id, prisma);
     const updatePayload = {
       machineId: socket.machineId,
       printerDeviceId: device.id,
@@ -470,8 +473,18 @@ async function handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status
       errorMessage,
       telemetry,
       healthStatus,
-      lastTelemetryAt: lastTelemetryAt.toISOString()
+      lastTelemetryAt: lastTelemetryAt.toISOString(),
+      status: availability?.status || 'UNKNOWN',
+      isReady: Boolean(availability?.isReady),
+      isOnline: Boolean(availability?.isReady),
+      statusMessage: availability?.statusMessage || 'Printer Status Unavailable',
+      agentOnline: Boolean(availability?.agentOnline),
+      paperStatus: availability?.paperStatus || 'UNKNOWN',
+      tonerStatus: availability?.tonerStatus || 'UNKNOWN',
+      jamStatus: Boolean(availability?.jamStatus)
     };
+
+    io.to(`printer_device_${device.id}`).emit('printer_device_status_update', updatePayload);
 
     if (companyId) {
       io.to(`company_${companyId}`).emit('printer_device_status_update', updatePayload);
