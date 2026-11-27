@@ -98,8 +98,8 @@ jobs:
       - name: Validate Backend Runtime Syntax
         run: node --check src/server.js && node --check src/socket.js && node --check src/modules/jobs/jobs.service.js && node --check src/services/printerDeviceJobBinding.service.js && node --check src/services/printerDeviceAdmin.service.js && node --check src/services/printerDiscovery.service.js && node --check src/modules/admin/printerDiscovery.admin.controller.js && node --check src/services/printerAgentProtocol.service.js && node --check src/services/redisClient.js && node --check src/services/queueService.js && node --check src/services/uploadWorker.js && node --check src/modules/upload/upload.controller.js && node --check src/modules/upload/upload.service.js && node --check src/utils/uploadPaths.js
 
-      - name: Run Legacy QR Binding Security & Session Tests (7 Suites)
-        run: npx jest tests/legacyQrMigration/approveLegacyQrBinding.test.js tests/legacyQrMigration/revokeLegacyQrBinding.test.js tests/legacyQrMigration/resolveLegacyQrDeviceBinding.test.js tests/legacyQrMigration/printerQrAliasSessionFlow.test.js tests/legacyQrMigration/legacyQrReadOnlyGuard.test.js tests/legacyQrMigration/migrationContract.test.js tests/readOnlyGuard_staging_legacy_qr_binding.test.js --runInBand --forceExit
+      - name: Run Legacy QR Binding Security & PostgreSQL Concurrency Tests (8 Suites)
+        run: npx jest tests/legacyQrMigration/approveLegacyQrBinding.test.js tests/legacyQrMigration/revokeLegacyQrBinding.test.js tests/legacyQrMigration/resolveLegacyQrDeviceBinding.test.js tests/legacyQrMigration/printerQrAliasSessionFlow.test.js tests/legacyQrMigration/legacyQrReadOnlyGuard.test.js tests/legacyQrMigration/migrationContract.test.js tests/legacyQrMigration/legacyQrBindingConcurrency.integration.test.js tests/readOnlyGuard_staging_legacy_qr_binding.test.js --runInBand --forceExit
         env:
           NODE_ENV: test
           JWT_SECRET: test_jwt_secret_ci_2026

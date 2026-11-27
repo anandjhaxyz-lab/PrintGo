@@ -17,7 +17,12 @@ describe('legacy QR alias revocation lifecycle', () => {
     await expect(revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: 'abc def ghij', user })).resolves.toMatchObject({ status: 'REVOKED' });
     await expect(revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: 'abc\tdef\nghij', user })).resolves.toMatchObject({ status: 'REVOKED' });
   });
-  test('revocation is idempotent for an already revoked binding', async () => {
+  test('enforces the 500-character maximum after trimming at the service boundary', async () => {
+    const accepted = await revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: 'A'.repeat(500), user });
+    expect(accepted.status).toBe('REVOKED');
+    await expect(revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: 'A'.repeat(501), user })).rejects.toThrow(/10 to 500 characters/);
+    await expect(revokeLegacyQrBinding({ prisma: prismaFor(makeTx({ id: 'b1', status: 'ACTIVE' })), qrId: 'q1', reason: `  ${'A'.repeat(501)}  `, user })).rejects.toThrow(/10 to 500 characters/);
+  });  test('revocation is idempotent for an already revoked binding', async () => {
     const tx = makeTx({ id: 'b1', status: 'REVOKED', printerDeviceId: 'd1' });
     await expect(revokeLegacyQrBinding({ prisma: prismaFor(tx), qrId: 'q1', reason: 'Retiring old counter mapping', user })).resolves.toMatchObject({ status: 'REVOKED', alreadyRevoked: true });
     expect(tx.$executeRawUnsafe).not.toHaveBeenCalled();

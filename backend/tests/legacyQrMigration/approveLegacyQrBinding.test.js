@@ -52,7 +52,12 @@ describe('legacy QR binding approval transaction (mock-only)', () => {
     const tabNewlineResult = await approveLegacyQrBinding({ prisma: prismaFor(makeTx({ qr, device })), qrId: 'q1', printerDeviceId: 'd1', reason: 'abc\tdef\nghij', user });
     expect(tabNewlineResult.status).toBe('ACTIVE');
   });
-  test('rejects cross-machine or unapproved target', async () => {
+  test('enforces the 500-character maximum after trimming at the service boundary', async () => {
+    const accepted = await approveLegacyQrBinding({ prisma: prismaFor(makeTx({ qr, device })), qrId: 'q1', printerDeviceId: 'd1', reason: 'A'.repeat(500), user });
+    expect(accepted.status).toBe('ACTIVE');
+    await expect(approveLegacyQrBinding({ prisma: prismaFor(makeTx({ qr, device })), qrId: 'q1', printerDeviceId: 'd1', reason: 'A'.repeat(501), user })).rejects.toThrow(/10 to 500 characters/);
+    await expect(approveLegacyQrBinding({ prisma: prismaFor(makeTx({ qr, device })), qrId: 'q1', printerDeviceId: 'd1', reason: `  ${'A'.repeat(501)}  `, user })).rejects.toThrow(/10 to 500 characters/);
+  });  test('rejects cross-machine or unapproved target', async () => {
     await expect(approveLegacyQrBinding({ prisma: prismaFor(makeTx({ qr, device: { ...device, machineId: 'm2' } })), qrId: 'q1', printerDeviceId: 'd1', reason: 'Bind counter QR to Epson', user })).rejects.toThrow(/same machine/);
     await expect(approveLegacyQrBinding({ prisma: prismaFor(makeTx({ qr, device: { ...device, approvedAt: null } })), qrId: 'q1', printerDeviceId: 'd1', reason: 'Bind counter QR to Epson', user })).rejects.toThrow(/same machine/);
   });
