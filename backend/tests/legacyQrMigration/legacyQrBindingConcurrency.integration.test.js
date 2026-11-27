@@ -19,8 +19,10 @@ function assertDisposableDatabaseUrl() {
   if (!raw) throw new Error('DATABASE_URL is required for this integration test.');
   const parsed = new URL(raw);
   const databaseName = parsed.pathname.replace(/^\//, '').split('?')[0];
-  if (!['localhost', '127.0.0.1'].includes(parsed.hostname) || databaseName !== 'printgo_disposable_target' || parsed.port !== '55432') {
-    throw new Error('Safety stop: legacy QR concurrency tests may run only against local printgo_disposable_target on port 55432.');
+  const isGitHubActions = process.env.GITHUB_ACTIONS === 'true';
+  const expectedPort = isGitHubActions ? '5432' : '55432';
+  if (!['localhost', '127.0.0.1'].includes(parsed.hostname) || databaseName !== 'printgo_disposable_target' || parsed.port !== expectedPort) {
+    throw new Error(`Safety stop: legacy QR concurrency tests require a local printgo_disposable_target database on port ${expectedPort} for this environment.`);
   }
 }
 
