@@ -243,6 +243,32 @@ const isAllowedStagingPrinterApproval = (req) => {
   return true;
 };
 
+const STAGING_LEGACY_QR_BINDING_GIT_BRANCH = STAGING_GIT_BRANCH;
+const LEGACY_QR_BINDING_APPROVAL_PATH = /^\/api\/admin\/printer-qrs\/[a-zA-Z0-9_-]+\/legacy-binding$/;
+const LEGACY_QR_BINDING_REVOCATION_PATH = /^\/api\/admin\/printer-qrs\/[a-zA-Z0-9_-]+\/legacy-binding\/revoke$/;
+
+const isAllowedStagingLegacyQrBindingMutation = (req) => {
+  if (process.env.APP_ENV !== 'staging' || process.env.RENDER !== 'true') return false;
+  if (process.env.RENDER_SERVICE_ID !== STAGING_SERVICE_ID || process.env.RENDER_SERVICE_NAME !== STAGING_SERVICE_NAME) return false;
+  if (process.env.RENDER_GIT_BRANCH !== STAGING_LEGACY_QR_BINDING_GIT_BRANCH) return false;
+  if (process.env.STAGING_LEGACY_QR_BINDINGS_ENABLED !== 'true') return false;
+  if ((req.method || '').toUpperCase() !== 'POST') return false;
+  const path = getCleanPath(req);
+  const approval = LEGACY_QR_BINDING_APPROVAL_PATH.test(path);
+  const revocation = LEGACY_QR_BINDING_REVOCATION_PATH.test(path);
+  if (!approval && !revocation) return false;
+  if (req.user?.role !== 'SUPERADMIN') return false;
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const keys = Object.keys(body).sort();
+  const expected = approval ? ['printerDeviceId', 'reason'] : ['reason'];
+  if (keys.length !== expected.length || keys.some((key, i) => key !== expected[i])) return false;
+  if (typeof body.reason !== 'string' || body.reason.replace(/\s/g, '').length < 10 || body.reason.trim().length > 500) return false;
+  if (approval && (typeof body.printerDeviceId !== 'string' || !body.printerDeviceId.trim())) return false;
+  logger?.warn?.('[READ_ONLY_GUARD] Authorized exact staging legacy printer QR binding mutation.');
+  return true;
+};
+
 const readOnlyGuard = (req, res, next) => {
   if (process.env.ADMIN_READ_ONLY === 'true') {
     const mutationMethods = ['POST', 'PUT', 'DELETE', 'PATCH'];
@@ -271,6 +297,10 @@ const readOnlyGuard = (req, res, next) => {
         return next();
       }
 
+      if (isAllowedStagingLegacyQrBindingMutation(req)) {
+        return next();
+      }
+
       const cleanPath = getCleanPath(req);
       logger?.warn?.(`[READ_ONLY_GUARD] Blocked mutation: ${req.method} ${cleanPath} (ADMIN_READ_ONLY=true)`);
 
@@ -291,6 +321,8 @@ module.exports = {
   isAllowedStagingPrinterApproval,
   isAllowedStagingCanonDisable,
   isAllowedStagingDeviceQrCreation,
+  isAllowedStagingLegacyQrBindingMutation,
+  STAGING_LEGACY_QR_BINDING_GIT_BRANCH,
   STAGING_DEVICE_QR_CREATION_GIT_BRANCH,
   STAGING_PRINTER_QR_DEVICES,
   STAGING_CANON_DISABLE_DEVICE_ID,

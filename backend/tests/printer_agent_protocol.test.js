@@ -308,8 +308,11 @@ describe('Printer Agent protocol — per-device telemetry isolation', () => {
       agentProtocol: { supportsMultiPrinter: true }
     };
     const prisma = {
+      machine: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'machine-a', status: 'ACTIVE', lastOnline: new Date() })
+      },
       printerDevice: {
-        findFirst: jest.fn().mockResolvedValue({ id: 'device-a', windowsPrinterName: 'Epson L6460' }),
+        findFirst: jest.fn().mockResolvedValue({ id: 'device-a', displayName: 'Epson L6460', printerModel: 'Epson L6460', windowsPrinterName: 'Epson L6460', status: 'ACTIVE', healthStatus: 'ONLINE', lastTelemetryAt: new Date() }),
         update: jest.fn().mockResolvedValue({})
       }
     };

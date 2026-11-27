@@ -158,10 +158,22 @@ describe('Socket.IO Tenant Isolation & Global Admin Room Boundary', () => {
       to: jest.fn().mockReturnValue({ emit: jest.fn() })
     };
     const prisma = {
+      machine: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'm-gamma',
+          status: 'ACTIVE',
+          lastOnline: new Date()
+        })
+      },
       printerDevice: {
         findFirst: jest.fn().mockResolvedValue({
           id: 'dev-gamma-1',
           windowsPrinterName: 'HP LaserJet Gamma',
+          displayName: 'HP LaserJet Gamma',
+          printerModel: 'HP LaserJet Gamma',
+          status: 'ACTIVE',
+          healthStatus: 'ONLINE',
+          lastTelemetryAt: new Date(),
           machine: { companyId: 'company-gamma' }
         }),
         update: jest.fn().mockResolvedValue({ id: 'dev-gamma-1' })

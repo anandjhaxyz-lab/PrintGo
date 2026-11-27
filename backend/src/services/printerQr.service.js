@@ -673,6 +673,46 @@ const resolvePrinterQr = async (publicCode) => {
       }
     }
 
+    let legacyAliasDevice = null;
+    if (legacyPlaceholderDevice || !lockedQr.printerDeviceId) {
+      const aliasRows = await tx.$queryRawUnsafe(
+        'SELECT * FROM "LegacyPrinterQrBinding" WHERE "printerQrId" = $1 AND status = $2 FOR UPDATE',
+        lockedQr.id,
+        'ACTIVE'
+      );
+      if (aliasRows.length > 1) {
+        throw new AppError('Legacy QR has ambiguous physical-printer aliases.', 409);
+      }
+      const allBindingRows = await tx.$queryRawUnsafe(
+        'SELECT status FROM "LegacyPrinterQrBinding" WHERE "printerQrId" = $1 FOR UPDATE',
+        lockedQr.id
+      );
+      if (allBindingRows.length && allBindingRows[0].status !== 'ACTIVE') {
+        throw new AppError('Legacy QR alias is not active. Replace the QR before reuse.', 410);
+      }
+      if (aliasRows.length === 1) {
+        if (!isMultiPrinterDispatchEnabled()) {
+          throw new AppError('Legacy physical-printer QR aliases are locked until per-printer Agent dispatch is enabled.', 503);
+        }
+        const binding = aliasRows[0];
+        const deviceRows = await tx.$queryRawUnsafe(
+          'SELECT * FROM "PrinterDevice" WHERE id = $1 FOR UPDATE',
+          binding.printerDeviceId
+        );
+        const device = deviceRows[0];
+        const { validateLegacyQrAlias } = require('./legacyPrinterQrBinding.service');
+        legacyAliasDevice = validateLegacyQrAlias({ qr: lockedQr, binding, device });
+        lockedQr.printer_device_id = device.id;
+        lockedQr.printer_device_machine_id = device.machineId;
+        lockedQr.printer_device_display_name = device.displayName;
+        lockedQr.printer_device_model = device.printerModel;
+        lockedQr.printer_device_windows_printer_name = device.windowsPrinterName;
+        lockedQr.printer_device_status = device.status;
+        lockedQr.printer_device_approved_at = device.approvedAt;
+        lockedQr.printer_device_is_default = device.isDefault;
+      }
+    }
+
     // Create a brand new ephemeral customer session inside transaction
     const sessionCode = crypto.randomBytes(6).toString('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 60 mins
@@ -684,7 +724,7 @@ const resolvePrinterQr = async (publicCode) => {
         machineId: lockedQr.machine_id,
         printerQrId: lockedQr.id,
         // Historic Phase 1 placeholder rows preserve Machine-level QR behavior.
-        printerDeviceId: legacyPlaceholderDevice ? null : (lockedQr.printerDeviceId || null),
+        printerDeviceId: legacyAliasDevice ? legacyAliasDevice.id : (legacyPlaceholderDevice ? null : (lockedQr.printerDeviceId || null)),
         status: 'WAITING_FOR_MOBILE',
         paymentMode: sessionPaymentMode,
         expiresAt
@@ -799,6 +839,19 @@ const getPublicPrinterQrInfo = async (publicCode) => {
     throw new AppError('This QR code is not bound to a registered printer.', 400);
   }
   const legacyPlaceholderDevice = qr.printerDeviceId && isLegacyPlaceholderDevice(qr.printerDevice);
+  let effectiveDevice = qr.printerDevice && !legacyPlaceholderDevice ? qr.printerDevice : null;
+  let legacyAlias = null;
+  const binding = await prisma.legacyPrinterQrBinding.findUnique({
+    where: { printerQrId: qr.id },
+    include: { printerDevice: { select: { id: true, machineId: true, displayName: true, printerModel: true, windowsPrinterName: true, status: true, approvedAt: true, isDefault: true, healthStatus: true, lastTelemetryAt: true } } }
+  });
+  if (binding) {
+    if (binding.status !== 'ACTIVE') throw new AppError('Legacy QR alias is not active. Replace the QR before reuse.', 410);
+    if (!isMultiPrinterDispatchEnabled()) throw new AppError('Legacy physical-printer QR aliases are locked until per-printer Agent dispatch is enabled.', 503);
+    const { validateLegacyQrAlias } = require('./legacyPrinterQrBinding.service');
+    legacyAlias = validateLegacyQrAlias({ qr: { id: qr.id, machineId: qr.machineId, status: qr.status, printerDeviceId: qr.printerDeviceId, printerDevice: qr.printerDevice }, binding, device: binding.printerDevice });
+    effectiveDevice = legacyAlias;
+  }
   if (qr.printerDeviceId && (!qr.printerDevice || qr.printerDevice.machineId !== qr.machineId)) {
     throw new AppError('This QR code references an invalid physical printer mapping.', 403);
   }
@@ -820,21 +873,20 @@ const getPublicPrinterQrInfo = async (publicCode) => {
   const pricingProfile = serializePublicPricingProfile(rawProfile);
   const { env: cashfreeEnv } = resolveCashfreeEnv();
 
-  const availability = qr.printerDeviceId && !legacyPlaceholderDevice
-    ? await getPrinterDeviceAvailability(qr.machine.id, qr.printerDeviceId, prisma)
+  const availability = effectiveDevice
+    ? await getPrinterDeviceAvailability(qr.machine.id, effectiveDevice.id, prisma)
     : await getMachineAvailability(qr.machine.id, prisma);
   let isReady = availability ? availability.isReady : false;
   let hardwareStatus = availability ? availability.status : 'UNKNOWN';
   let statusMessage = availability ? availability.statusMessage : 'Printer Status Unavailable';
   let lastTelemetryAt = null;
 
-  if (qr.printerDevice && !legacyPlaceholderDevice) {
-    lastTelemetryAt = qr.printerDevice.lastTelemetryAt ? qr.printerDevice.lastTelemetryAt.toISOString() : null;
+  if (effectiveDevice) {
+    lastTelemetryAt = effectiveDevice.lastTelemetryAt ? effectiveDevice.lastTelemetryAt.toISOString() : null;
     hardwareStatus = availability?.status || 'UNKNOWN';
     isReady = Boolean(availability?.isReady);
     statusMessage = availability?.statusMessage || 'Printer Status Unavailable';
   }
-
   return {
     success: true,
     status: qr.status,
@@ -843,15 +895,15 @@ const getPublicPrinterQrInfo = async (publicCode) => {
     cashfreeEnv: cashfreeEnv || 'sandbox',
     pricingProfile,
     printer: {
-      name: !legacyPlaceholderDevice && qr.printerDevice?.displayName ? qr.printerDevice.displayName : qr.machine.name,
-      model: qr.printerDevice?.printerModel || qr.machine.printerModel || 'Unknown',
+      name: effectiveDevice?.displayName || qr.machine.name,
+      model: effectiveDevice?.printerModel || qr.machine.printerModel || 'Unknown',
       location: qr.machine.location,
       isOnline: isReady,
       hardwareStatus,
       statusMessage,
       lastTelemetryAt,
-      deviceHealth: qr.printerDevice && !legacyPlaceholderDevice ? qr.printerDevice.healthStatus : null,
-      printerDeviceId: qr.printerDevice && !legacyPlaceholderDevice ? qr.printerDevice.id : null,
+      deviceHealth: effectiveDevice ? effectiveDevice.healthStatus : null,
+      printerDeviceId: effectiveDevice ? effectiveDevice.id : null,
       agentOnline: availability ? availability.agentOnline : false,
       paperStatus: availability ? availability.paperStatus : 'UNKNOWN',
       tonerStatus: availability ? availability.tonerStatus : 'UNKNOWN',

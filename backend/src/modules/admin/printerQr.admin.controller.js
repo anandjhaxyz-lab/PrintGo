@@ -38,6 +38,27 @@ const generatePrinterDeviceQr = async (req, res, next) => {
   }
 };
 
+const approveLegacyQrBinding = async (req, res, next) => {
+  try {
+    const service = require('../../services/legacyPrinterQrBinding.service');
+    const result = await service.approveLegacyQrBinding({
+      prisma: require('../../utils/prisma'),
+      qrId: req.params.id,
+      printerDeviceId: req.body?.printerDeviceId,
+      reason: req.body?.reason,
+      user: req.user
+    });
+    res.status(201).json({ success: true, data: { binding: result } });
+  } catch (error) { next(error); }
+};
+const revokeLegacyQrBinding = async (req, res, next) => {
+  try {
+    const service = require('../../services/legacyPrinterQrBinding.service');
+    const result = await service.revokeLegacyQrBinding({ prisma: require('../../utils/prisma'), qrId: req.params.id, reason: req.body?.reason, user: req.user });
+    res.status(200).json({ success: true, data: { binding: result } });
+  } catch (error) { next(error); }
+};
+
 const revokePrinterQr = async (req, res, next) => {
   try {
     const { reason } = req.body;
@@ -82,6 +103,8 @@ module.exports = {
   getPrinterQrById,
   generatePrinterQr,
   generatePrinterDeviceQr,
+  approveLegacyQrBinding,
+  revokeLegacyQrBinding,
   revokePrinterQr,
   replacePrinterQr,
   getMachineQrLedger
