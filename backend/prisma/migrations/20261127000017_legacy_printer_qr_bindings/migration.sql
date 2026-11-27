@@ -13,8 +13,8 @@ CREATE TABLE "LegacyPrinterQrBinding" (
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "LegacyPrinterQrBinding_pkey" PRIMARY KEY ("id"),
-  CONSTRAINT "LegacyPrinterQrBinding_printerQrId_fkey" FOREIGN KEY ("printerQrId") REFERENCES "PrinterQr"("id") ON DELETE CASCADE ON UPDATE CASCADE,
-  CONSTRAINT "LegacyPrinterQrBinding_machineId_fkey" FOREIGN KEY ("machineId") REFERENCES "Machine"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT "LegacyPrinterQrBinding_printerQrId_fkey" FOREIGN KEY ("printerQrId") REFERENCES "PrinterQr"("id") ON DELETE RESTRICT ON UPDATE CASCADE,
+  CONSTRAINT "LegacyPrinterQrBinding_machineId_fkey" FOREIGN KEY ("machineId") REFERENCES "Machine"("id") ON DELETE RESTRICT ON UPDATE CASCADE,
   CONSTRAINT "LegacyPrinterQrBinding_printerDeviceId_fkey" FOREIGN KEY ("printerDeviceId") REFERENCES "PrinterDevice"("id") ON DELETE RESTRICT ON UPDATE CASCADE
 );
 CREATE UNIQUE INDEX "LegacyPrinterQrBinding_printerQrId_key" ON "LegacyPrinterQrBinding"("printerQrId");
