@@ -23,6 +23,17 @@ describe('legacy QR migration SQL contract (static isolated)', () => {
     expect(schema).toContain('printerQr       PrinterQr     @relation(fields: [printerQrId], references: [id], onDelete: Restrict)');
     expect(schema).toContain('machine         Machine       @relation(fields: [machineId], references: [id], onDelete: Restrict)');
   });
+  test('disposable PostgreSQL regression script checks all three ON DELETE RESTRICT constraints and database identity', () => {
+    const sql = fs.readFileSync(path.join(__dirname, '../sql/legacy_printer_qr_binding_constraints.test.sql'), 'utf8');
+    expect(sql).toContain("current_database()");
+    expect(sql).toContain("printgo_disposable_target");
+    for (const name of ['LegacyPrinterQrBinding_printerQrId_fkey','LegacyPrinterQrBinding_machineId_fkey','LegacyPrinterQrBinding_printerDeviceId_fkey']) {
+      expect(sql).toContain(name);
+    }
+    expect(sql).toContain("v_delete_action <> 'r'");
+    expect(sql).toContain('ROLLBACK;');
+  });
+
   test('does not touch QR token, sessions, or existing printer mappings', () => {
     expect(migration).not.toMatch(/UPDATE\s+"?PrinterQr"?/i);
     expect(migration).not.toMatch(/UPDATE\s+"?Session"?/i);
