@@ -26,6 +26,9 @@ jest.mock('../src/utils/prisma', () => ({
   printerQr: {
     findUnique: jest.fn()
   },
+  legacyPrinterQrBinding: {
+    findUnique: jest.fn()
+  },
   session: {
     findUnique: jest.fn(),
     create: jest.fn()
@@ -70,6 +73,7 @@ describe('PrintGo Unified Payment Mode Consistency Suite', () => {
     prisma.machine.findUnique.mockReset();
     prisma.machine.findMany.mockReset();
     prisma.printerQr.findUnique.mockReset();
+    prisma.legacyPrinterQrBinding.findUnique.mockReset().mockResolvedValue(null);
     prisma.session.findUnique.mockReset();
     prisma.document.create.mockReset().mockResolvedValue({ id: 'doc-1', pages: 1 });
     prisma.printJob.create.mockReset();
