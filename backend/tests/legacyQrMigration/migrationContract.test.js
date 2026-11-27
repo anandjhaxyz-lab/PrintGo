@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const migration = fs.readFileSync(path.join(__dirname, '../../prisma/migrations/20261127000017_legacy_printer_qr_bindings/migration.sql'), 'utf8');
+const repairMigration = fs.readFileSync(path.join(__dirname, '../../prisma/migrations/20261128000018_legacy_printer_qr_binding_restrict_delete_actions/migration.sql'), 'utf8');
 const schema = fs.readFileSync(path.join(__dirname, '../../prisma/schema.prisma'), 'utf8');
 describe('legacy QR migration SQL contract (static isolated)', () => {
   test('creates binding table with required identity and audit fields', () => {
@@ -32,6 +33,18 @@ describe('legacy QR migration SQL contract (static isolated)', () => {
     }
     expect(sql).toContain("v_delete_action <> 'r'");
     expect(sql).toContain('ROLLBACK;');
+  });
+
+  test('follow-up repair migration rebuilds all three foreign keys with ON DELETE RESTRICT', () => {
+    for (const name of ['LegacyPrinterQrBinding_printerQrId_fkey','LegacyPrinterQrBinding_machineId_fkey','LegacyPrinterQrBinding_printerDeviceId_fkey']) {
+      expect(repairMigration).toContain('DROP CONSTRAINT IF EXISTS "' + name + '"');
+      expect(repairMigration).toContain('ADD CONSTRAINT "' + name + '"');
+    }
+    expect((repairMigration.match(/ON DELETE RESTRICT/g) || []).length).toBe(3);
+    expect(repairMigration).toContain('BEGIN;');
+    expect(repairMigration).toContain('COMMIT;');
+    expect(repairMigration).not.toMatch(/UPDATE\s+"?LegacyPrinterQrBinding"?/i);
+    expect(repairMigration).not.toMatch(/DELETE\s+FROM/i);
   });
 
   test('does not touch QR token, sessions, or existing printer mappings', () => {
