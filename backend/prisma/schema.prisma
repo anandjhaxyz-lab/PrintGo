@@ -231,9 +231,9 @@ model PrinterQr {
 model LegacyPrinterQrBinding {
   id              String        @id @default(uuid())
   printerQrId     String        @unique
-  printerQr       PrinterQr     @relation(fields: [printerQrId], references: [id], onDelete: Cascade)
+  printerQr       PrinterQr     @relation(fields: [printerQrId], references: [id], onDelete: Restrict)
   machineId       String
-  machine         Machine       @relation(fields: [machineId], references: [id], onDelete: Cascade)
+  machine         Machine       @relation(fields: [machineId], references: [id], onDelete: Restrict)
   printerDeviceId String
   printerDevice   PrinterDevice @relation(fields: [printerDeviceId], references: [id], onDelete: Restrict)
   status          String        @default("PENDING")

@@ -71,3 +71,46 @@ Integrated the approved legacy machine-level QR alias feature into this candidat
 - Added regression test proving a legacy alias cannot override an already-approved device-bound QR.
 - Final targeted verification: 12 suites, 95 tests passed, 0 failed; Prisma schema valid; changed JS syntax checks passed; git diff --check passed.
 - Test execution touched only the isolated worktree and test logs; generated log changes were restored. No staging/production DB, QR records, Agent, physical printer, payment config, or deployment were touched. No commit or push.
+
+## Consolidated verification ledger — PR #24 audit-retention review
+
+Date: 2026-11-27
+Workspace: `D:\PrintGo-PR24-Audit-Fixes`
+Branch: `fix/pr24-audit-retention-tests`
+Base commit: `adcb6168ae71f06858e99e763d06058a40e26931`
+
+### Audit retention correction
+
+- Changed the `LegacyPrinterQrBinding` foreign-key delete behavior for both `PrinterQr` and `Machine` from `ON DELETE CASCADE` to `ON DELETE RESTRICT`.
+- Updated the matching Prisma relations to `onDelete: Restrict`.
+- This prevents deletion of a parent QR or Machine while an audit binding/tombstone references it. The target `PrinterDevice` relation was already `RESTRICT` and remains unchanged.
+- Updated `migrationContract.test.js` to assert both SQL foreign-key actions and Prisma relation actions.
+- Because migration `20261127000017_legacy_printer_qr_bindings` has not been applied to staging or production, the migration file itself was amended in this isolated PR branch; no follow-up database migration was run.
+
+### Consolidated test evidence (separate runs; counts are not additive)
+
+- Earlier integration regression run: 15 suites / 160 tests passed, as recorded above.
+- Epson placeholder follow-up: 12 suites / 94 tests passed, as recorded above.
+- Independent safety follow-up: 12 suites / 95 tests passed, as recorded above.
+- Disposable PostgreSQL follow-up: Phase 3 admin QR integration 10 passed; Phase 4 customer mobile QR flow 22 passed in the later follow-up. These were separate suites/runs, not part of one combined suite total.
+- Current PR #24 audit-retention review run after the FK correction: **7 suites passed, 36 tests passed, 0 failed**. Suites: approveLegacyQrBinding, legacyQrReadOnlyGuard, migrationContract, printerDeviceAvailability, printerQrAliasSessionFlow, resolveLegacyQrDeviceBinding, revokeLegacyQrBinding.
+- Prisma CLI 5.22.0 schema validation: PASS (schema validation only; a dummy local DATABASE_URL was supplied and no database connection was made).
+- `node --check` on changed runtime JavaScript files: PASS.
+- `git diff --check`: PASS.
+
+### Explicit limitations
+
+- The current 7-suite run used mocked/in-memory test paths. It did not execute the amended SQL against PostgreSQL, so actual database enforcement of `ON DELETE RESTRICT` remains to be verified on a disposable database before staging migration.
+- The earlier Phase 3/Phase 4 PostgreSQL test results were recorded before this FK-only correction; they do not verify the amended delete actions.
+- GitHub CI has not yet reported a run for the PR head. Local tests do not imply GitHub CI passed.
+- No staging/production database access or migration, push, PR update, merge, deployment, Agent restart, QR binding, payment change, or physical printing was performed.
+
+### Audit-retention FK enforcement — disposable PostgreSQL verification
+
+- Created a fresh, separate PostgreSQL 16 cluster under the isolated worktree on `127.0.0.1:5433`; it did not reuse the installed Windows PostgreSQL service or any staging/production database.
+- Created only minimal parent tables (`Machine`, `PrinterQr`, `PrinterDevice`) required by the migration, then applied the exact amended `20261127000017_legacy_printer_qr_bindings/migration.sql` to the disposable database.
+- Inserted one Machine, one QR, one target PrinterDevice, and one `REVOKED` binding row.
+- Runtime assertions passed: deleting the referenced QR was rejected by a foreign-key violation; deleting the referenced Machine was rejected; deleting the referenced PrinterDevice was rejected; the revoked binding/tombstone remained present.
+- Catalog inspection confirmed `confdeltype = 'r'` (RESTRICT) for all three binding foreign keys.
+- Disposable PostgreSQL cluster was stopped; port 5433 was confirmed clear; temporary cluster/data/log files were removed. The pre-existing `postgresql-x64-16` Windows service remained Running and was not modified.
+- This verifies the migration SQL's FK behavior against PostgreSQL. It is not a full application migration rehearsal against the complete PrintGo schema.
