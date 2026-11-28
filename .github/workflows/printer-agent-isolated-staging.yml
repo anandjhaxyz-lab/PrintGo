@@ -1,0 +1,71 @@
+name: Printer Agent Isolated Staging Validation
+
+on:
+  push:
+    branches:
+      - fix/isolated-printer-status-telemetry
+    paths:
+      - "printer-agent/**"
+      - ".github/workflows/printer-agent-isolated-staging.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: printer-agent-isolated-staging-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-agent-validation:
+    name: Windows x64 Agent Build and Test
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: printer-agent
+
+    steps:
+      - name: Checkout isolated fix branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: printer-agent/package-lock.json
+
+      - name: Install locked agent dependencies
+        run: npm ci
+
+      - name: Validate agent runtime syntax
+        shell: pwsh
+        run: |
+          $files = @(
+            "index.js",
+            "src/printerFleetManager.js",
+            "src/printerStatusMapping.js",
+            "src/spooler.js",
+            "src/networkConnectivity.js",
+            "src/subprocessDiagnostics.js"
+          )
+          foreach ($file in $files) {
+            node --check $file
+            if ($LASTEXITCODE -ne 0) { throw "Syntax check failed: $file" }
+          }
+
+      - name: Run isolated printer-agent regression suite
+        run: npm test -- --runInBand --json --outputFile=agent-test-results.json
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: printer-agent-windows-test-report
+          path: printer-agent/agent-test-results.json
+          if-no-files-found: ignore
+          retention-days: 14
