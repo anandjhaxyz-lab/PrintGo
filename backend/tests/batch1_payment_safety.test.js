@@ -106,6 +106,8 @@ async function runBatch1Suite() {
       name: `Batch1 Machine A ${suffix}`,
       location: 'Pilot Desk A',
       machineKey: `mk_b1_a_${suffix}`,
+      status: 'ACTIVE',
+      lastOnline: new Date(),
       companyId: companyA.id
     }
   });
@@ -114,8 +116,14 @@ async function runBatch1Suite() {
       name: `Batch1 Machine B ${suffix}`,
       location: 'Pilot Desk B',
       machineKey: `mk_b1_b_${suffix}`,
+      status: 'ACTIVE',
+      lastOnline: new Date(),
       companyId: companyB.id
     }
+  });
+  // Online telemetry is required by the payment-order availability gate.
+  await prisma.printerStatus.create({
+    data: { machineId: machineA.id, isOnline: true, paperStatus: 'OK', tonerStatus: 'OK', jamStatus: false, timestamp: new Date() }
   });
   const doc = await prisma.document.create({
     data: {
@@ -155,8 +163,28 @@ async function runBatch1Suite() {
     { expiresIn: '1h' }
   );
 
+  // Track only sessions created by this run; never update or delete pre-existing sessions.
+  const createdSessionIds = new Map();
+  const ensureSession = async (code, machine) => {
+    if (createdSessionIds.has(code)) {
+      return prisma.session.findUnique({ where: { id: createdSessionIds.get(code) } });
+    }
+
+    const existingSession = await prisma.session.findUnique({ where: { code } });
+    if (existingSession) {
+      throw new Error(`Fixture session code collision; refusing to modify existing session: ${code}`);
+    }
+
+    const session = await prisma.session.create({
+      data: { code, machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) }
+    });
+    createdSessionIds.set(code, session.id);
+    return session;
+  };
+
   let jobSeq = 1;
   const createJob = async ({ machine = machineA, sessionId = `sess_${suffix}_1`, cost = 12 } = {}) => {
+    await ensureSession(sessionId, machine);
     const shortId = `b1j${suffix.toString().slice(-5)}${jobSeq++}`;
     return prisma.printJob.create({
       data: {
@@ -227,7 +255,27 @@ async function runBatch1Suite() {
       const otherSess = `sess_attacker_${suffix}`;
       const job = await createJob({ sessionId: ownerSess });
 
+      await ensureSession(otherSess, machineA);
+      const wrongMachSess = `sess_wrong_machine_${suffix}`;
+      await ensureSession(wrongMachSess, machineB);
+
+      const stagingEnvSnapshot = {
+        APP_ENV: process.env.APP_ENV,
+        ENABLE_DEMO_PAYMENT: process.env.ENABLE_DEMO_PAYMENT,
+        RENDER: process.env.RENDER,
+        RENDER_SERVICE_ID: process.env.RENDER_SERVICE_ID,
+        RENDER_SERVICE_NAME: process.env.RENDER_SERVICE_NAME,
+        RENDER_GIT_BRANCH: process.env.RENDER_GIT_BRANCH,
+        DEMO_PAYMENT_REQUIRE_ACCESS_CODE: process.env.DEMO_PAYMENT_REQUIRE_ACCESS_CODE
+      };
+      process.env.APP_ENV = 'staging';
       process.env.ENABLE_DEMO_PAYMENT = 'true';
+      process.env.RENDER = 'true';
+      process.env.RENDER_SERVICE_ID = 'srv-dbqpapon74is73csbc80';
+      process.env.RENDER_SERVICE_NAME = 'printgo-backend-staging';
+      process.env.RENDER_GIT_BRANCH = 'feature/printgo-production-readiness';
+      process.env.DEMO_PAYMENT_REQUIRE_ACCESS_CODE = 'false';
+
       try {
         const unauthRes = await request(app).post(`/api/payments/demo-pay/${job.shortId}`).send();
         if (unauthRes.status !== 401) throw new Error(`Expected 401 unauthenticated, got ${unauthRes.status}`);
@@ -239,7 +287,7 @@ async function runBatch1Suite() {
           .send();
         if (crossSessRes.status !== 403) throw new Error(`Expected 403 cross-session, got ${crossSessRes.status}`);
 
-        const wrongMachToken = makeSessionToken(ownerSess, machineB.id);
+        const wrongMachToken = makeSessionToken(wrongMachSess, machineB.id);
         const crossMachRes = await request(app)
           .post(`/api/payments/demo-pay/${job.shortId}`)
           .set('Authorization', `Bearer ${wrongMachToken}`)
@@ -256,7 +304,10 @@ async function runBatch1Suite() {
           throw new Error(`Expected owner demo-pay 200/WAITING, got ${okRes.status} (${JSON.stringify(okRes.body)})`);
         }
       } finally {
-        delete process.env.ENABLE_DEMO_PAYMENT;
+        for (const [key, value] of Object.entries(stagingEnvSnapshot)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
       }
     });
 
@@ -265,6 +316,10 @@ async function runBatch1Suite() {
       const ownerSess = `sess_ver_owner_${suffix}`;
       const otherSess = `sess_ver_other_${suffix}`;
       const job = await createJob({ sessionId: ownerSess });
+
+      await ensureSession(otherSess, machineA);
+      const wrongMachSess = `sess_ver_wrong_machine_${suffix}`;
+      await ensureSession(wrongMachSess, machineB);
 
       const noAuth = await request(app).get(`/api/payments/verify/${job.shortId}`);
       if (noAuth.status !== 401) throw new Error(`Expected 401 without token, got ${noAuth.status}`);
@@ -276,7 +331,7 @@ async function runBatch1Suite() {
 
       const crossMach = await request(app)
         .get(`/api/payments/verify/${job.shortId}`)
-        .set('Authorization', `Bearer ${makeSessionToken(ownerSess, machineB.id)}`);
+        .set('Authorization', `Bearer ${makeSessionToken(wrongMachSess, machineB.id)}`);
       if (crossMach.status !== 403) throw new Error(`Expected 403 cross-machine, got ${crossMach.status}`);
 
       const validOwner = await request(app)
@@ -585,7 +640,8 @@ async function runBatch1Suite() {
       });
       await prisma.printJob.update({
         where: { id: job.id },
-        data: { status: 'COMPLETED', paymentId: payment.id }
+        // Refund endpoint covers pre-fulfillment failures; completed physical jobs are intentionally non-refundable.
+        data: { status: 'WAITING', paymentId: payment.id }
       });
       const invoice = await generateInvoiceForJob(job.shortId);
 
@@ -730,6 +786,9 @@ async function runBatch1Suite() {
     await prisma.reconciliationRecord.deleteMany({ where: { printJobId: { in: jobIds } } }).catch(() => {});
     await prisma.refund.deleteMany({ where: { printJobId: { in: jobIds } } }).catch(() => {});
     await prisma.printJob.deleteMany({ where: { id: { in: jobIds } } }).catch(() => {});
+    if (createdSessionIds.size > 0) {
+      await prisma.session.deleteMany({ where: { id: { in: [...createdSessionIds.values()] } } }).catch(() => {});
+    }
     await prisma.paymentEvent.deleteMany({ where: { eventId: { contains: String(suffix) } } }).catch(() => {});
     await prisma.transaction.deleteMany({ where: { payment: { gatewayOrderId: { contains: String(suffix) } } } }).catch(() => {});
     await prisma.payment.deleteMany({

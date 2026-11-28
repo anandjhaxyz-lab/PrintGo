@@ -321,10 +321,18 @@ describe('Phase 3.8 — Advertisement Module Repair & Safety Suite', () => {
       delete process.env.ALLOW_EPHEMERAL_STORAGE_FOR_TESTS;
       process.env.NODE_ENV = 'production';
 
-      // Ensure mock /var/data does not exist on Windows host
-      expect(() => {
-        getAdsUploadsDir();
-      }).toThrow('PERSISTENT_STORAGE_ERROR');
+      // Simulate an absent Render persistent mount consistently across Windows and Unix hosts.
+      const originalExistsSync = fs.existsSync;
+      fs.existsSync = (targetPath, ...args) => (
+        targetPath === '/var/data' ? false : originalExistsSync(targetPath, ...args)
+      );
+      try {
+        expect(() => {
+          getAdsUploadsDir();
+        }).toThrow('PERSISTENT_STORAGE_ERROR');
+      } finally {
+        fs.existsSync = originalExistsSync;
+      }
     });
   });
 

@@ -295,7 +295,7 @@ async function runTestSuite() {
   // 11. CSV Export Generation
   await test('11. CSV export streams valid CSV headers and rows for sales, jobs, and payments', async () => {
     const salesCsv = await adminAnalytics.exportReportCsv(superadminUser, 'sales', { period: '30d' });
-    if (!salesCsv.startsWith('Date,Gross Collections')) {
+    if (!salesCsv.startsWith('Date,Actual Collections (INR),Service Value (INR)')) {
       throw new Error(`Invalid sales CSV header: ${salesCsv.slice(0, 50)}`);
     }
 

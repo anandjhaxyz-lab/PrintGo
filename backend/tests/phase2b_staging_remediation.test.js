@@ -4,7 +4,7 @@
  * Strictly offline / isolated (no live DB mutations, no Cashfree calls, no printing):
  * 1. Verifies render.staging.yaml blueprint fixes (preDeployCommand, healthCheckPath, 0.5c-512mb, 0.1c-256mb, isolation)
  * 2. Verifies Winston logger enables redacted Console transport in NODE_ENV=production while preserving File transports
- * 3. Verifies advertisements storage aligns with UPLOADS_DIR and preserves readOnlyGuard
+ * 3. Verifies advertisements storage aligns with ADS_UPLOAD_DIR and preserves readOnlyGuard
  * 4. Verifies machines.controller.js getPublicKey uses shared Prisma client
  * 5. Verifies provisionStagingPilot.js hard-guards against printgo_db, dry-run, confirmation flag, and idempotency
  * 6. Verifies dual-origin CORS policy for Customer Portal + Render Admin Dashboard
@@ -86,18 +86,20 @@ async function runTests() {
     assert(res.stdout.includes('LOGGER_OK'), 'Logger subprocess did not confirm LOGGER_OK');
   });
 
-  // 3. Advertisements upload storage alignment with UPLOADS_DIR
-  await runCase('3. Advertisements upload storage uses UPLOADS_DIR/ads and preserves readOnlyGuard', async () => {
+  // 3. Advertisements upload storage alignment with persistent ADS_UPLOAD_DIR
+  await runCase('3. Advertisements upload storage uses persistent ADS_UPLOAD_DIR and preserves readOnlyGuard', async () => {
+    const prevAdsUploads = process.env.ADS_UPLOAD_DIR;
     const prevUploads = process.env.UPLOADS_DIR;
     const prevReadOnly = process.env.ADMIN_READ_ONLY;
     const prevJwt = process.env.JWT_SECRET;
     try {
+      process.env.ADS_UPLOAD_DIR = '/var/data/ads';
       process.env.UPLOADS_DIR = '/var/data/uploads';
       process.env.ADMIN_READ_ONLY = 'true';
       process.env.JWT_SECRET = process.env.JWT_SECRET || 'phase2b_test_secret';
 
       const { getAdsUploadsDir } = require('../src/utils/storage');
-      const expected = path.join('/var/data/uploads', 'ads');
+      const expected = path.resolve('/var/data/ads');
       assert.strictEqual(getAdsUploadsDir(), expected, `Expected ${expected}, got ${getAdsUploadsDir()}`);
 
       const routesSrc = fs.readFileSync(path.join(backendRoot, 'src/modules/advertisements/advertisements.routes.js'), 'utf8');
@@ -113,6 +115,8 @@ async function runTests() {
       const res = await request(app).post('/api/advertisements/admin');
       assert.strictEqual(res.status, 401, 'Unauthenticated admin ad upload rejected with 401');
     } finally {
+      if (prevAdsUploads === undefined) delete process.env.ADS_UPLOAD_DIR;
+      else process.env.ADS_UPLOAD_DIR = prevAdsUploads;
       if (prevUploads === undefined) delete process.env.UPLOADS_DIR;
       else process.env.UPLOADS_DIR = prevUploads;
       if (prevReadOnly === undefined) delete process.env.ADMIN_READ_ONLY;

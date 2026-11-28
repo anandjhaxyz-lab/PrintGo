@@ -86,7 +86,7 @@ async function runTestSuite() {
     }
 
     const jobDetails = journal2.getJob('TEST-RST-01');
-    if (jobDetails.state !== 'DISPATCHED_TO_SPOOLER') {
+    if (jobDetails.state !== 'DISPATCH_INTENT') {
       throw new Error(`Unexpected job state in reloaded journal: ${jobDetails.state}`);
     }
 
