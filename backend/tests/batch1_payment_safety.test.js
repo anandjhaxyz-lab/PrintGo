@@ -163,15 +163,23 @@ async function runBatch1Suite() {
     { expiresIn: '1h' }
   );
 
-  // Track exact fixture session codes so cleanup never touches unrelated sessions.
-  const createdSessionCodes = new Set();
+  // Track only sessions created by this run; never update or delete pre-existing sessions.
+  const createdSessionIds = new Map();
   const ensureSession = async (code, machine) => {
-    createdSessionCodes.add(code);
-    return prisma.session.upsert({
-      where: { code },
-      create: { code, machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
-      update: { machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) }
+    if (createdSessionIds.has(code)) {
+      return prisma.session.findUnique({ where: { id: createdSessionIds.get(code) } });
+    }
+
+    const existingSession = await prisma.session.findUnique({ where: { code } });
+    if (existingSession) {
+      throw new Error(`Fixture session code collision; refusing to modify existing session: ${code}`);
+    }
+
+    const session = await prisma.session.create({
+      data: { code, machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) }
     });
+    createdSessionIds.set(code, session.id);
+    return session;
   };
 
   let jobSeq = 1;
@@ -778,8 +786,8 @@ async function runBatch1Suite() {
     await prisma.reconciliationRecord.deleteMany({ where: { printJobId: { in: jobIds } } }).catch(() => {});
     await prisma.refund.deleteMany({ where: { printJobId: { in: jobIds } } }).catch(() => {});
     await prisma.printJob.deleteMany({ where: { id: { in: jobIds } } }).catch(() => {});
-    if (createdSessionCodes.size > 0) {
-      await prisma.session.deleteMany({ where: { code: { in: [...createdSessionCodes] } } }).catch(() => {});
+    if (createdSessionIds.size > 0) {
+      await prisma.session.deleteMany({ where: { id: { in: [...createdSessionIds.values()] } } }).catch(() => {});
     }
     await prisma.paymentEvent.deleteMany({ where: { eventId: { contains: String(suffix) } } }).catch(() => {});
     await prisma.transaction.deleteMany({ where: { payment: { gatewayOrderId: { contains: String(suffix) } } } }).catch(() => {});
