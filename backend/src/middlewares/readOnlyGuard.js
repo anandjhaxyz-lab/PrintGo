@@ -26,6 +26,29 @@ const STAGING_CANON_DISABLE_DEVICE_ID = '114c0092-e3c6-4432-b17f-e7c6f42ec334';
 const STAGING_CANON_DISABLE_GIT_BRANCH = 'fix/staging-canon-disable-minimal';
 const STAGING_CANON_DISABLE_PATH = '/api/admin/printer-devices/' + STAGING_CANON_DISABLE_DEVICE_ID + '/disable';
 
+// Exact single-QR staging exception for retiring legacy Front Desk Counter QR.
+const STAGING_LEGACY_QR_ID = '09363ed8-b14c-491a-aff2-c5d6c6d588f7';
+const STAGING_LEGACY_QR_REVOKE_PATH = `/api/admin/printer-qrs/${STAGING_LEGACY_QR_ID}/revoke`;
+
+const isAllowedStagingLegacyQrRevoke = (req) => {
+  if (!req || typeof req !== 'object') return false;
+  if (process.env.APP_ENV !== 'staging') return false;
+  if ((req.method || '').toUpperCase() !== 'POST') return false;
+  if (getCleanPath(req) !== STAGING_LEGACY_QR_REVOKE_PATH) return false;
+
+  const role = req.user?.role;
+  if (role !== 'SUPERADMIN' && role !== 'FRANCHISEE') return false;
+
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return false;
+  if (typeof req.body.reason !== 'string') return false;
+
+  const trimmedReason = req.body.reason.trim();
+  if (trimmedReason.length < 10 || trimmedReason.length > 500) return false;
+
+  logger?.warn?.(`[READ_ONLY_GUARD] Authorized staging legacy printer QR revoke exception for ${STAGING_LEGACY_QR_ID} by role ${role}.`);
+  return true;
+};
+
 const isAllowedStagingCanonDisable = (req) => {
   if (process.env.APP_ENV !== 'staging') return false;
   if (process.env.RENDER !== 'true') return false;
@@ -271,6 +294,10 @@ const readOnlyGuard = (req, res, next) => {
         return next();
       }
 
+      if (isAllowedStagingLegacyQrRevoke(req)) {
+        return next();
+      }
+
       const cleanPath = getCleanPath(req);
       logger?.warn?.(`[READ_ONLY_GUARD] Blocked mutation: ${req.method} ${cleanPath} (ADMIN_READ_ONLY=true)`);
 
@@ -291,6 +318,9 @@ module.exports = {
   isAllowedStagingPrinterApproval,
   isAllowedStagingCanonDisable,
   isAllowedStagingDeviceQrCreation,
+  isAllowedStagingLegacyQrRevoke,
+  STAGING_LEGACY_QR_ID,
+  STAGING_LEGACY_QR_REVOKE_PATH,
   STAGING_DEVICE_QR_CREATION_GIT_BRANCH,
   STAGING_PRINTER_QR_DEVICES,
   STAGING_CANON_DISABLE_DEVICE_ID,
