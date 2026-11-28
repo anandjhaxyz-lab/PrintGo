@@ -1,6 +1,12 @@
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
+// Keep payment-readiness tests deterministic and fail-closed regardless of developer .env values.
+// These explicit placeholders must be rejected before any Cashfree network call is possible.
+process.env.CASHFREE_ENV = 'sandbox';
+process.env.CASHFREE_APP_ID = 'YOUR_SANDBOX_APP_ID';
+process.env.CASHFREE_SECRET_KEY = 'YOUR_SANDBOX_SECRET_KEY';
+delete process.env.CASHFREE_ENVIRONMENT;
 
 function validateDatabaseUrl(urlStr) {
   if (!urlStr || typeof urlStr !== 'string') {

@@ -64,7 +64,7 @@ services:
       - key: APP_ENV
         value: staging
       - key: ENABLE_DEMO_PAYMENT
-        value: "true"
+        value: "false"
       - key: DEMO_PAYMENT_ACCESS_CODE
         # Secret supervised access code for Staging demo payment simulation (set in Render Dashboard)
         sync: false

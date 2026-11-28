@@ -118,20 +118,21 @@ async function runTests() {
     console.log('\n--- SECTION 2: Mobile Frontend API URLs Audit ---');
     const mobileViewCode = fs.readFileSync(path.resolve(__dirname, '../../frontend/src/pages/MobileView.jsx'), 'utf8');
     
-    const requiredEndpoints = [
+    const requiredEndpointPatterns = [
       '/api/auth/session/join',
-      '/api/machines/${res.data.machineId}/public-key',
+      '/api/machines/${machineIdToFetch}/public-key',
       '/api/upload',
       '/api/jobs',
-      '/api/payments/order/${jobId}',
-      '/api/payments/verify/${idToVerify}'
+      '/api/payments/order/${encodeURIComponent(jobId)}',
+      '/api/payments/verify/${encodeURIComponent(idToVerify)}'
     ];
 
-    for (const ep of requiredEndpoints) {
-      assert(mobileViewCode.includes(ep), `MobileView calls centralized endpoint: ${ep}`);
+    for (const endpointPattern of requiredEndpointPatterns) {
+      assert(mobileViewCode.includes(endpointPattern), `MobileView calls centralized endpoint: ${endpointPattern}`);
     }
     assert(!mobileViewCode.includes('192.168.1.2'), 'MobileView contains zero hardcoded 192.168.1.2 addresses');
-    assert(mobileViewCode.includes('import.meta.env.VITE_API_URL'), 'MobileView uses configurable VITE_API_URL environment variable');
+    const apiConfigCode = fs.readFileSync(path.resolve(__dirname, '../../frontend/src/utils/apiConfig.js'), 'utf8');
+    assert(mobileViewCode.includes('getApiUrl') && apiConfigCode.includes('VITE_API_URL'), 'MobileView uses centralized configurable VITE_API_URL resolver');
 
     // ------------------------------------------------------------------------
     // SECTION 3: SCENARIO A — KIOSK (SHOP LAN) + CUSTOMER MOBILE (4G/5G CELLULAR)

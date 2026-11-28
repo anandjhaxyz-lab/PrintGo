@@ -69,6 +69,7 @@ app.use('/api/payments', paymentsRoutes);
 app.use(errorHandler);
 
 const created = {
+  companyIds: [],
   machineIds: [],
   qrIds: [],
   sessionCodes: [],
@@ -109,11 +110,12 @@ const run = async () => {
     }
   };
 
-  // Fixture setup: disposable machine, QR, pricing profile
-  const company = await prisma.company.findFirst();
-  assert(company, 'Expected seed company in disposable DB');
-
+  // Fixture setup is self-contained: never depend on pre-seeded or unrelated DB rows.
   const uid = `b2_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+  const company = await prisma.company.create({
+    data: { name: `Batch2 Disposable Company ${uid}`, contactEmail: `batch2_${uid}@test.local` }
+  });
+  created.companyIds.push(company.id);
   const machine = await prisma.machine.create({
     data: {
       companyId: company.id,
@@ -122,9 +124,15 @@ const run = async () => {
       location: 'Counter Desk A',
       printerModel: 'EPSON L6460 Series',
       status: 'ACTIVE',
+      paymentMode: 'CASHFREE_ONLINE',
+      lastOnline: new Date(),
     }
   });
   created.machineIds.push(machine.id);
+  // Payment-order tests require a fresh agent heartbeat and connected-printer telemetry.
+  await prisma.printerStatus.create({
+    data: { machineId: machine.id, isOnline: true, paperStatus: 'OK', tonerStatus: 'OK', jamStatus: false, timestamp: new Date() }
+  });
 
   const qrPublicCode = `qr_${uid}`;
   const qr = await prisma.printerQr.create({
@@ -441,6 +449,9 @@ const run = async () => {
     }
     if (created.machineIds.length > 0) {
       await prisma.machine.deleteMany({ where: { id: { in: created.machineIds } } }).catch(() => {});
+    }
+    if (created.companyIds.length > 0) {
+      await prisma.company.deleteMany({ where: { id: { in: created.companyIds } } }).catch(() => {});
     }
 
     await prisma.$disconnect();

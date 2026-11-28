@@ -254,7 +254,8 @@ describe('Payment Webhooks & Refund Tests', () => {
           refund: {
             findUnique: jest.fn().mockResolvedValue(null),
             findMany: jest.fn().mockResolvedValue([]),
-            create: jest.fn().mockResolvedValue(createdRefund)
+            // Mirror Prisma create(): the persisted row must retain the generated gatewayRefundId.
+            create: jest.fn().mockImplementation(async ({ data }) => ({ ...createdRefund, gatewayRefundId: data.gatewayRefundId }))
           },
           transaction: { create: jest.fn() }
         };
