@@ -16,6 +16,7 @@ on:
       - docs/hyderabad-windows-physical-certification
       - fix/multi-printer-release-review-blockers
       - fix/ci-trigger-pr19-safety-followup
+      - fix/staging-agent-handshake-compat
   pull_request:
     branches:
       - main
@@ -29,6 +30,7 @@ on:
       - feat/multi-printer-device-qr-session-binding
       - docs/hyderabad-windows-physical-certification
       - fix/multi-printer-release-review-blockers
+      - fix/staging-agent-handshake-compat
 
 jobs:
   # =========================================================================
