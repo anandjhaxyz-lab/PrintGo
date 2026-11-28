@@ -163,11 +163,16 @@ async function runBatch1Suite() {
     { expiresIn: '1h' }
   );
 
-  const ensureSession = async (code, machine) => prisma.session.upsert({
+  // Track exact fixture session codes so cleanup never touches unrelated sessions.
+  const createdSessionCodes = new Set();
+  const ensureSession = async (code, machine) => {
+    createdSessionCodes.add(code);
+    return prisma.session.upsert({
     where: { code },
     create: { code, machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
     update: { machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) }
-  });
+    });
+  };
 
   let jobSeq = 1;
   const createJob = async ({ machine = machineA, sessionId = `sess_${suffix}_1`, cost = 12 } = {}) => {
@@ -773,7 +778,9 @@ async function runBatch1Suite() {
     await prisma.reconciliationRecord.deleteMany({ where: { printJobId: { in: jobIds } } }).catch(() => {});
     await prisma.refund.deleteMany({ where: { printJobId: { in: jobIds } } }).catch(() => {});
     await prisma.printJob.deleteMany({ where: { id: { in: jobIds } } }).catch(() => {});
-    await prisma.session.deleteMany({ where: { code: { contains: String(suffix) } } }).catch(() => {});
+    if (createdSessionCodes.size > 0) {
+      await prisma.session.deleteMany({ where: { code: { in: [...createdSessionCodes] } } }).catch(() => {});
+    }
     await prisma.paymentEvent.deleteMany({ where: { eventId: { contains: String(suffix) } } }).catch(() => {});
     await prisma.transaction.deleteMany({ where: { payment: { gatewayOrderId: { contains: String(suffix) } } } }).catch(() => {});
     await prisma.payment.deleteMany({
