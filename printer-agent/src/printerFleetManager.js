@@ -1,5 +1,6 @@
-const { interpretDetectedErrorState } = require('./printerStatusMapping');
+const { evaluatePrinterReadiness } = require('./printerStatusMapping');
 const ACTIVE_DEVICE_STATUS = 'ACTIVE';
+const STATUS_QUERY_STAGGER_MS = 9000;
 const VALID_DEVICE_STATUSES = new Set([
   'DISCOVERY_REQUIRED',
   'PENDING_APPROVAL',
@@ -87,9 +88,18 @@ class PrinterFleetManager {
     this.monitors = new Map();
     this.discoveredPrinters = [];
     this.lastRefreshAt = null;
+    this.statusCheckTimers = new Set();
+  }
+
+  cancelPendingStatusChecks() {
+    for (const timer of this.statusCheckTimers) clearTimeout(timer);
+    this.statusCheckTimers.clear();
   }
 
   async refresh() {
+    // Cancel delayed checks from the previous fleet snapshot before invalidating it.
+    this.cancelPendingStatusChecks();
+
     // A failed discovery/registry refresh must not leave stale print mappings active.
     this.devices.clear();
     this.monitors.clear();
@@ -164,18 +174,20 @@ class PrinterFleetManager {
         reason = 'WINDOWS_QUEUE_NOT_BOUND';
       } else if (!discoveredPrinter) {
         reason = 'WINDOWS_QUEUE_NOT_PRESENT';
-      } else if (discoveredPrinter.workOffline === true) {
-        canPrint = false;
-        reason = 'PRINTER_OFFLINE';
-      } else if (discoveredPrinter.detectedErrorState !== null && discoveredPrinter.detectedErrorState !== undefined) {
-        const errorState = interpretDetectedErrorState(discoveredPrinter.detectedErrorState);
-        if (errorState && errorState.isBlocking) {
+      } else {
+        const readiness = evaluatePrinterReadiness(discoveredPrinter);
+        if (!readiness.canPrint) {
           canPrint = false;
-          reason = errorState.code === 9 ? 'PRINTER_OFFLINE' : 'PRINTER_ERROR_STATE';
+          reason = readiness.reason === 'PRINTER_OFFLINE'
+            ? 'PRINTER_OFFLINE'
+            : (readiness.reason === 'PRINTER_BUSY' ? 'PRINTER_BUSY' : 'PRINTER_ERROR_STATE');
         }
       }
 
-      if (canPrint) {
+      // Monitoring is diagnostic, not dispatch authorization. Keep a monitor
+      // for every approved, exactly matched queue even when its current state
+      // is Unknown/offline/error; resolveForPrint still requires canPrint=true.
+      if (approvalValid && discoveredPrinter) {
         const monitor = this.monitorFactory({
           printerDevice: device,
           discoveredPrinter,
@@ -183,8 +195,10 @@ class PrinterFleetManager {
           journal: this.journal
         });
         if (!monitor || typeof monitor.checkPrinterStatus !== 'function') {
-          canPrint = false;
-          reason = 'DEVICE_MONITOR_UNAVAILABLE';
+          if (canPrint) {
+            canPrint = false;
+            reason = 'DEVICE_MONITOR_UNAVAILABLE';
+          }
         } else {
           nextMonitors.set(device.id, monitor);
         }
@@ -245,16 +259,31 @@ class PrinterFleetManager {
   }
 
   checkPrinterStatuses(socket) {
-    let checksStarted = 0;
+    let checksScheduled = 0;
+    let index = 0;
     for (const monitor of this.monitors.values()) {
       if (monitor && typeof monitor.checkPrinterStatus === 'function') {
-        monitor.checkPrinterStatus(socket);
-        checksStarted += 1;
+        const delay = index * STATUS_QUERY_STAGGER_MS;
+        if (delay === 0) {
+          monitor.checkPrinterStatus(socket);
+        } else {
+          const timer = setTimeout(() => {
+            this.statusCheckTimers.delete(timer);
+            if (this.monitors.size && Array.from(this.monitors.values()).includes(monitor)) {
+              monitor.checkPrinterStatus(socket);
+            }
+          }, delay);
+          this.statusCheckTimers.add(timer);
+        }
+        checksScheduled += 1;
+        index += 1;
       }
     }
-    return checksStarted;
+    return checksScheduled;
   }
 }
+
+PrinterFleetManager.STATUS_QUERY_STAGGER_MS = STATUS_QUERY_STAGGER_MS;
 
 module.exports = {
   PrinterFleetError,
