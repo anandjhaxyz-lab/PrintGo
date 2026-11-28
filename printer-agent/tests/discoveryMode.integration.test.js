@@ -86,9 +86,11 @@ describe('PrintGo Discovery-Only Socket.IO integration', () => {
     jest.spyOn(fs, 'existsSync').mockReturnValue(true);
     const originalReadFileSync = fs.readFileSync.bind(fs);
     jest.spyOn(fs, 'readFileSync').mockImplementation((filePath, ...args) => {
-      if (filePath === path.join(__dirname, 'keys', 'public.pem') ||
-          filePath === path.join(__dirname, 'keys', 'private.pem')) {
-        return 'integration-test-key-material';
+      if (filePath === path.join(__dirname, '..', 'keys', 'public.pem') ||
+          filePath === path.join(__dirname, '..', 'keys', 'private.pem')) {
+        return filePath.endsWith('public.pem')
+          ? '-----BEGIN PUBLIC KEY-----\nintegration-test-public-key\n-----END PUBLIC KEY-----'
+          : '-----BEGIN PRIVATE KEY-----\nintegration-test-private-key\n-----END PRIVATE KEY-----';
       }
       return originalReadFileSync(filePath, ...args);
     });
