@@ -24,7 +24,7 @@ const { PrinterDeviceQueue } = require('./src/printerDeviceQueue');
 const { PrinterDispatchAuthorizer } = require('./src/dispatchAuthorization');
 const {
   discoverWindowsPrinters,
-  DEFAULT_DISCOVERY_TIMEOUT_MS
+  normalizeDiscoveryTimeoutMs
 } = require('./src/windowsPrinterDiscovery');
 const {
   buildAgentHello,
@@ -274,11 +274,10 @@ socket.on('printer_device_registry', async (payload) => {
       throw new Error('Backend PrinterDevice registry is missing a valid issuedAt timestamp.');
     }
     const devices = validatePrinterDeviceRegistry(payload, registeredMachineId);
-    const discoveryTimeoutMs = Number.parseInt(process.env.DISCOVERY_TIMEOUT_MS || '', 10);
-    const discoveryOptions = { execFile };
-    if (Number.isInteger(discoveryTimeoutMs) && discoveryTimeoutMs > 0) {
-      discoveryOptions.timeoutMs = discoveryTimeoutMs;
-    }
+    const discoveryOptions = {
+      execFile,
+      timeoutMs: normalizeDiscoveryTimeoutMs(process.env.DISCOVERY_TIMEOUT_MS)
+    };
     const discoveredPrinters = await discoverWindowsPrinters(discoveryOptions);
 
     const nextFleetManager = new PrinterFleetManager({

@@ -1,6 +1,9 @@
 const {
   WINDOWS_PRINTER_DISCOVERY_SCRIPT,
+  MIN_DISCOVERY_TIMEOUT_MS,
+  MAX_DISCOVERY_TIMEOUT_MS,
   DEFAULT_DISCOVERY_TIMEOUT_MS,
+  normalizeDiscoveryTimeoutMs,
   discoverWindowsPrinters,
   parseDiscoveryOutput
 } = require('../src/windowsPrinterDiscovery');
@@ -251,6 +254,68 @@ describe('Windows printer discovery', () => {
     expect(res2).toHaveLength(1);
     expect(res1[0].windowsPrinterName).toBe('Epson L6460 Series');
     expect(res2[0].windowsPrinterName).toBe('Epson L6460 Series');
+  });
+
+  test('sequential retry: failure cleans up state and allows subsequent fresh execution to succeed', async () => {
+    let callCount = 0;
+    const mockKill = jest.fn();
+    const execFile = jest.fn((command, args, options, callback) => {
+      callCount++;
+      if (callCount === 1) {
+        const child = { killed: false, kill: mockKill };
+        process.nextTick(() => {
+          const err = new Error('Discovery timed out');
+          err.killed = true;
+          err.signal = 'SIGTERM';
+          err.code = 'ETIMEDOUT';
+          callback(err, '', '');
+        });
+        return child;
+      }
+      process.nextTick(() => {
+        callback(null, JSON.stringify([{ Name: 'Canon Generic Plus UFR II (Copy 2)', PortName: 'USB001' }]));
+      });
+      return { killed: false, kill: jest.fn() };
+    });
+
+    // 1. First discovery call times out and rejects
+    await expect(discoverWindowsPrinters({ platform: 'win32', execFile }))
+      .rejects.toEqual(expect.objectContaining({
+        code: 'WINDOWS_DISCOVERY_FAILED',
+        message: expect.stringContaining('timed out after 30000ms')
+      }));
+
+    expect(callCount).toBe(1);
+    expect(mockKill).toHaveBeenCalledWith('SIGKILL');
+
+    // 2. Second discovery call executes a fresh subprocess and succeeds (no stale promise or deadlock)
+    const retryResult = await discoverWindowsPrinters({ platform: 'win32', execFile });
+    expect(callCount).toBe(2);
+    expect(retryResult).toHaveLength(1);
+    expect(retryResult[0].windowsPrinterName).toBe('Canon Generic Plus UFR II (Copy 2)');
+  });
+
+  test('validates discovery timeout boundaries and handles invalid/extreme values safely', () => {
+    expect(MIN_DISCOVERY_TIMEOUT_MS).toBe(1000);
+    expect(MAX_DISCOVERY_TIMEOUT_MS).toBe(300000);
+    expect(DEFAULT_DISCOVERY_TIMEOUT_MS).toBe(30000);
+
+    // Normalization helper tests
+    expect(normalizeDiscoveryTimeoutMs(undefined)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(null)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('not-a-number')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(0)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(-500)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(500)).toBe(30000); // below minimum
+    expect(normalizeDiscoveryTimeoutMs(1000)).toBe(1000); // minimum boundary
+    expect(normalizeDiscoveryTimeoutMs(15000)).toBe(15000);
+    expect(normalizeDiscoveryTimeoutMs(300000)).toBe(300000); // maximum boundary
+    expect(normalizeDiscoveryTimeoutMs(300001)).toBe(30000); // above maximum (overflow protection)
+    expect(normalizeDiscoveryTimeoutMs(999999999999)).toBe(30000); // 32-bit overflow protection
+    expect(normalizeDiscoveryTimeoutMs('45000')).toBe(45000); // string parsing
+    expect(normalizeDiscoveryTimeoutMs('0')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('999999999999')).toBe(30000);
   });
 
   test('failed discovery does not initialize an invalid printer fleet', async () => {

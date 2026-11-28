@@ -7,7 +7,25 @@ const WINDOWS_PRINTER_DISCOVERY_SCRIPT = [
   "if ($printers.Count -eq 0) { '[]' } else { $printers | ConvertTo-Json -Depth 4 -Compress }"
 ].join('; ');
 
+const MIN_DISCOVERY_TIMEOUT_MS = 1000;
+const MAX_DISCOVERY_TIMEOUT_MS = 300000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 30000;
+
+function normalizeDiscoveryTimeoutMs(timeoutMs, defaultMs = DEFAULT_DISCOVERY_TIMEOUT_MS) {
+  if (typeof timeoutMs === 'string') {
+    const trimmed = timeoutMs.trim();
+    if (!trimmed) return defaultMs;
+    const parsed = Number.parseInt(trimmed, 10);
+    if (Number.isInteger(parsed) && parsed >= MIN_DISCOVERY_TIMEOUT_MS && parsed <= MAX_DISCOVERY_TIMEOUT_MS) {
+      return parsed;
+    }
+    return defaultMs;
+  }
+  if (Number.isInteger(timeoutMs) && timeoutMs >= MIN_DISCOVERY_TIMEOUT_MS && timeoutMs <= MAX_DISCOVERY_TIMEOUT_MS) {
+    return timeoutMs;
+  }
+  return defaultMs;
+}
 
 let inFlightDiscoveryPromise = null;
 let inFlightExecFile = null;
@@ -119,9 +137,7 @@ function discoverWindowsPrinters(options = {}) {
   const majorVersion = parseInt(String(release || '').split('.')[0], 10);
   const isWindows10Or11 = Number.isFinite(majorVersion) && majorVersion >= 10;
   const execFile = options.execFile;
-  const timeoutMs = Number.isInteger(options.timeoutMs) && options.timeoutMs > 0
-    ? options.timeoutMs
-    : DEFAULT_DISCOVERY_TIMEOUT_MS;
+  const timeoutMs = normalizeDiscoveryTimeoutMs(options.timeoutMs);
 
   if (platform !== 'win32' || arch !== 'x64' || !isWindows10Or11) {
     return Promise.reject(new PrinterDiscoveryError(
@@ -211,7 +227,10 @@ function discoverWindowsPrinters(options = {}) {
 
 module.exports = {
   WINDOWS_PRINTER_DISCOVERY_SCRIPT,
+  MIN_DISCOVERY_TIMEOUT_MS,
+  MAX_DISCOVERY_TIMEOUT_MS,
   DEFAULT_DISCOVERY_TIMEOUT_MS,
+  normalizeDiscoveryTimeoutMs,
   PrinterDiscoveryError,
   discoverWindowsPrinters,
   parseDiscoveryOutput
