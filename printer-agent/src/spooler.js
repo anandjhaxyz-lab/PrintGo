@@ -1,14 +1,19 @@
 const os = require('os');
 const fs = require('fs');
-const { interpretDetectedErrorState } = require('./printerStatusMapping');
+const { interpretDetectedErrorState, evaluateContextualPrinterHealth } = require('./printerStatusMapping');
+const { parseTcpEndpoint, checkTcpConnectivity } = require('./networkConnectivity');
+const { buildSubprocessDiagnostic, formatSubprocessDiagnostic } = require('./subprocessDiagnostics');
 
 function encodePowerShellValue(value) {
   return Buffer.from(String(value), 'utf16le').toString('base64');
 }
 
 function buildPrinterStatusCommand(printerName) {
+  if (typeof printerName !== 'string' || !printerName.trim() || /[\u0000-\u001f\u007f]/.test(printerName)) {
+    throw new TypeError('A valid non-empty Windows printer name is required.');
+  }
   const encodedName = encodePowerShellValue(printerName);
-  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Name -eq $printerName } | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, WorkOffline, PortName`;
+  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); $escapedPrinterName = $printerName.Replace('\\', '\\\\').Replace('''', '\\'''); $filter = 'Name = ''' + $escapedPrinterName + ''''; Get-CimInstance -ClassName Win32_Printer -Filter $filter | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, WorkOffline, PortName`;
 }
 
 function buildPrintJobQueryCommand(printerName) {
@@ -68,6 +73,7 @@ class SpoolerMonitor {
     this.isWin = this.platform === 'win32';
     this.journal = journal;
     this.isCheckingStatus = false;
+    this.tcpChecker = typeof options.tcpChecker === 'function' ? options.tcpChecker : checkTcpConnectivity;
     this.portName = 'Unknown';
     this.connectionType = 'Unknown';
   }
@@ -78,21 +84,33 @@ class SpoolerMonitor {
     this.isCheckingStatus = true;
     
     if (this.isWin) {
+      let command;
+      try {
+        command = buildPrinterStatusCommand(this.printerName);
+      } catch (err) {
+        this.isCheckingStatus = false;
+        console.error(`[printer-agent] Invalid printerName for status check: ${err.message}`);
+        this.emitStatus(socket, true, 'Invalid printer queue name', 'Unknown');
+        return;
+      }
+
       this.execFile('powershell.exe', [
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        buildPrinterStatusCommand(this.printerName)
-      ], { timeout: 8000 }, (error, stdout) => {
-        this.isCheckingStatus = false;
+        command
+      ], { timeout: 8000 }, (error, stdout, stderr) => {
         if (error) {
-          console.error(`Error querying printer status: ${error.message}`);
-          this.emitStatus(socket, true, `Query Error: ${error.message}`, 'Unknown');
+          this.isCheckingStatus = false;
+          const diagnostics = buildSubprocessDiagnostic('windows-printer-status', error, stderr, 8000);
+          console.error(`[printer-agent subprocess] ${formatSubprocessDiagnostic(diagnostics)}`);
+          this.emitStatus(socket, true, 'Windows printer status query failed', 'Unknown');
           return;
         }
 
         const rawOutput = (stdout || '').trim();
         if (!rawOutput) {
+          this.isCheckingStatus = false;
           this.emitStatus(socket, true, 'Printer Queue Missing or Renamed', 'Unknown');
           return;
         }
@@ -101,29 +119,16 @@ class SpoolerMonitor {
         let errorMessage = '';
 
         // Extract WorkOffline
-        const isWorkOffline = /WorkOffline\s*:\s*True/i.test(stdout) ||
-          (stdout.includes('Offline') && !/WorkOffline\s*:\s*False/i.test(stdout));
+        const workOfflineMatch = stdout.match(/WorkOffline\s*:\s*(True|False)/i);
+        const workOffline = workOfflineMatch ? workOfflineMatch[1].toLowerCase() === 'true' : null;
 
         // Extract DetectedErrorState (e.g. "DetectedErrorState : 4" or "ErrorState: 4")
         const errorStateMatch = stdout.match(/(?:DetectedErrorState|ErrorState)\s*:\s*(\d+)/i);
         const detectedErrorState = errorStateMatch ? parseInt(errorStateMatch[1], 10) : null;
 
-        if (isWorkOffline) {
-          isError = true;
-          errorMessage = 'Printer Offline';
-        } else if (detectedErrorState !== null) {
-          const interpreted = interpretDetectedErrorState(detectedErrorState);
-          if (interpreted) {
-            isError = interpreted.isError;
-            errorMessage = interpreted.message;
-          }
-        } else if (stdout.includes('Paper Out') || stdout.includes('Out of Paper')) {
-          isError = true;
-          errorMessage = 'Out of Paper';
-        } else if (stdout.includes('Jam')) {
-          isError = true;
-          errorMessage = 'Paper Jam';
-        }
+        // Extract PrinterStatus (e.g. "PrinterStatus : 3")
+        const printerStatusMatch = stdout.match(/PrinterStatus\s*:\s*(\d+)/i);
+        const printerStatus = printerStatusMatch ? parseInt(printerStatusMatch[1], 10) : null;
 
         // Extract PortName and classify connection
         const portMatch = stdout.match(/PortName\s*:\s*([^\r\n]+)/i);
@@ -132,7 +137,59 @@ class SpoolerMonitor {
         this.portName = rawPort || 'Unknown';
         this.connectionType = connectionType;
 
-        this.emitStatus(socket, isError, errorMessage, connectionType);
+        const hasExplicitPaperOut = stdout.includes('Paper Out') || stdout.includes('Out of Paper');
+        const hasExplicitJam = stdout.includes('Jam');
+
+        const evaluateAndEmit = (networkOnline = null, networkError = null) => {
+          const health = evaluateContextualPrinterHealth({
+            detectedErrorState,
+            workOffline,
+            printerStatus,
+            connectionType,
+            networkOnline,
+            networkError
+          });
+
+          let isError = !health.canPrint;
+          let errorMessage = health.message;
+
+          if (hasExplicitPaperOut) {
+            isError = true;
+            errorMessage = 'Out of Paper';
+          } else if (hasExplicitJam) {
+            isError = true;
+            errorMessage = 'Paper Jam';
+          }
+
+          try {
+            this.emitStatus(socket, isError, errorMessage, connectionType, {
+              diagnosticReason: health.reason,
+              paperStatus: health.paperStatus,
+              tonerStatus: health.tonerStatus
+            });
+          } finally {
+            this.isCheckingStatus = false;
+          }
+        };
+
+        if (connectionType === 'Network' && workOffline === false && !interpretDetectedErrorState(detectedErrorState)?.isBlocking) {
+          const endpoint = parseTcpEndpoint(this.portName);
+          if (endpoint) {
+            let probePromise;
+            try {
+              probePromise = this.tcpChecker({ host: endpoint.host, port: endpoint.port });
+            } catch (err) {
+              evaluateAndEmit(false, err?.code || err?.message || 'PROBE_FAILED');
+              return;
+            }
+            Promise.resolve(probePromise)
+              .then((probe) => evaluateAndEmit(probe?.isOnline === true, probe?.error || null))
+              .catch((err) => evaluateAndEmit(false, err?.code || err?.message || 'PROBE_FAILED'));
+            return;
+          }
+        }
+
+        evaluateAndEmit();
       });
     } else {
       // Linux CUPS
@@ -180,15 +237,21 @@ class SpoolerMonitor {
     }
   }
 
-  emitStatus(socket, isError, errorMessage, connectionType = this.connectionType || 'Unknown') {
+  emitStatus(socket, isError, errorMessage, connectionType = this.connectionType || 'Unknown', extraTelemetry = {}) {
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
     const memoryUsage = ((totalMem - freeMem) / totalMem * 100).toFixed(2);
     const uptime = os.uptime();
+    // Keep diagnostics within the backend's boundedText contract.
+    const normalizedErrorMessage = String(errorMessage ?? '')
+      .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 128) || (isError ? 'Printer status error' : '');
 
     socket.emit('printer_status_update', {
       isError,
-      errorMessage,
+      errorMessage: normalizedErrorMessage,
       printerName: this.printerName,
       ...(this.printerDeviceId ? { printerDeviceId: this.printerDeviceId } : {}),
       connectionType,
@@ -198,7 +261,10 @@ class SpoolerMonitor {
         platform: os.platform(),
         arch: os.arch(),
         connectionType,
-        portName: this.portName !== 'Unknown' ? this.portName : undefined
+        portName: this.portName !== 'Unknown' ? this.portName : undefined,
+        ...(extraTelemetry.diagnosticReason ? { diagnosticReason: extraTelemetry.diagnosticReason } : {}),
+        ...(extraTelemetry.paperStatus ? { paperStatus: extraTelemetry.paperStatus } : {}),
+        ...(extraTelemetry.tonerStatus ? { tonerStatus: extraTelemetry.tonerStatus } : {})
       },
       timestamp: new Date().toISOString()
     });

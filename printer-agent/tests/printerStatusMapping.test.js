@@ -1,6 +1,7 @@
 const {
   WIN32_DETECTED_ERROR_STATE,
-  interpretDetectedErrorState
+  interpretDetectedErrorState,
+  evaluateContextualPrinterHealth
 } = require('../src/printerStatusMapping');
 
 describe('Win32_Printer DetectedErrorState Mapping and Policy (Finding 1)', () => {
@@ -46,9 +47,19 @@ describe('Win32_Printer DetectedErrorState Mapping and Policy (Finding 1)', () =
     expect(jammed.isBlocking).toBe(true);
   });
 
-  test('correctly maps all documented blocking error states', () => {
+  test('treats code 0 as Unknown state without classifying it as confirmed hardware fault', () => {
+    const res = interpretDetectedErrorState(0);
+    expect(res).not.toBeNull();
+    expect(res.code).toBe(0);
+    expect(res.name).toBe('Unknown');
+    expect(res.isUnknown).toBe(true);
+    expect(res.isError).toBe(false);
+    expect(res.isBlocking).toBe(false);
+    expect(res.reason).toBe('PRINTER_STATE_UNKNOWN');
+  });
+
+  test('correctly maps all documented confirmed blocking error states', () => {
     const expected = [
-      { code: 0, name: 'Unknown', isError: true, isBlocking: true, message: 'Printer State Unknown' },
       { code: 1, name: 'Other', isError: true, isBlocking: true, message: 'Printer Error' },
       { code: 4, name: 'No Paper', isError: true, isBlocking: true, message: 'Out of Paper' },
       { code: 6, name: 'No Toner', isError: true, isBlocking: true, message: 'No Toner' },
@@ -85,5 +96,34 @@ describe('Win32_Printer DetectedErrorState Mapping and Policy (Finding 1)', () =
     expect(interpretDetectedErrorState(undefined)).toBeNull();
     expect(interpretDetectedErrorState('')).toBeNull();
     expect(interpretDetectedErrorState('invalid-string')).toBeNull();
+  });
+});
+
+
+describe('Contextual WMI unknown-state fail-closed gates', () => {
+
+  test('requires TCP confirmation for a network printer even when WMI reports No Error', () => {
+    const unverified = evaluateContextualPrinterHealth({ detectedErrorState: 2, workOffline: false, printerStatus: 3, connectionType: 'Network' });
+    expect(unverified.canPrint).toBe(false);
+    expect(unverified.reason).toBe('NETWORK_UNVERIFIED');
+
+    const verified = evaluateContextualPrinterHealth({ detectedErrorState: 2, workOffline: false, printerStatus: 3, connectionType: 'Network', networkOnline: true });
+    expect(verified.canPrint).toBe(true);
+    expect(verified.isUnknown).toBe(false);
+  });
+  test('does not allow Unknown state when WorkOffline is missing', () => {
+    const result = evaluateContextualPrinterHealth({ detectedErrorState: 0, printerStatus: 3, connectionType: 'USB' });
+    expect(result.canPrint).toBe(false);
+    expect(result.reason).toBe('PRINTER_OFFLINE_STATE_UNCONFIRMED');
+  });
+  test('does not allow Unknown state when Windows queue state is missing', () => {
+    const result = evaluateContextualPrinterHealth({ detectedErrorState: 0, workOffline: false, connectionType: 'USB' });
+    expect(result.canPrint).toBe(false);
+    expect(result.reason).toBe('PRINTER_QUEUE_NOT_READY');
+  });
+  test('does not allow network Unknown state without a successful TCP probe', () => {
+    const result = evaluateContextualPrinterHealth({ detectedErrorState: 0, workOffline: false, printerStatus: 3, connectionType: 'Network' });
+    expect(result.canPrint).toBe(false);
+    expect(result.reason).toBe('NETWORK_UNVERIFIED');
   });
 });

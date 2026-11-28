@@ -1,5 +1,7 @@
-const { interpretDetectedErrorState } = require('./printerStatusMapping');
+const { interpretDetectedErrorState, evaluateContextualPrinterHealth } = require('./printerStatusMapping');
+const { parseTcpEndpoint, checkTcpConnectivity } = require('./networkConnectivity');
 const ACTIVE_DEVICE_STATUS = 'ACTIVE';
+const STATUS_QUERY_STAGGER_MS = 9000;
 const VALID_DEVICE_STATUSES = new Set([
   'DISCOVERY_REQUIRED',
   'PENDING_APPROVAL',
@@ -83,13 +85,21 @@ class PrinterFleetManager {
     }
 
     this.journal = options.journal || null;
+    this.tcpChecker = typeof options.tcpChecker === 'function'
+      ? options.tcpChecker
+      : checkTcpConnectivity;
     this.devices = new Map();
     this.monitors = new Map();
     this.discoveredPrinters = [];
     this.lastRefreshAt = null;
+    this.statusCheckTimers = new Set();
   }
 
   async refresh() {
+    // Cancel delayed checks from the previous fleet snapshot before invalidating it.
+    for (const timer of this.statusCheckTimers) clearTimeout(timer);
+    this.statusCheckTimers.clear();
+
     // A failed discovery/registry refresh must not leave stale print mappings active.
     this.devices.clear();
     this.monitors.clear();
@@ -167,11 +177,38 @@ class PrinterFleetManager {
       } else if (discoveredPrinter.workOffline === true) {
         canPrint = false;
         reason = 'PRINTER_OFFLINE';
-      } else if (discoveredPrinter.detectedErrorState !== null && discoveredPrinter.detectedErrorState !== undefined) {
-        const errorState = interpretDetectedErrorState(discoveredPrinter.detectedErrorState);
-        if (errorState && errorState.isBlocking) {
+      } else {
+        let networkOnline = null;
+        let networkError = null;
+
+        if (discoveredPrinter.connectionType === 'Network' && !interpretDetectedErrorState(discoveredPrinter.detectedErrorState)?.isBlocking) {
+          const endpoint = parseTcpEndpoint(discoveredPrinter.portName);
+          if (endpoint) {
+            try {
+              const probe = await this.tcpChecker({ host: endpoint.host, port: endpoint.port });
+              networkOnline = probe?.isOnline === true;
+              networkError = probe?.error || null;
+            } catch (err) {
+              networkOnline = false;
+              networkError = err?.code || err?.message || 'PROBE_FAILED';
+            }
+          }
+        }
+
+        const health = evaluateContextualPrinterHealth({
+          detectedErrorState: discoveredPrinter.detectedErrorState,
+          workOffline: discoveredPrinter.workOffline,
+          printerStatus: discoveredPrinter.printerStatus,
+          connectionType: discoveredPrinter.connectionType,
+          networkOnline,
+          networkError
+        });
+
+        if (!health.canPrint) {
           canPrint = false;
-          reason = errorState.code === 9 ? 'PRINTER_OFFLINE' : 'PRINTER_ERROR_STATE';
+          reason = health.reason || 'PRINTER_ERROR_STATE';
+        } else if (health.isUnknown) {
+          reason = health.reason || 'PRINTER_STATE_UNKNOWN';
         }
       }
 
@@ -245,14 +282,27 @@ class PrinterFleetManager {
   }
 
   checkPrinterStatuses(socket) {
-    let checksStarted = 0;
+    let checksScheduled = 0;
+    let index = 0;
     for (const monitor of this.monitors.values()) {
       if (monitor && typeof monitor.checkPrinterStatus === 'function') {
-        monitor.checkPrinterStatus(socket);
-        checksStarted += 1;
+        const delay = index * STATUS_QUERY_STAGGER_MS;
+        if (delay === 0) {
+          monitor.checkPrinterStatus(socket);
+        } else {
+          const timer = setTimeout(() => {
+            this.statusCheckTimers.delete(timer);
+            if (this.monitors.size && Array.from(this.monitors.values()).includes(monitor)) {
+              monitor.checkPrinterStatus(socket);
+            }
+          }, delay);
+          this.statusCheckTimers.add(timer);
+        }
+        checksScheduled += 1;
+        index += 1;
       }
     }
-    return checksStarted;
+    return checksScheduled;
   }
 }
 

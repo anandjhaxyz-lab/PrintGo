@@ -5,7 +5,10 @@ function discovered(name, portName = 'USB001') {
     windowsPrinterName: name,
     driverName: 'Test Driver',
     portName,
-    connectionType: portName.startsWith('USB') ? 'USB' : 'Network'
+    connectionType: portName.startsWith('USB') ? 'USB' : 'Network',
+    printerStatus: 3,
+    detectedErrorState: 2,
+    workOffline: false
   };
 }
 
@@ -33,7 +36,8 @@ describe('PrinterFleetManager', () => {
         activeDevice('device-1', 'Epson L6460'),
         activeDevice('device-2', 'HP LaserJet')
       ],
-      monitorFactory
+      monitorFactory,
+      tcpChecker: jest.fn().mockResolvedValue({ isOnline: true, error: null })
     });
 
     const devices = await manager.refresh();
@@ -148,7 +152,7 @@ describe('PrinterFleetManager', () => {
     expect(offlineDev.canPrint).toBe(false);
     expect(offlineDev.reason).toBe('PRINTER_OFFLINE');
     expect(errorDev.canPrint).toBe(false);
-    expect(errorDev.reason).toBe('PRINTER_ERROR_STATE');
+    expect(errorDev.reason).toBe('PRINTER_NO_PAPER');
     expect(() => manager.resolveForPrint('device-offline')).toThrow();
     expect(() => manager.resolveForPrint('device-error')).toThrow();
   });
@@ -196,6 +200,60 @@ describe('PrinterFleetManager', () => {
     expect(manager.resolveForPrint('dev-low-toner')).toBeDefined();
   });
 
+
+  test('evaluates the observed Epson/HP/Canon WMI pattern independently and fails closed on HP offline', async () => {
+    const discoveredPrinters = [
+      { ...discovered('EPSON L6460 Series', '192.168.1.7'), connectionType: 'Network', detectedErrorState: 0, printerStatus: 3, workOffline: false },
+      { ...discovered('HP LaserJet Professional M1136 MFP (Copy 1)', 'USB011'), connectionType: 'USB', detectedErrorState: 0, printerStatus: 3, workOffline: true },
+      { ...discovered('Canon Generic Plus UFR II (Copy 2)', 'USB001'), connectionType: 'USB', detectedErrorState: 0, printerStatus: 3, workOffline: false }
+    ];
+    const tcpChecker = jest.fn().mockResolvedValue({ isOnline: true, error: null });
+    const monitorFactory = jest.fn(({ printerName }) => ({ printerName, checkPrinterStatus: jest.fn() }));
+    const manager = new PrinterFleetManager({
+      discoverPrinters: async () => discoveredPrinters,
+      getDeviceRegistry: async () => [
+        activeDevice('epson', 'EPSON L6460 Series'),
+        activeDevice('hp', 'HP LaserJet Professional M1136 MFP (Copy 1)'),
+        activeDevice('canon', 'Canon Generic Plus UFR II (Copy 2)')
+      ],
+      monitorFactory,
+      tcpChecker
+    });
+
+    const devices = await manager.refresh();
+    const epson = devices.find((device) => device.id === 'epson');
+    const hp = devices.find((device) => device.id === 'hp');
+    const canon = devices.find((device) => device.id === 'canon');
+
+    expect(epson.canPrint).toBe(true);
+    expect(epson.reason).toBe('PRINTER_STATE_UNKNOWN');
+    expect(hp.canPrint).toBe(false);
+    expect(hp.reason).toBe('PRINTER_OFFLINE');
+    expect(canon.canPrint).toBe(true);
+    expect(canon.reason).toBe('PRINTER_STATE_UNKNOWN');
+    expect(tcpChecker).toHaveBeenCalledTimes(1);
+    expect(tcpChecker).toHaveBeenCalledWith({ host: '192.168.1.7', port: 9100 });
+    expect(monitorFactory).toHaveBeenCalledTimes(2);
+    expect(() => manager.resolveForPrint('hp')).toThrow();
+    expect(manager.resolveForPrint('epson').windowsPrinterName).toBe('EPSON L6460 Series');
+    expect(manager.resolveForPrint('canon').windowsPrinterName).toBe('Canon Generic Plus UFR II (Copy 2)');
+  });
+
+
+  test('preserves explicit network-unverified reason when no probeable TCP endpoint exists', async () => {
+    const monitorFactory = jest.fn(() => ({ checkPrinterStatus: jest.fn() }));
+    const manager = new PrinterFleetManager({
+      discoverPrinters: async () => [{ ...discovered('WSD Printer', 'WSD-ABCD'), connectionType: 'Network', detectedErrorState: 0, printerStatus: 3, workOffline: false }],
+      getDeviceRegistry: async () => [activeDevice('wsd-device', 'WSD Printer')],
+      monitorFactory
+    });
+    const [device] = await manager.refresh();
+    expect(device.canPrint).toBe(false);
+    expect(device.reason).toBe('NETWORK_UNVERIFIED');
+    expect(monitorFactory).not.toHaveBeenCalled();
+    expect(() => manager.resolveForPrint('wsd-device')).toThrow();
+  });
+
   test('rejects duplicate registered queue bindings and more than ten devices', async () => {
     const duplicateManager = new PrinterFleetManager({
       discoverPrinters: async () => [discovered('Queue A')],
@@ -239,6 +297,40 @@ describe('PrinterFleetManager', () => {
     expect(() => manager.resolveForPrint('device-1')).toThrow();
   });
 
+  test('cancels staggered status checks when fleet refresh invalidates old monitors', async () => {
+    jest.useFakeTimers();
+    try {
+      let monitorSet = [
+        { checkPrinterStatus: jest.fn() },
+        { checkPrinterStatus: jest.fn() }
+      ];
+      const oldMonitorA = monitorSet[0];
+      const oldMonitorB = monitorSet[1];
+      let queueNames = ['A', 'B'];
+      const manager = new PrinterFleetManager({
+        discoverPrinters: async () => queueNames.map((name) => discovered(name)),
+        getDeviceRegistry: async () => queueNames.map((name, index) => activeDevice(`device-${name}`, name)),
+        monitorFactory: () => monitorSet.shift()
+      });
+
+      await manager.refresh();
+      const socket = { emit: jest.fn() };
+      manager.checkPrinterStatuses(socket);
+      expect(oldMonitorA.checkPrinterStatus).toHaveBeenCalledTimes(1);
+      expect(oldMonitorB.checkPrinterStatus).not.toHaveBeenCalled();
+
+      queueNames = ['C'];
+      monitorSet = [{ checkPrinterStatus: jest.fn() }];
+      await manager.refresh();
+      await jest.advanceTimersByTimeAsync(18000);
+
+      expect(oldMonitorB.checkPrinterStatus).not.toHaveBeenCalled();
+      expect(manager.statusCheckTimers.size).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test('checks each monitor independently and returns the number of checks started', async () => {
     const monitorA = { checkPrinterStatus: jest.fn() };
     const monitorB = { checkPrinterStatus: jest.fn() };
@@ -246,14 +338,23 @@ describe('PrinterFleetManager', () => {
     const manager = new PrinterFleetManager({
       discoverPrinters: async () => [discovered('A'), discovered('B', 'IP_10.0.0.2')],
       getDeviceRegistry: async () => [activeDevice('device-a', 'A'), activeDevice('device-b', 'B')],
-      monitorFactory: () => monitors.shift()
+      monitorFactory: () => monitors.shift(),
+      tcpChecker: jest.fn().mockResolvedValue({ isOnline: true, error: null })
     });
 
     await manager.refresh();
     const socket = { emit: jest.fn() };
 
-    expect(manager.checkPrinterStatuses(socket)).toBe(2);
-    expect(monitorA.checkPrinterStatus).toHaveBeenCalledWith(socket);
-    expect(monitorB.checkPrinterStatus).toHaveBeenCalledWith(socket);
+    jest.useFakeTimers();
+    try {
+      expect(manager.checkPrinterStatuses(socket)).toBe(2);
+      expect(monitorA.checkPrinterStatus).toHaveBeenCalledWith(socket);
+      expect(monitorB.checkPrinterStatus).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(9000);
+      expect(monitorB.checkPrinterStatus).toHaveBeenCalledWith(socket);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
