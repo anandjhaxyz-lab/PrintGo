@@ -8,7 +8,29 @@ function encodePowerShellValue(value) {
 
 function buildPrinterStatusCommand(printerName) {
   const encodedName = encodePowerShellValue(printerName);
-  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Name -eq $printerName } | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, ExtendedDetectedErrorState, WorkOffline, PortName | ConvertTo-Json -Compress`;
+  return `$ErrorActionPreference = 'Stop'; $printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); $printer = Get-CimInstance -ClassName Win32_Printer -ErrorAction Stop | Where-Object { $_.Name -eq $printerName } | Select-Object -First 1 PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, ExtendedDetectedErrorState, WorkOffline, PortName; if ($null -ne $printer) { $printer | ConvertTo-Json -Compress }`;
+}
+
+function sanitizeDiagnosticText(value, maxLength = 400) {
+  if (value === undefined || value === null) return undefined;
+  return String(value)
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\b(password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/\b[A-Z]:\\[^\s"']+/gi, '[PATH]')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function buildProcessErrorDiagnostics(error, stderr) {
+  return {
+    code: error && error.code,
+    errno: error && error.errno,
+    syscall: sanitizeDiagnosticText(error && error.syscall, 80),
+    killed: error && error.killed,
+    signal: error && error.signal,
+    message: sanitizeDiagnosticText(error && error.message, 240),
+    stderr: sanitizeDiagnosticText(stderr, 400)
+  };
 }
 
 function buildPrintJobQueryCommand(printerName) {
@@ -81,12 +103,15 @@ class SpoolerMonitor {
       this.execFile('powershell.exe', [
         '-NoProfile',
         '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
         '-Command',
         buildPrinterStatusCommand(this.printerName)
-      ], { timeout: 8000 }, (error, stdout) => {
+      ], { timeout: 30000, maxBuffer: 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
         this.isCheckingStatus = false;
         if (error) {
-          console.error(`Error querying printer status: ${error.message}`);
+          const diagnostics = buildProcessErrorDiagnostics(error, stderr);
+          console.error(`Error querying printer status: ${JSON.stringify(diagnostics)}`);
           this.emitStatus(socket, true, `Query Error: ${error.message}`, 'Unknown');
           return;
         }

@@ -307,7 +307,7 @@ describe('PrinterFleetManager', () => {
     expect(() => manager.resolveForPrint('device-1')).toThrow();
   });
 
-  test('checks each monitor independently and returns the number of checks started', async () => {
+  test('checks each monitor independently and returns the number of checks scheduled', async () => {
     const monitorA = { checkPrinterStatus: jest.fn() };
     const monitorB = { checkPrinterStatus: jest.fn() };
     const monitors = [monitorA, monitorB];
@@ -320,9 +320,113 @@ describe('PrinterFleetManager', () => {
     await manager.refresh();
     const socket = { emit: jest.fn() };
 
-    expect(manager.checkPrinterStatuses(socket)).toBe(2);
-    expect(monitorA.checkPrinterStatus).toHaveBeenCalledWith(socket);
-    expect(monitorB.checkPrinterStatus).toHaveBeenCalledWith(socket);
+    jest.useFakeTimers();
+    try {
+      expect(manager.checkPrinterStatuses(socket)).toBe(2);
+      expect(monitorA.checkPrinterStatus).toHaveBeenCalledWith(socket);
+      expect(monitorB.checkPrinterStatus).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(9000);
+      expect(monitorB.checkPrinterStatus).toHaveBeenCalledWith(socket);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('stagger-schedules three printer checks at 0, 9 and 18 seconds', async () => {
+    const monitorA = { checkPrinterStatus: jest.fn() };
+    const monitorB = { checkPrinterStatus: jest.fn() };
+    const monitorC = { checkPrinterStatus: jest.fn() };
+    const monitors = [monitorA, monitorB, monitorC];
+    const names = ['Epson', 'HP', 'Canon'];
+    const manager = new PrinterFleetManager({
+      discoverPrinters: async () => names.map((name) => discovered(name)),
+      getDeviceRegistry: async () => names.map((name) => activeDevice(`device-${name}`, name)),
+      monitorFactory: () => monitors.shift()
+    });
+
+    jest.useFakeTimers();
+    try {
+      await manager.refresh();
+      expect(manager.checkPrinterStatuses({ emit: jest.fn() })).toBe(3);
+      expect(monitorA.checkPrinterStatus).toHaveBeenCalledTimes(1);
+      expect(monitorB.checkPrinterStatus).not.toHaveBeenCalled();
+      expect(monitorC.checkPrinterStatus).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(8999);
+      expect(monitorB.checkPrinterStatus).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1);
+      expect(monitorB.checkPrinterStatus).toHaveBeenCalledTimes(1);
+      expect(monitorC.checkPrinterStatus).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(9000);
+      expect(monitorC.checkPrinterStatus).toHaveBeenCalledTimes(1);
+      expect(manager.statusCheckTimers.size).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('cancels staggered status checks when fleet refresh invalidates old monitors', async () => {
+    jest.useFakeTimers();
+    try {
+      let monitorSet = [
+        { checkPrinterStatus: jest.fn() },
+        { checkPrinterStatus: jest.fn() }
+      ];
+      const oldMonitorA = monitorSet[0];
+      const oldMonitorB = monitorSet[1];
+      let queueNames = ['A', 'B'];
+      const manager = new PrinterFleetManager({
+        discoverPrinters: async () => queueNames.map((name) => discovered(name)),
+        getDeviceRegistry: async () => queueNames.map((name) => activeDevice(`device-${name}`, name)),
+        monitorFactory: () => monitorSet.shift()
+      });
+
+      await manager.refresh();
+      const socket = { emit: jest.fn() };
+      manager.checkPrinterStatuses(socket);
+      expect(oldMonitorA.checkPrinterStatus).toHaveBeenCalledTimes(1);
+      expect(oldMonitorB.checkPrinterStatus).not.toHaveBeenCalled();
+
+      queueNames = ['C'];
+      monitorSet = [{ checkPrinterStatus: jest.fn() }];
+      await manager.refresh();
+      await jest.advanceTimersByTimeAsync(18000);
+
+      expect(oldMonitorB.checkPrinterStatus).not.toHaveBeenCalled();
+      expect(manager.statusCheckTimers.size).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('cancels pending status checks even when the replacement fleet refresh fails', async () => {
+    jest.useFakeTimers();
+    try {
+      const oldMonitorA = { checkPrinterStatus: jest.fn() };
+      const oldMonitorB = { checkPrinterStatus: jest.fn() };
+      let failDiscovery = false;
+      const manager = new PrinterFleetManager({
+        discoverPrinters: async () => {
+          if (failDiscovery) throw new Error('mock refresh failure');
+          return [discovered('A'), discovered('B')];
+        },
+        getDeviceRegistry: async () => [activeDevice('device-a', 'A'), activeDevice('device-b', 'B')],
+        monitorFactory: ({ printerName }) => printerName === 'A' ? oldMonitorA : oldMonitorB
+      });
+
+      await manager.refresh();
+      manager.checkPrinterStatuses({ emit: jest.fn() });
+      expect(manager.statusCheckTimers.size).toBe(1);
+      failDiscovery = true;
+      await expect(manager.refresh()).rejects.toThrow('mock refresh failure');
+      expect(manager.statusCheckTimers.size).toBe(0);
+      await jest.advanceTimersByTimeAsync(18000);
+      expect(oldMonitorB.checkPrinterStatus).not.toHaveBeenCalled();
+      expect(manager.monitors.size).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('end-to-end integration: chained raw Windows discovery JSON -> normalization -> fleet readiness', async () => {

@@ -13,6 +13,10 @@ describe('PowerShell command encoding', () => {
     expect(script).toContain(`FromBase64String('${encoded}')`);
     expect(script).not.toContain(queueName);
     expect(script).toContain('$printerName');
+    expect(script).toContain("$ErrorActionPreference = 'Stop'");
+    expect(script).toContain("-ClassName Win32_Printer -ErrorAction Stop");
+    expect(script).toContain("Select-Object -First 1");
+    expect(script).toContain("if ($null -ne $printer)");
   });
 
   test('encodes both queue and job identifiers for spooler polling and removal', () => {
@@ -339,18 +343,84 @@ describe('SpoolerMonitor', () => {
       }));
     });
 
-    it('should emit query error when PowerShell fails with an error', () => {
+    it('logs bounded process diagnostics and remains fail-closed when PowerShell fails', () => {
+      const logSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const error = new Error('PowerShell execution failed at C:\\private\\agent.exe');
+      error.code = 'ETIMEDOUT';
+      error.errno = -1;
+      error.syscall = 'spawn powershell.exe';
+      error.killed = true;
+      error.signal = 'SIGTERM';
       mockExecFile.mockImplementation((cmd, args, a3, a4) => {
         const callback = typeof a3 === 'function' ? a3 : a4;
-        callback(new Error('PowerShell execution failed'));
+        callback(error, '', 'token=do-not-log\\r\\nC:\\private\\diagnostic.txt');
+      });
+
+      try {
+        monitor.checkPrinterStatus(mockSocket);
+
+        expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
+          isError: true,
+          errorMessage: expect.stringContaining('PowerShell execution failed')
+        }));
+        expect(logSpy).toHaveBeenCalledTimes(1);
+        const logged = logSpy.mock.calls[0][0];
+        expect(logged).toContain('ETIMEDOUT');
+        expect(logged).toContain('SIGTERM');
+        expect(logged).toContain('token=[REDACTED]');
+        expect(logged).not.toContain('do-not-log');
+        expect(logged).not.toContain('C:\\private');
+        expect(logged.length).toBeLessThan(1000);
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
+    it('executes PowerShell with 30-second timeout, 1MB maxBuffer, windowsHide, and ExecutionPolicy Bypass', () => {
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        const callback = typeof opts === 'function' ? opts : cb;
+        callback(null, mockCim());
       });
 
       monitor.checkPrinterStatus(mockSocket);
 
-      expect(mockSocket.emit).toHaveBeenCalledWith('printer_status_update', expect.objectContaining({
-        isError: true,
-        errorMessage: expect.stringContaining('PowerShell execution failed')
-      }));
+      expect(mockExecFile).toHaveBeenCalledTimes(1);
+      const [cmd, args, opts] = mockExecFile.mock.calls[0];
+      expect(cmd).toBe('powershell.exe');
+      expect(args).toEqual([
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        expect.stringContaining('$ErrorActionPreference = \'Stop\'')
+      ]);
+      expect(opts).toEqual({
+        timeout: 30000,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true
+      });
+    });
+
+    it('prevents overlapping checkPrinterStatus executions while a query is in progress', () => {
+      let pendingCallback;
+      mockExecFile.mockImplementation((cmd, args, opts, cb) => {
+        pendingCallback = typeof opts === 'function' ? opts : cb;
+      });
+
+      monitor.checkPrinterStatus(mockSocket);
+      expect(mockExecFile).toHaveBeenCalledTimes(1);
+
+      // Second call while first is in-flight
+      monitor.checkPrinterStatus(mockSocket);
+      expect(mockExecFile).toHaveBeenCalledTimes(1);
+
+      // First query finishes
+      pendingCallback(null, mockCim());
+
+      // Subsequent call should now proceed
+      monitor.checkPrinterStatus(mockSocket);
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
     });
 
     it('should detect USB connection for USB019 or USB-prefixed port', () => {

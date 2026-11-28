@@ -145,6 +145,12 @@ let fleetManager = null;
 let latestRegistryIssuedAt = 0;
 let pendingRegistryRefresh = null;
 
+const disposeCurrentFleetManager = () => {
+  if (fleetManager && typeof fleetManager.cancelPendingStatusChecks === 'function') {
+    fleetManager.cancelPendingStatusChecks();
+  }
+};
+
 const settleRegistryRefresh = (requestId, accepted, details = {}) => {
   const pending = pendingRegistryRefresh;
   if (!pending || pending.requestId !== requestId) return false;
@@ -192,6 +198,7 @@ const requestLatestPrinterRegistry = () => {
   return promise;
 };
 socket.on('connect', () => {
+  disposeCurrentFleetManager();
   console.log(`✅ Connected to cloud backend! (Socket ID: ${socket.id})`);
   fleetProtocolAccepted = false;
   fleetManager = null;
@@ -292,6 +299,7 @@ socket.on('printer_device_registry', async (payload) => {
       }
       return;
     }
+    disposeCurrentFleetManager();
     latestRegistryIssuedAt = registryIssuedAt;
     fleetManager = nextFleetManager;
 
@@ -317,6 +325,7 @@ socket.on('printer_device_registry', async (payload) => {
   } catch (error) {
     // Fail closed: a bad registry or Windows inventory cannot enable a printer.
     if (!Number.isFinite(Date.parse(payload?.issuedAt)) || Date.parse(payload.issuedAt) >= latestRegistryIssuedAt) {
+      disposeCurrentFleetManager();
       fleetManager = null;
     }
     console.error(`❌ Multi-printer registry synchronization failed: ${error.message}`);
@@ -355,6 +364,7 @@ socket.on('machine_suspended', (data) => {
 
 socket.on('disconnect', () => {
   fleetProtocolAccepted = false;
+  disposeCurrentFleetManager();
   fleetManager = null;
   if (pendingRegistryRefresh) {
     settleRegistryRefresh(pendingRegistryRefresh.requestId, false, {
