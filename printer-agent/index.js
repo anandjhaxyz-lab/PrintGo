@@ -27,8 +27,17 @@ const {
   buildAgentHello,
   validatePrinterDeviceRegistry
 } = require('./src/agentProtocol');
+const {
+  parseDiscoveryModeConfig,
+  evaluatePrintJobSafety
+} = require('./src/discoveryMode');
 const journal = new JobJournal();
 const agentPackage = require('./package.json');
+const discoveryModeConfig = parseDiscoveryModeConfig();
+if (!discoveryModeConfig.isValid) {
+  console.error(`🔥 CRITICAL CONFIG ERROR: ${discoveryModeConfig.error}`);
+  console.error('Fails closed: DISCOVERY_ONLY mode enforced; all print jobs will be refused.');
+}
 
 process.on('uncaughtException', (err) => {
   console.error('🔥 CRITICAL ERROR: Uncaught Exception:', err);
@@ -54,6 +63,10 @@ if (PRINTER_NAME && !/^[a-zA-Z0-9_\-\s\(\)\.]+$/.test(PRINTER_NAME)) {
 
 // P3-003: Printer Compatibility & Driver Validation
 async function validatePrinter() {
+    if (discoveryModeConfig.isDiscoveryOnly) {
+        console.log(`\n🔍  Running in DISCOVERY-ONLY MODE. Skipping physical printer validation.`);
+        return;
+    }
     if (PRINTER_NAME === 'SimulationMode') {
         console.log(`\n🖨️  Running in SIMULATION MODE. Skipping printer validation.`);
         return;
@@ -80,6 +93,9 @@ if (PRINTER_NAME) {
 }
 
 console.log(`🖨️  PrintGo Enterprise Printer Agent Starting...`);
+if (discoveryModeConfig.isDiscoveryOnly) {
+  console.log(`🔒 DISCOVERY_ONLY mode is ACTIVE. All physical and simulated printing is completely disabled.`);
+}
 console.log(`🔗 Connecting to cloud backend: ${BACKEND_URL}`);
 
 const tempDir = path.join(__dirname, 'temp');
@@ -491,6 +507,18 @@ socket.on('physical_print_job', (jobData) => {
     return;
   }
 
+  // --- DISCOVERY_ONLY SAFETY GUARD ---
+  const safetyCheck = evaluatePrintJobSafety(jobData, discoveryModeConfig);
+  if (safetyCheck.blocked) {
+    console.warn(`🛑 DISCOVERY_ONLY GUARD: Refused print job ${jobId}. ${safetyCheck.reason}`);
+    socket.emit('print_spooler_error', {
+      jobId,
+      error: safetyCheck.reason,
+      ...safetyCheck.deviceBinding
+    });
+    return;
+  }
+
   const rawPrinterDeviceId = jobData?.printerDeviceId;
   const hasDeviceId = rawPrinterDeviceId !== undefined && rawPrinterDeviceId !== null;
   const laneQueueName = hasDeviceId ? jobData?.windowsPrinterName : PRINTER_NAME;
@@ -528,6 +556,18 @@ const processPhysicalPrintJob = async (jobData) => {
   // Command Injection Prevention (P0)
   if (!jobData.jobId || !/^[a-zA-Z0-9_-]+$/.test(jobData.jobId)) {
     console.error(`❌ REJECTED Job: Invalid jobId format (potential injection): ${jobData.jobId}`);
+    return;
+  }
+
+  // Defense-in-depth discovery-only guard
+  const safetyCheck = evaluatePrintJobSafety(jobData, discoveryModeConfig);
+  if (safetyCheck.blocked) {
+    console.warn(`🛑 DISCOVERY_ONLY GUARD: processPhysicalPrintJob refused dispatch for job ${jobData.jobId}. ${safetyCheck.reason}`);
+    socket.emit('print_spooler_error', {
+      jobId: jobData.jobId,
+      error: safetyCheck.reason,
+      ...safetyCheck.deviceBinding
+    });
     return;
   }
 
@@ -885,3 +925,14 @@ setInterval(async () => {
     console.error(`⚠️  Keep-Alive ping failed: ${error.message}`);
   }
 }, 10 * 60 * 1000); // 10 minutes
+
+module.exports = {
+  socket,
+  discoveryModeConfig,
+  dispatchAuthorizer,
+  activePrintJobIds,
+  printerDeviceQueue,
+  processPhysicalPrintJob,
+  getFleetManager: () => fleetManager,
+  validatePrinter
+};
