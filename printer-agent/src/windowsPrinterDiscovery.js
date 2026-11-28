@@ -3,7 +3,7 @@ const { classifyConnection } = require('./spooler');
 
 const WINDOWS_PRINTER_DISCOVERY_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
-  "$printers = @(Get-CimInstance -ClassName Win32_Printer | Select-Object Name, DriverName, PortName, PrinterStatus, DetectedErrorState, WorkOffline, Shared, Network, Default)",
+  "$printers = @(Get-CimInstance -ClassName Win32_Printer | Select-Object Name, DriverName, PortName, PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, ExtendedDetectedErrorState, WorkOffline, Shared, Network, Default)",
   "if ($printers.Count -eq 0) { '[]' } else { $printers | ConvertTo-Json -Depth 4 -Compress }"
 ].join('; ');
 
@@ -57,7 +57,9 @@ function normalizePrinterRecord(record) {
     portName,
     connectionType: classifyConnection(portName),
     printerStatus: getField(record, 'PrinterStatus') ?? null,
+    extendedPrinterStatus: getField(record, 'ExtendedPrinterStatus') ?? null,
     detectedErrorState: getField(record, 'DetectedErrorState') ?? null,
+    extendedDetectedErrorState: getField(record, 'ExtendedDetectedErrorState') ?? null,
     workOffline: parseBoolean(getField(record, 'WorkOffline')),
     shared: parseBoolean(getField(record, 'Shared')),
     network: parseBoolean(getField(record, 'Network')),

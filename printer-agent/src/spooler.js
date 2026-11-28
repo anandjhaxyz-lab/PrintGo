@@ -1,6 +1,6 @@
 const os = require('os');
 const fs = require('fs');
-const { interpretDetectedErrorState } = require('./printerStatusMapping');
+const { evaluatePrinterReadiness } = require('./printerStatusMapping');
 
 function encodePowerShellValue(value) {
   return Buffer.from(String(value), 'utf16le').toString('base64');
@@ -8,7 +8,7 @@ function encodePowerShellValue(value) {
 
 function buildPrinterStatusCommand(printerName) {
   const encodedName = encodePowerShellValue(printerName);
-  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Name -eq $printerName } | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, WorkOffline, PortName`;
+  return `$printerName = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedName}')); Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Name -eq $printerName } | Select-Object PrinterStatus, ExtendedPrinterStatus, DetectedErrorState, ExtendedDetectedErrorState, WorkOffline, PortName | ConvertTo-Json -Compress`;
 }
 
 function buildPrintJobQueryCommand(printerName) {
@@ -97,40 +97,61 @@ class SpoolerMonitor {
           return;
         }
 
-        let isError = false;
-        let errorMessage = '';
-
-        // Extract WorkOffline
-        const isWorkOffline = /WorkOffline\s*:\s*True/i.test(stdout) ||
-          (stdout.includes('Offline') && !/WorkOffline\s*:\s*False/i.test(stdout));
-
-        // Extract DetectedErrorState (e.g. "DetectedErrorState : 4" or "ErrorState: 4")
-        const errorStateMatch = stdout.match(/(?:DetectedErrorState|ErrorState)\s*:\s*(\d+)/i);
-        const detectedErrorState = errorStateMatch ? parseInt(errorStateMatch[1], 10) : null;
-
-        if (isWorkOffline) {
-          isError = true;
-          errorMessage = 'Printer Offline';
-        } else if (detectedErrorState !== null) {
-          const interpreted = interpretDetectedErrorState(detectedErrorState);
-          if (interpreted) {
-            isError = interpreted.isError;
-            errorMessage = interpreted.message;
-          }
-        } else if (stdout.includes('Paper Out') || stdout.includes('Out of Paper')) {
-          isError = true;
-          errorMessage = 'Out of Paper';
-        } else if (stdout.includes('Jam')) {
-          isError = true;
-          errorMessage = 'Paper Jam';
+        let statusRecord = null;
+        try {
+          const parsed = JSON.parse(rawOutput);
+          statusRecord = Array.isArray(parsed) ? parsed[0] : parsed;
+          if (!statusRecord || typeof statusRecord !== 'object') statusRecord = null;
+        } catch (_) {
+          // Backward-compatible parser for plain-text output
         }
 
-        // Extract PortName and classify connection
-        const portMatch = stdout.match(/PortName\s*:\s*([^\r\n]+)/i);
-        const rawPort = portMatch ? portMatch[1].trim() : '';
+        const readField = (name) => {
+          if (statusRecord) {
+            const key = Object.keys(statusRecord).find((k) => k.toLowerCase() === name.toLowerCase());
+            if (key) return statusRecord[key];
+          }
+          const match = stdout.match(new RegExp('(?:' + name + ')\\s*[:=]\\s*([^\\r\\n,;]+)', 'i'));
+          return match ? match[1].trim() : undefined;
+        };
+
+        const rawWorkOffline = readField('WorkOffline');
+        let workOffline = null;
+        if (rawWorkOffline !== undefined && rawWorkOffline !== null) {
+          if (rawWorkOffline === true || String(rawWorkOffline).toLowerCase() === 'true') {
+            workOffline = true;
+          } else if (rawWorkOffline === false || String(rawWorkOffline).toLowerCase() === 'false') {
+            workOffline = false;
+          }
+        } else if (/WorkOffline\s*:\s*True/i.test(stdout)) {
+          workOffline = true;
+        } else if (/WorkOffline\s*:\s*False/i.test(stdout)) {
+          workOffline = false;
+        }
+
+        const rawPort = readField('PortName') || '';
         const connectionType = classifyConnection(rawPort);
         this.portName = rawPort || 'Unknown';
         this.connectionType = connectionType;
+
+        const readiness = evaluatePrinterReadiness({
+          workOffline,
+          printerStatus: readField('PrinterStatus'),
+          extendedPrinterStatus: readField('ExtendedPrinterStatus'),
+          detectedErrorState: readField('DetectedErrorState'),
+          extendedDetectedErrorState: readField('ExtendedDetectedErrorState')
+        });
+
+        let isError = !readiness.canPrint;
+        let errorMessage = readiness.message || (isError ? (readiness.reason || 'Printer Status Not Verified') : '');
+
+        if (!isError && (stdout.includes('Paper Out') || stdout.includes('Out of Paper'))) {
+          isError = true;
+          errorMessage = 'Out of Paper';
+        } else if (!isError && stdout.includes('Jam')) {
+          isError = true;
+          errorMessage = 'Paper Jam';
+        }
 
         this.emitStatus(socket, isError, errorMessage, connectionType);
       });

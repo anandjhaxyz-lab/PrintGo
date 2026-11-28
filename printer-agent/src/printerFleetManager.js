@@ -1,4 +1,4 @@
-const { interpretDetectedErrorState } = require('./printerStatusMapping');
+const { evaluatePrinterReadiness } = require('./printerStatusMapping');
 const ACTIVE_DEVICE_STATUS = 'ACTIVE';
 const VALID_DEVICE_STATUSES = new Set([
   'DISCOVERY_REQUIRED',
@@ -164,14 +164,13 @@ class PrinterFleetManager {
         reason = 'WINDOWS_QUEUE_NOT_BOUND';
       } else if (!discoveredPrinter) {
         reason = 'WINDOWS_QUEUE_NOT_PRESENT';
-      } else if (discoveredPrinter.workOffline === true) {
-        canPrint = false;
-        reason = 'PRINTER_OFFLINE';
-      } else if (discoveredPrinter.detectedErrorState !== null && discoveredPrinter.detectedErrorState !== undefined) {
-        const errorState = interpretDetectedErrorState(discoveredPrinter.detectedErrorState);
-        if (errorState && errorState.isBlocking) {
+      } else {
+        const readiness = evaluatePrinterReadiness(discoveredPrinter);
+        if (!readiness.canPrint) {
           canPrint = false;
-          reason = errorState.code === 9 ? 'PRINTER_OFFLINE' : 'PRINTER_ERROR_STATE';
+          reason = readiness.reason === 'PRINTER_OFFLINE'
+            ? 'PRINTER_OFFLINE'
+            : (readiness.reason === 'PRINTER_BUSY' ? 'PRINTER_BUSY' : 'PRINTER_ERROR_STATE');
         }
       }
 
