@@ -4,7 +4,7 @@
  * Strictly offline / isolated (no live DB mutations, no Cashfree calls, no printing):
  * 1. Verifies render.staging.yaml blueprint fixes (preDeployCommand, healthCheckPath, 0.5c-512mb, 0.1c-256mb, isolation)
  * 2. Verifies Winston logger enables redacted Console transport in NODE_ENV=production while preserving File transports
- * 3. Verifies advertisements storage aligns with UPLOADS_DIR and preserves readOnlyGuard
+ * 3. Verifies advertisements storage aligns with ADS_UPLOAD_DIR and preserves readOnlyGuard
  * 4. Verifies machines.controller.js getPublicKey uses shared Prisma client
  * 5. Verifies provisionStagingPilot.js hard-guards against printgo_db, dry-run, confirmation flag, and idempotency
  * 6. Verifies dual-origin CORS policy for Customer Portal + Render Admin Dashboard
