@@ -5,6 +5,10 @@ import { Printer, RefreshCw, CheckCircle2, AlertCircle, Clock, QrCode, Copy, X }
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
+const extractErrorMessage = (err, fallback = 'An unexpected error occurred') => {
+  return err.response?.data?.message || err.response?.data?.error || err.message || fallback;
+};
+
 export const PrinterFleetApprovalPanel = ({ currentUser }) => {
   const [discoveries, setDiscoveries] = useState([]);
   const [devices, setDevices] = useState([]);
@@ -29,7 +33,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       setDevices(deviceResponse.data?.data?.devices || []);
       setDeviceQrEnabled(deviceResponse.data?.data?.deviceQrEnabled === true);
     } catch (loadError) {
-      setError(loadError.response?.data?.error || loadError.message || 'Could not load printer fleet information.');
+      setError(extractErrorMessage(loadError, 'Could not load printer fleet information.'));
     } finally {
       setLoading(false);
     }
@@ -69,7 +73,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       setSuccess(`${registeredName} approved and registered. You can now create its permanent customer QR.`);
       await loadFleet();
     } catch (approveError) {
-      setError(approveError.response?.data?.error || approveError.message || 'Printer approval failed.');
+      setError(extractErrorMessage(approveError, 'Printer approval failed.'));
     } finally {
       setBusyId(null);
     }
@@ -102,7 +106,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       setSuccess(`Permanent customer QR created for ${device.displayName}.`);
       await loadFleet();
     } catch (createError) {
-      setError(createError.response?.data?.error || createError.message || 'Device QR creation failed.');
+      setError(extractErrorMessage(createError, 'Device QR creation failed.'));
     } finally {
       setBusyId(null);
     }
@@ -134,7 +138,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       setSuccess(`${device.displayName} is now disabled. Its permanent QR remains assigned, but new print jobs are blocked.`);
       await loadFleet();
     } catch (disableError) {
-      setError(disableError.response?.data?.error || disableError.message || 'Printer disable failed.');
+      setError(extractErrorMessage(disableError, 'Printer disable failed.'));
     } finally {
       setBusyId(null);
     }
@@ -164,7 +168,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       setSuccess(`${device.displayName} is active again. Its existing permanent QR and device identity are unchanged.`);
       await loadFleet();
     } catch (enableError) {
-      setError(enableError.response?.data?.error || enableError.message || 'Printer re-enable failed.');
+      setError(extractErrorMessage(enableError, 'Printer re-enable failed.'));
     } finally {
       setBusyId(null);
     }
@@ -217,7 +221,7 @@ export const PrinterFleetApprovalPanel = ({ currentUser }) => {
       setSuccess(`${device.displayName} now maps to ${target.windowsPrinterName}. Its physical device ID and permanent QR are unchanged.`);
       await loadFleet();
     } catch (remapError) {
-      setError(remapError.response?.data?.error || remapError.message || 'Printer remapping failed.');
+      setError(extractErrorMessage(remapError, 'Printer remapping failed.'));
     } finally {
       setBusyId(null);
     }

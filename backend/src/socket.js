@@ -301,6 +301,18 @@ const setupSockets = (io) => {
       // PrinterStatus stream until device-bound QR/session routing ships.
       if (status?.printerDeviceId) {
         await handlePrinterDeviceTelemetry({ socket, io, prisma, logger, status });
+        try {
+          const parentAvailability = await getMachineAvailability(socket.machineId, prisma);
+          if (parentAvailability) {
+            io.to(`machine_${socket.machineId}`).emit('printer_status_update', parentAvailability);
+            if (socket.companyId) {
+              io.to(`company_${socket.companyId}`).emit('printer_status_update', parentAvailability);
+            }
+            io.to('superadmins').emit('printer_status_update', parentAvailability);
+          }
+        } catch (broadcastErr) {
+          logger.error('Error broadcasting parent availability after child device telemetry:', broadcastErr);
+        }
         return;
       }
 

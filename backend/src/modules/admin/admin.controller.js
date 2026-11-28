@@ -69,6 +69,10 @@ exports.getAllMachines = async (req, res, next) => {
         printerStatuses: {
           take: 1,
           orderBy: { timestamp: 'desc' }
+        },
+        printerDevices: {
+          where: { status: 'ACTIVE' },
+          orderBy: { sortOrder: 'asc' }
         }
       },
       orderBy: { createdAt: 'desc' }

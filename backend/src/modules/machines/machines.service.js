@@ -44,7 +44,14 @@ const getMachines = async (user) => {
 
   const machines = await prisma.machine.findMany({
     where,
-    include: { company: true, printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } } }
+    include: {
+      company: true,
+      printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } },
+      printerDevices: {
+        where: { status: 'ACTIVE' },
+        orderBy: { sortOrder: 'asc' }
+      }
+    }
   });
 
   return machines.map(m => {
@@ -65,7 +72,14 @@ const getMachines = async (user) => {
 const getMachineById = async (id, user) => {
   const machine = await prisma.machine.findUnique({
     where: { id },
-    include: { company: true, printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } } }
+    include: {
+      company: true,
+      printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } },
+      printerDevices: {
+        where: { status: 'ACTIVE' },
+        orderBy: { sortOrder: 'asc' }
+      }
+    }
   });
   if (!machine) throw new AppError('Machine not found', 404);
   
@@ -134,6 +148,10 @@ const getMachinesByCompany = async (companyId) => {
     include: {
       company: true,
       printerStatuses: { take: 1, orderBy: { timestamp: 'desc' } },
+      printerDevices: {
+        where: { status: 'ACTIVE' },
+        orderBy: { sortOrder: 'asc' }
+      },
       printJobs: { take: 50, orderBy: { createdAt: 'desc' } }
     }
   });

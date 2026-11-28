@@ -37,6 +37,17 @@ import { PrinterFleetApprovalPanel } from './PrinterFleetApprovalPanel';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
+/**
+ * Normalizes backend error responses to prioritize descriptive server messages:
+ * 1. response.data.message
+ * 2. response.data.error
+ * 3. Axios error message (fallback)
+ * 4. Default fallback string
+ */
+const extractErrorMessage = (err, fallback = 'An unexpected error occurred') => {
+  return err.response?.data?.message || err.response?.data?.error || err.message || fallback;
+};
+
 export const PrintersView = ({
   machines = [],
   telemetryHistory = [],
@@ -92,11 +103,11 @@ export const PrintersView = ({
       }
     } catch (err) {
       console.error('Failed to resume ads:', err);
-      const serverError = err.response?.data?.error || err.response?.data?.message || err.message;
-      if (err.response?.status === 403 && serverError.includes('Read-Only')) {
+      const serverError = extractErrorMessage(err, 'Failed to resume advertisements.');
+      if (err.response?.status === 403 && String(serverError).includes('Read-Only')) {
         setGlobalError('Action blocked: Cloud Admin Dashboard is operating in Read-Only Monitoring Mode (ADMIN_READ_ONLY=true). Remote mutations are disabled.');
       } else {
-        setGlobalError(serverError || 'Failed to resume advertisements.');
+        setGlobalError(serverError);
       }
       setTimeout(() => setGlobalError(''), 6000);
     }
@@ -169,7 +180,7 @@ export const PrintersView = ({
         setPreviewState({ isOpen: true, qr: newQr, machine: generateState.machine });
       }
     } catch (err) {
-      const errMsg = err.response?.data?.error || err.message || 'Failed to generate printer QR';
+      const errMsg = extractErrorMessage(err, 'Failed to generate printer QR');
       setGenerateState(prev => ({ ...prev, isSubmitting: false, errorMsg: errMsg }));
     }
   };
@@ -193,7 +204,7 @@ export const PrintersView = ({
         setPreviewState({ isOpen: true, qr: rotatedQr, machine: rotateState.machine });
       }
     } catch (err) {
-      const errMsg = err.response?.data?.error || err.message || 'Failed to rotate printer QR';
+      const errMsg = extractErrorMessage(err, 'Failed to rotate printer QR');
       setRotateState(prev => ({ ...prev, isSubmitting: false, errorMsg: errMsg }));
     }
   };
@@ -213,7 +224,7 @@ export const PrintersView = ({
         await loadPrinterQrs();
       }
     } catch (err) {
-      const errMsg = err.response?.data?.error || err.message || 'Failed to revoke printer QR';
+      const errMsg = extractErrorMessage(err, 'Failed to revoke printer QR');
       setRevokeState(prev => ({ ...prev, isSubmitting: false, errorMsg: errMsg }));
     }
   };
@@ -232,7 +243,7 @@ export const PrintersView = ({
         });
       }
     } catch (err) {
-      setGlobalError(err.response?.data?.error || 'Failed to load QR history ledger');
+      setGlobalError(extractErrorMessage(err, 'Failed to load QR history ledger'));
       setLedgerState(prev => ({ ...prev, isLoading: false }));
     }
   };
@@ -253,7 +264,7 @@ export const PrintersView = ({
         throw new Error(res.data?.error || 'Failed to update payment mode');
       }
     } catch (err) {
-      setGlobalError(err.response?.data?.error || err.message || 'Failed to switch payment mode');
+      setGlobalError(extractErrorMessage(err, 'Failed to switch payment mode'));
     }
   };
 
