@@ -168,9 +168,9 @@ async function runBatch1Suite() {
   const ensureSession = async (code, machine) => {
     createdSessionCodes.add(code);
     return prisma.session.upsert({
-    where: { code },
-    create: { code, machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
-    update: { machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) }
+      where: { code },
+      create: { code, machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
+      update: { machineId: machine.id, status: 'CONNECTED', expiresAt: new Date(Date.now() + 60 * 60 * 1000) }
     });
   };
 
