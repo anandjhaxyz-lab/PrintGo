@@ -300,22 +300,39 @@ describe('Windows printer discovery', () => {
     expect(MAX_DISCOVERY_TIMEOUT_MS).toBe(300000);
     expect(DEFAULT_DISCOVERY_TIMEOUT_MS).toBe(30000);
 
-    // Normalization helper tests
+    // Valid inputs
+    expect(normalizeDiscoveryTimeoutMs('1000')).toBe(1000);
+    expect(normalizeDiscoveryTimeoutMs('15000')).toBe(15000);
+    expect(normalizeDiscoveryTimeoutMs('300000')).toBe(300000);
+    expect(normalizeDiscoveryTimeoutMs(1000)).toBe(1000);
+    expect(normalizeDiscoveryTimeoutMs(15000)).toBe(15000);
+    expect(normalizeDiscoveryTimeoutMs(300000)).toBe(300000);
+
+    // Invalid string inputs — strict full-string validation
+    expect(normalizeDiscoveryTimeoutMs('1500.5')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('1000abc')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('abc1000')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('1e4')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(' ')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('   ')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('0')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('-1000')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('999999999999')).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs('not-a-number')).toBe(30000);
+
+    // Invalid numeric and non-integer inputs
+    expect(normalizeDiscoveryTimeoutMs(1500.5)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(NaN)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(Infinity)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(-Infinity)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(0)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(-1000)).toBe(30000);
+    expect(normalizeDiscoveryTimeoutMs(500)).toBe(30000); // below minimum
+    expect(normalizeDiscoveryTimeoutMs(300001)).toBe(30000); // above maximum
+    expect(normalizeDiscoveryTimeoutMs(999999999999)).toBe(30000); // 32-bit overflow
     expect(normalizeDiscoveryTimeoutMs(undefined)).toBe(30000);
     expect(normalizeDiscoveryTimeoutMs(null)).toBe(30000);
-    expect(normalizeDiscoveryTimeoutMs('')).toBe(30000);
-    expect(normalizeDiscoveryTimeoutMs('not-a-number')).toBe(30000);
-    expect(normalizeDiscoveryTimeoutMs(0)).toBe(30000);
-    expect(normalizeDiscoveryTimeoutMs(-500)).toBe(30000);
-    expect(normalizeDiscoveryTimeoutMs(500)).toBe(30000); // below minimum
-    expect(normalizeDiscoveryTimeoutMs(1000)).toBe(1000); // minimum boundary
-    expect(normalizeDiscoveryTimeoutMs(15000)).toBe(15000);
-    expect(normalizeDiscoveryTimeoutMs(300000)).toBe(300000); // maximum boundary
-    expect(normalizeDiscoveryTimeoutMs(300001)).toBe(30000); // above maximum (overflow protection)
-    expect(normalizeDiscoveryTimeoutMs(999999999999)).toBe(30000); // 32-bit overflow protection
-    expect(normalizeDiscoveryTimeoutMs('45000')).toBe(45000); // string parsing
-    expect(normalizeDiscoveryTimeoutMs('0')).toBe(30000);
-    expect(normalizeDiscoveryTimeoutMs('999999999999')).toBe(30000);
   });
 
   test('failed discovery does not initialize an invalid printer fleet', async () => {

@@ -14,14 +14,14 @@ const DEFAULT_DISCOVERY_TIMEOUT_MS = 30000;
 function normalizeDiscoveryTimeoutMs(timeoutMs, defaultMs = DEFAULT_DISCOVERY_TIMEOUT_MS) {
   if (typeof timeoutMs === 'string') {
     const trimmed = timeoutMs.trim();
-    if (!trimmed) return defaultMs;
+    if (!/^\d+$/.test(trimmed)) return defaultMs;
     const parsed = Number.parseInt(trimmed, 10);
-    if (Number.isInteger(parsed) && parsed >= MIN_DISCOVERY_TIMEOUT_MS && parsed <= MAX_DISCOVERY_TIMEOUT_MS) {
+    if (Number.isSafeInteger(parsed) && parsed >= MIN_DISCOVERY_TIMEOUT_MS && parsed <= MAX_DISCOVERY_TIMEOUT_MS) {
       return parsed;
     }
     return defaultMs;
   }
-  if (Number.isInteger(timeoutMs) && timeoutMs >= MIN_DISCOVERY_TIMEOUT_MS && timeoutMs <= MAX_DISCOVERY_TIMEOUT_MS) {
+  if (typeof timeoutMs === 'number' && Number.isSafeInteger(timeoutMs) && timeoutMs >= MIN_DISCOVERY_TIMEOUT_MS && timeoutMs <= MAX_DISCOVERY_TIMEOUT_MS) {
     return timeoutMs;
   }
   return defaultMs;
