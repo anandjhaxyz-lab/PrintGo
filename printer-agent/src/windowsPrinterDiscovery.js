@@ -7,6 +7,11 @@ const WINDOWS_PRINTER_DISCOVERY_SCRIPT = [
   "if ($printers.Count -eq 0) { '[]' } else { $printers | ConvertTo-Json -Depth 4 -Compress }"
 ].join('; ');
 
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 30000;
+
+let inFlightDiscoveryPromise = null;
+let inFlightExecFile = null;
+
 class PrinterDiscoveryError extends Error {
   constructor(code, message, cause) {
     super(message);
@@ -114,7 +119,9 @@ function discoverWindowsPrinters(options = {}) {
   const majorVersion = parseInt(String(release || '').split('.')[0], 10);
   const isWindows10Or11 = Number.isFinite(majorVersion) && majorVersion >= 10;
   const execFile = options.execFile;
-  const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 15000;
+  const timeoutMs = Number.isInteger(options.timeoutMs) && options.timeoutMs > 0
+    ? options.timeoutMs
+    : DEFAULT_DISCOVERY_TIMEOUT_MS;
 
   if (platform !== 'win32' || arch !== 'x64' || !isWindows10Or11) {
     return Promise.reject(new PrinterDiscoveryError(
@@ -130,40 +137,81 @@ function discoverWindowsPrinters(options = {}) {
     ));
   }
 
-  return new Promise((resolve, reject) => {
-    execFile(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        WINDOWS_PRINTER_DISCOVERY_SCRIPT
-      ],
-      { timeout: timeoutMs, maxBuffer: 1024 * 1024, windowsHide: true },
-      (error, stdout) => {
-        if (error) {
-          reject(new PrinterDiscoveryError(
-            'WINDOWS_DISCOVERY_FAILED',
-            `Could not enumerate Windows printer queues: ${error.message}`,
-            error
-          ));
-          return;
-        }
+  // Prevent overlapping discovery subprocesses by coalescing concurrent calls with the same execFile
+  if (options.coalesce !== false && inFlightDiscoveryPromise && inFlightExecFile === execFile) {
+    return inFlightDiscoveryPromise;
+  }
 
-        try {
-          resolve(parseDiscoveryOutput(stdout));
-        } catch (parseError) {
-          reject(parseError);
+  const discoveryPromise = new Promise((resolve, reject) => {
+    let childProcess = null;
+    try {
+      childProcess = execFile(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          WINDOWS_PRINTER_DISCOVERY_SCRIPT
+        ],
+        { timeout: timeoutMs, maxBuffer: 1024 * 1024, windowsHide: true },
+        (error, stdout) => {
+          if (error) {
+            // Defensive cleanup of timed-out or hung subprocess
+            if (childProcess && !childProcess.killed && typeof childProcess.kill === 'function') {
+              try {
+                childProcess.kill('SIGKILL');
+              } catch (_) {}
+            }
+
+            const isTimeout = !!(error.killed || error.signal === 'SIGTERM' || error.code === 'ETIMEDOUT' || error.timedOut);
+            const failureMessage = isTimeout
+              ? `Windows printer discovery timed out after ${timeoutMs}ms.`
+              : `Could not enumerate Windows printer queues: ${error.message}`;
+
+            reject(new PrinterDiscoveryError(
+              'WINDOWS_DISCOVERY_FAILED',
+              failureMessage,
+              error
+            ));
+            return;
+          }
+
+          try {
+            resolve(parseDiscoveryOutput(stdout));
+          } catch (parseError) {
+            reject(parseError);
+          }
         }
-      }
-    );
+      );
+    } catch (invocationError) {
+      reject(new PrinterDiscoveryError(
+        'WINDOWS_DISCOVERY_FAILED',
+        `Could not enumerate Windows printer queues: ${invocationError.message}`,
+        invocationError
+      ));
+    }
   });
+
+  if (options.coalesce !== false) {
+    inFlightDiscoveryPromise = discoveryPromise;
+    inFlightExecFile = execFile;
+    const cleanup = () => {
+      if (inFlightDiscoveryPromise === discoveryPromise) {
+        inFlightDiscoveryPromise = null;
+        inFlightExecFile = null;
+      }
+    };
+    discoveryPromise.then(cleanup, cleanup);
+  }
+
+  return discoveryPromise;
 }
 
 module.exports = {
   WINDOWS_PRINTER_DISCOVERY_SCRIPT,
+  DEFAULT_DISCOVERY_TIMEOUT_MS,
   PrinterDiscoveryError,
   discoverWindowsPrinters,
   parseDiscoveryOutput
